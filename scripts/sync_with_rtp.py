@@ -26,7 +26,9 @@ def main(args):
                 "rsync", "-rl",
                 "--exclude", ".*swp",
                 "--exclude", "__pycache__",
-                "--exclude", "build",
+                "--exclude", "build/release",
+                "--exclude", "build/debug",
+                "--exclude", "build/bin",
                 f"{remote_path}/", proj_path
             ]
         else:
@@ -34,7 +36,9 @@ def main(args):
                 "rsync", "-rl",
                 "--exclude", ".*swp",
                 "--exclude", "__pycache__",
-                "--exclude", "build",
+                "--exclude", "build/release",
+                "--exclude", "build/debug",
+                "--exclude", "build/bin",
                 "--exclude", ".git",
                 f"{proj_path}/", remote_path
             ]
