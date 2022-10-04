@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/kmg_parser.h"
 #include "common/timing.h"
 
 
@@ -63,36 +64,38 @@ void printDevProp(const cudaDeviceProp& device_prop) {
     }
     printf("Name:                         %s\n", device_prop.name);
     printf("# of SMs:                     %d\n", device_prop.multiProcessorCount);
-    printf("Clock rate:                   %d\n", device_prop.clockRate);
+    printf("Clock rate:                   %sHz\n",
+            mm_utils::get_count_str(device_prop.clockRate, 1000, 1).c_str());
     printf("# of Async Engines:           %d\n", device_prop.asyncEngineCount);
     printf("Major/Minor revisions:        %d / %d\n",
             device_prop.major, device_prop.minor);
-    printf("Total global memory:          %lu\n", device_prop.totalGlobalMem);
+    printf("Total global memory:          %sB\n",
+            mm_utils::get_byte_str(device_prop.totalGlobalMem).c_str());
     printf("Memory bus width:             %d\n", device_prop.memoryBusWidth);
-    printf("Memory clock rate:            %d\n", device_prop.memoryClockRate);
-    printf("Total constant memory:        %lu\n", device_prop.totalConstMem);
-    printf("Max pitch allowed for memcpy: %lu\n", device_prop.memPitch);
-    printf("L2 cache size:                %d\n", device_prop.l2CacheSize);
+    printf("Memory clock rate:            %sHz\n",
+            mm_utils::get_count_str(device_prop.memoryClockRate, 1000, 1).c_str());
+    printf("Total constant memory:        %s\n",
+            mm_utils::get_byte_str(device_prop.totalConstMem).c_str());
+    printf("Max pitch allowed for memcpy: %sB\n",
+            mm_utils::get_byte_str(device_prop.memPitch).c_str());
+    printf("L2 cache size:                %sB\n",
+            mm_utils::get_byte_str(device_prop.l2CacheSize).c_str());
     printf("Supported mem operations:     %s\n", supported_mem_op.c_str());
     printf("Un-Supported mem operations:  %s\n", unsupported_mem_op.c_str());
     printf("Warp size:                    %d\n", device_prop.warpSize);
     printf("Max blocks per SM:            %d\n", device_prop.maxBlocksPerMultiProcessor);
-    printf("32-bit regs per block/SM:     %d / %d\n",
-            device_prop.regsPerBlock, device_prop.regsPerMultiprocessor);
-    printf("Shared memory per block/SM:   %lu / %lu\n",
-            device_prop.sharedMemPerBlock, device_prop.sharedMemPerMultiprocessor);
-    printf("Max threads per block:        %d\n", device_prop.maxThreadsPerBlock);
-    printf("Max block dimension:          ");
-    fflush(stdout);
-    for (int i = 0; i < 3; ++i) {
-        printf("%d  ", device_prop.maxThreadsDim[i]);
-    }
-    printf("\n");
-    printf("Max grid dimension:           ");
-    for (int i = 0; i < 3; ++i) {
-        printf("%d  ", device_prop.maxGridSize[i]);
-    }
-    printf("\n");
+    printf("32-bit regs per block/SM:     %s / %s\n",
+            mm_utils::get_byte_str(device_prop.regsPerBlock).c_str(),
+            mm_utils::get_byte_str(device_prop.regsPerMultiprocessor).c_str());
+    printf("Shared memory per block/SM:   %sB / %sB\n",
+            mm_utils::get_byte_str(device_prop.sharedMemPerBlock).c_str(),
+            mm_utils::get_byte_str(device_prop.sharedMemPerMultiprocessor).c_str());
+    printf("Max threads per block:        %s\n",
+            mm_utils::get_count_str(device_prop.maxThreadsPerBlock, 1024).c_str());
+    printf("Max block dimension:          %s\n",
+            mm_utils::get_dims_str(device_prop.maxThreadsDim, 3, 1024).c_str());
+    printf("Max grid dimension:           %s\n",
+            mm_utils::get_dims_str(device_prop.maxGridSize, 3, 1024).c_str());
     fflush(stdout);
 }
 
