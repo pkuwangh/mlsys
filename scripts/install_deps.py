@@ -17,7 +17,9 @@ if platform.system() == "Linux":
         print("dnf | yum not available?!")
         exit(1)
     if pkg_manager == "dnf" or pkg_manager == "yum":
-        pkg_list = ["cmake3" ,"gcc", "gcc-c++"]
+        pkg_list = ["cmake3" ,"gcc", "gcc-c++", "numactl-devel", "boost-devel"]
+    else:
+        pkg_list = ["cmake", "gcc-10", "g++-10", "libnuma-dev", "libboost-program-options-dev"]
     cmd = [pkg_manager, "install", "-y"] + pkg_list
 
 else:
