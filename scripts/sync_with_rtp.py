@@ -23,22 +23,20 @@ def main(args):
         # copy the repo myself
         if args.download:
             cmd = [
-                "rsync", "-rl",
+                "rsync", "-rlcv",
                 "--exclude", ".*swp",
                 "--exclude", "__pycache__",
-                "--exclude", "build/release",
-                "--exclude", "build/debug",
-                "--exclude", "build/bin",
+                "--exclude", "build",
+                "--exclude", "bin",
                 f"{remote_path}/", proj_path
             ]
         else:
             cmd = [
-                "rsync", "-rl",
+                "rsync", "-rlcv",
                 "--exclude", ".*swp",
                 "--exclude", "__pycache__",
-                "--exclude", "build/release",
-                "--exclude", "build/debug",
-                "--exclude", "build/bin",
+                "--exclude", "build",
+                "--exclude", "bin",
                 "--exclude", ".git",
                 f"{proj_path}/", remote_path
             ]

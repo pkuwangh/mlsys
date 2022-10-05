@@ -31,7 +31,7 @@ void addForDisplayString(
 }
 
 
-void printDevProp(const cudaDeviceProp& device_prop) {
+void printDevProp(const cudaDeviceProp& device_prop, bool id_only=false) {
     std::string supported_mem_op;
     std::string unsupported_mem_op;
     std::vector<std::pair<int, std::string>> features = {
@@ -62,7 +62,10 @@ void printDevProp(const cudaDeviceProp& device_prop) {
         std::string& mem_op = item.first ? supported_mem_op : unsupported_mem_op;
         addForDisplayString(mem_op, item.second);
     }
-    printf("Name:                         %s\n", device_prop.name);
+    printf("%#x - %s\n", device_prop.pciBusID, device_prop.name);
+    if (id_only) {
+        return;
+    }
     printf("# of SMs:                     %d\n", device_prop.multiProcessorCount);
     printf("Clock rate:                   %sHz\n",
             mm_utils::get_count_str(device_prop.clockRate, 1000, 1).c_str());
@@ -96,7 +99,6 @@ void printDevProp(const cudaDeviceProp& device_prop) {
             mm_utils::get_dims_str(device_prop.maxThreadsDim, 3, 1024).c_str());
     printf("Max grid dimension:           %s\n",
             mm_utils::get_dims_str(device_prop.maxGridSize, 3, 1024).c_str());
-    fflush(stdout);
 }
 
 
@@ -110,18 +112,15 @@ void queryAllDevice() {
         cudaGetDeviceProperties(&device_prop, i);
         if (curr_device_name.compare(device_prop.name) == 0) {
             curr_device_count += 1;
-            continue;
         } else {
-            if (curr_device_count) {
-                printf("<<<<<<<< There are %d such Devices\n", curr_device_count);
-            }
             curr_device_name = device_prop.name;
             curr_device_count = 1;
         }
-        printf("\n-------- CUDA Device #%d --------\n", i);
-        printDevProp(device_prop);
+        printf("-------- CUDA Device #%-2d:  ", i);
+        printDevProp(device_prop, (curr_device_count > 1));
+        fflush(stdout);
     }
-    printf("\n>>>>>>>> Total Device Count: %d\n", device_count);
+    printf("\n>>>>>>>> Total Device Count: %d <<<<<<<<\n", device_count);
 }
 
 
