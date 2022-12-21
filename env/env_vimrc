@@ -1,14 +1,11 @@
 syntax on
 colorscheme desert
-set background=dark
-set guifont=Monospace\ 11
+" set background=dark
+" set guifont=Monospace\ 11
 hi normal guifg=white guibg=black
 hi comment ctermfg=red guifg=red
 
 imap jj <Esc>
-
-set nocompatible
-set confirm
 
 set autoindent
 set cindent
@@ -40,26 +37,14 @@ filetype on
 filetype plugin on
 filetype indent on
 
-set report=0
-
-set showmatch
-set matchtime=5
-set scrolloff=3
-
 " set cursorline
 " hi CursorLine term=bold cterm=bold gui=bold ctermbg=0x808080 guibg=grey4
 
 set visualbell
+set t_vb=
 
 autocmd BufNewFile,BufRead * setlocal formatoptions-=cro
 
-autocmd BufRead,BufNewFile SConscript set filetype=python
-autocmd BufRead,BufNewFile *.json set filetype=json
-autocmd BufNewFile,BufRead *.py set filetype=python
-autocmd BufNewFile,BufRead *.m set filetype=octave
-autocmd BufNewFile,BufRead *.cu set filetype=cuda
-autocmd BufNewFile,BufRead *.cl set filetype=opencl
-autocmd BufNewFile,BufRead makefile.rules set filetype=make
 
 fun! ShowFuncName()
     let lnum = line(".")

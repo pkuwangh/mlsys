@@ -20,13 +20,14 @@ if platform.system() == "Linux":
         pkg_list = ["cmake3", "gcc", "gcc-c++", "numactl-devel", "boost-devel"]
     elif pkg_manager == "apt":
         pkg_list = [
+            "numactl",
             "cmake",
-            "gcc-10",
-            "g++-10",
+            "gcc",
+            "g++",
             "libnuma-dev",
             "libboost-program-options-dev",
         ]
-    cmd = [pkg_manager, "install", "-y"] + pkg_list
+    cmd = ["sudo", pkg_manager, "install", "-y"] + pkg_list
 
 elif platform.system() == "Darwin":
     pkg_list = ["cmake", "boost"]
