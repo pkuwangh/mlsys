@@ -77,11 +77,18 @@ sstat -j <job id>
 scontrol show job [job id]
 
 # run!
+# [srun, sbatch, salloc] all support
+# -p <partition>
+# --account <account name>
+# --reservation <reservation name>
+# to request GPUs
+# add somethiing like --gres=gpu:8
+
 # create a resource alloc and launch tasks for a job step in one command
 # number of nodes to run on
 srun -N3 -l /bin/hostname
 # number of tasks to run
-srun -n4 -l /bin/hostname
+srun -N4 -l /bin/hostname
 
 # submit a script for later execution
 # on specific nodes, subsequent job steps spawn 4 tasks each;
@@ -90,7 +97,7 @@ sbatch -n4 -w "gpu-n31-[01-03]" -o demo.stdout ./examples/slurm-sbatch-demo-scri
 
 # create a resource alloc and spawn job steps
 # create resource allocation
-salloc -N16 -p <partition> [--reservation name -w hosts -x hosts --nodefile filename] bash
+salloc -N16 [-w hosts / -x hosts / --nodefile filename] bash
 # this start a shell within the allocation
 # transfer file to each node
 sbcast ./examples/slurm-runner-sbcast-demo.sh /tmp/runner.sh
