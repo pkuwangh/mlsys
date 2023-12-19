@@ -6,4 +6,3 @@
 *.fatbin
 
 __pycache__/
-fb_*

@@ -48,13 +48,16 @@ Concepts
 ### Example commands
 
 ```bash
-# cluster/machines
+# machines
 sinfo -p <partition>
 sinfo -T  # reservation info
 sinfo -R  # reason for down / drained nodes
 sinfo -n <nodes> -v
+
+# resource
 scontrol show <entity> [ID]
 # entity can be partition, reservation, node, topology, or job
+scontrol show reservation [reservation]
 scontrol show partition [partition]
 scontrol show node [nodes]
 
@@ -62,6 +65,7 @@ scontrol show node [nodes]
 # historic job ID & name, AllocCPUs, state
 sacct [-u <USER>]
 sacct -a -r <partition> -s <state>  # running: r
+sacct -a --format="JobID,JobName,User,Reservation,Partition,Account,State,ExitCode,Elapsed,NNodes"
 sacct -j <job id> -l --json | jq
 
 # running job ID & name, user, nodes, node list
