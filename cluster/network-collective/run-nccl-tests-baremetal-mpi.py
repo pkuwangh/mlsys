@@ -59,23 +59,36 @@ def get_hostlist(args):
     return sorted(list(set(hostlist)))
 
 
-def get_cmd(args, hostlist, test_name):
+def get_cmd(args, hostlist, test_name, split_mask="0x0"):
     cmd = ["mpirun"]
     cmd += ["--mca", "btl", "tcp,self"]
     if args.tcp_if:
         cmd += ["--mca", "btl_tcp_if_include", args.tcp_if]
     cmd += ["-np", str(len(hostlist))]
     cmd += ["--host", ",".join(hostlist)]
-    cmd += ["-x", "NCCL_DEBUG=INFO"]
+    cmd += ["-x", "NCCL_DEBUG=DEBUG"]
     cmd += ["-x", "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"]
+    if test_name.startswith("all"):
+        cmd += ["-x", f"NCCL_TESTS_SPLIT_MASK={split_mask}"]
     cmd += [get_bin(args, test_name)]
     cmd += [f"-t{args.num_gpus}"]
-    cmd += [f"-g1"]
+    cmd += ["-g1"]
     cmd += [f"-b{args.begin_size}"]
     cmd += [f"-e{args.end_size}"]
-    cmd += [f"-f2"]
-    cmd += [f"-c0"]
+    cmd += ["-f2"]
+    cmd += ["-c0"]
+    cmd += [f"-n{args.niters}"]
     return cmd
+
+
+def get_cmds(args, hostlist, test_name):
+    cmds = []
+    if test_name.startswith("all"):
+        for split_mask in ["0x0", "0x3", "0x7"]:
+            cmds.append(get_cmd(args, hostlist, test_name, split_mask))
+    else:
+        cmds.append(get_cmd(args, hostlist, test_name))
+    return cmds
 
 
 def main(args):
@@ -86,10 +99,11 @@ def main(args):
     testlist = args.test if len(args.test) == 1 else args.test[1:]
     for test_name in testlist:
         print(f"\nRunning {test_name} ...")
-        cmd = get_cmd(args, hostlist, test_name)
-        print(" ".join(cmd))
-        if args.real:
-            os.system(" ".join(cmd))
+        cmds = get_cmds(args, hostlist, test_name)
+        for cmd in cmds:
+            print(" ".join(cmd))
+            if args.real:
+                os.system(" ".join(cmd))
 
 
 def get_nccl_tests():
@@ -138,7 +152,7 @@ def setup_parser():
         action="append",
         default=["sendrecv"],
         choices=get_nccl_tests(),
-        help="specific NCCL tests; accept multiple -t",
+        help="specific NCCL tests; accept multiple --test",
     )
     parser.add_argument(
         "--num-gpus",
@@ -160,6 +174,13 @@ def setup_parser():
         type=str,
         default="2g",
         help="message size end",
+    )
+    parser.add_argument(
+        "--niters",
+        "-n",
+        type=int,
+        default=20,
+        help="number of iterations",
     )
     parser.add_argument("--real", action="store_true", help="for real")
     return parser
