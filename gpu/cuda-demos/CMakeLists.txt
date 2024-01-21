@@ -12,6 +12,8 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release")
 endif()
 
+set(Boost_USE_STATIC_LIBS ON)
+find_package(Boost COMPONENTS program_options REQUIRED)
 execute_process(
     COMMAND git describe --always --tags
     WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
@@ -34,7 +36,7 @@ foreach(TEST ${TESTS})
     add_executable(${TEST} ${TEST}.cu)
 
     target_include_directories(${TEST} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} .)
-    target_link_libraries(${TEST} ${NVML_LIB_NAME} cuda)
+    target_link_libraries(${TEST} Boost::program_options ${NVML_LIB_NAME} cuda)
 
     install(TARGETS ${TEST} DESTINATION "bin")
 endforeach()

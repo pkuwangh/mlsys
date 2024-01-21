@@ -1,4 +1,4 @@
 #!/bin/bash
 
-numastat -mz | grep Mem
+numastat -mz | grep -e "Mem\|HugePages_"
 
