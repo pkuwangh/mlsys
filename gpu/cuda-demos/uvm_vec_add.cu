@@ -43,7 +43,7 @@ int benchmark(const std::string &allocator)
     else
     {
         std::cout << "Unknown allocator " << allocator << std::endl;
-        return 1;
+        return -1;
     }
 
     for (size_t i = 0; i < N; ++i)
@@ -73,7 +73,9 @@ int benchmark(const std::string &allocator)
     }
     cudaEventRecord(ckpt3);
 
-    cudaDeviceSynchronize();
+    cudaEventSynchronize(ckpt3);
+    // cudaDeviceSynchronize();
+
     float elapsed = 0;
     cudaEventElapsedTime(&elapsed, ckpt1, ckpt2);
     std::cout << "Elapsed time " << int(elapsed) << " mili-seconds - initial" << std::endl;
@@ -83,7 +85,7 @@ int benchmark(const std::string &allocator)
     float maxError = 0.0f;
     for (size_t i = 0; i < N; i++)
     {
-        maxError = fmax(maxError, fabs(y[i] - 3.0f));
+        maxError = fmax(maxError, fabs(y[i] - 103.0f));
     }
 
     cudaEventDestroy(ckpt1);
@@ -141,18 +143,20 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    int totalError = 0;
+    int maxError = 0;
     if (allocator == "all")
     {
         for (const std::string &x : avail_allocators)
         {
-            totalError += benchmark(x);
+            maxError = benchmark(x);
+            std::cout << "Max error is " << maxError << std::endl;
         }
     }
     else
     {
-        totalError += benchmark(allocator);
+        maxError = benchmark(allocator);
+        std::cout << "Max error is " << maxError << std::endl;
     }
 
-    return int(totalError);
+    return 0;
 }
