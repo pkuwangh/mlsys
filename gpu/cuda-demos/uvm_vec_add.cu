@@ -23,7 +23,9 @@ __global__ void add(size_t n, float *x, float *y)
 int benchmark(const std::string &allocator)
 {
     size_t N = (size_t)(2) << 30; // 2G x 4B x 2
+    size_t allocSize = N * sizeof(float);
     float *x, *y;
+    CUmemGenericAllocationHandle handleX, handleY;
 
     if (allocator == "cudaMallocManaged")
     {
@@ -34,6 +36,56 @@ int benchmark(const std::string &allocator)
     {
         cudaMallocHost(&x, N * sizeof(float));
         cudaMallocHost(&y, N * sizeof(float));
+    }
+    else if (allocator == "cuMemCreate")
+    {
+        // get device handle
+        int cudaDev;
+        CUdevice currentDev;
+        cudaGetDevice(&cudaDev);
+        cuDeviceGet(&currentDev, cudaDev);
+        std::cout << "get cuda device " << cudaDev << "/" << currentDev << std::endl;
+        // get cpu NUMA id and set location type
+        int cpuNumaNodeId = -1;
+        CUmemLocationType type = CU_MEM_LOCATION_TYPE_DEVICE;
+        cuDeviceGetAttribute(&cpuNumaNodeId, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, currentDev);
+        bool hostMem = (cpuNumaNodeId != -1);
+        type = hostMem ? CU_MEM_LOCATION_TYPE_HOST_NUMA : type;
+        std::cout << "hostMem-" << hostMem << ", host numa ID=" << cpuNumaNodeId << std::endl;
+        // memory allocation property
+        CUmemAllocationProp memprop = {};
+        memprop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        memprop.location.type = type;
+        memprop.location.id = hostMem ? cpuNumaNodeId : currentDev;
+        // size & granularity
+        size_t allocSize = N * sizeof(float);
+        size_t granu = 0;
+        cuMemGetAllocationGranularity(&granu, &memprop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+        size_t origSize = allocSize;
+        if (allocSize % granu > 0)
+        {
+            allocSize = granu * (allocSize / granu + 1);
+        }
+        std::cout << "requested size=" << origSize << ", padded alloc size=" << allocSize
+                  << ", granularity=" << granu << std::endl;
+        // physical memory allocation
+        cuMemCreate(&handleX, allocSize, &memprop, 0);
+        cuMemCreate(&handleY, allocSize, &memprop, 0);
+        // reserve an address space and map it to a pointer
+        cuMemAddressReserve((CUdeviceptr*)(&x), allocSize, 0, 0, 0);
+        cuMemAddressReserve((CUdeviceptr*)(&y), allocSize, 0, 0, 0);
+        cuMemMap((CUdeviceptr)x, allocSize, 0, handleX, 0);
+        cuMemMap((CUdeviceptr)y, allocSize, 0, handleY, 0);
+        // explicitly protect mapped VA ranges
+        CUmemAccessDesc accessDesc[2] = {{}};
+        accessDesc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        accessDesc[0].location.id = currentDev;
+        accessDesc[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        accessDesc[1].location.type = type;
+        accessDesc[1].location.id = hostMem ? cpuNumaNodeId : currentDev;
+        accessDesc[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        cuMemSetAccess((CUdeviceptr)x, allocSize, accessDesc, hostMem ? 2 : 1);
+        cuMemSetAccess((CUdeviceptr)y, allocSize, accessDesc, hostMem ? 2 : 1);
     }
     else if (allocator == "malloc")
     {
@@ -92,7 +144,13 @@ int benchmark(const std::string &allocator)
     cudaEventDestroy(ckpt2);
     cudaEventDestroy(ckpt3);
 
-    if (allocator == "malloc")
+    if (allocator == "cuMemCreate") {
+        cuMemAddressFree((CUdeviceptr)x, allocSize);
+        cuMemAddressFree((CUdeviceptr)y, allocSize);
+        cuMemRelease(handleX);
+        cuMemRelease(handleY);
+    }
+    else if (allocator == "malloc")
     {
         free(x);
         free(y);
@@ -108,8 +166,8 @@ int benchmark(const std::string &allocator)
 int main(int argc, char **argv)
 {
     std::set<std::string> avail_allocators({"cudaMallocHost",
-                                            "cuMemCreate",
                                             "cudaMallocManaged",
+                                            "cuMemCreate",
                                             "malloc"});
     std::string allocator;
     po::options_description all_opts("uvm_vec_add CLI");
