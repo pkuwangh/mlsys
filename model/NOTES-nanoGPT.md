@@ -6,6 +6,12 @@
 
 ## Quickstart with a tiny model
 
+Install deps
+
+```bash
+pip3 install -r requirements-nanoGPT.txt
+```
+
 Download data
 
 ```bash
@@ -58,4 +64,15 @@ Finetuning - continue training from a checkpoint
 ```bash
 # also init_from='gpt2'
 python3 train.py config/finetune_shakespeare.py
+```
+
+Sample/Inference
+
+```bash
+python3 sample.py --start="When you look in the mirror" \
+    --num_samples=2 --max_new_tokens=100 \
+    --init_from=gpt2
+python3 sample.py --start="When you look in the mirror" \
+    --num_samples=2 --max_new_tokens=100 \
+    --out_dir=out-shakespeare
 ```
