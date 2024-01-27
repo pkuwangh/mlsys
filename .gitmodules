@@ -1,3 +1,3 @@
 [submodule "model/nanoGPT"]
-	path = model/nanoGPT
+	path = mlsys/model/nanoGPT
 	url = https://github.com/pkuwangh/nanoGPT.git
