@@ -1,6 +1,6 @@
 #!/bin/bash
 
-virtualenv workspace/venv
+virtualenv workspace/my_venv
 
-source workspace/venv/bin/activate
+source workspace/my_venv/bin/activate
 
