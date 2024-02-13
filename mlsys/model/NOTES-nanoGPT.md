@@ -6,12 +6,6 @@
 
 ## Quickstart with a tiny model
 
-Install deps
-
-```bash
-pip3 install -r requirements-nanoGPT.txt
-```
-
 Download data
 
 ```bash
