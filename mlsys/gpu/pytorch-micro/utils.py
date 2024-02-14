@@ -39,7 +39,7 @@ def CompCap2Throughput(major, minor):
         return (0, 0, 0, 0, 0)
 
 
-def get_device_properties(device_idx=0, verbose=False):
+def get_device_properties(device_idx=0, verbose=0):
     # https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities
     # Ada  https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf
     # A100 https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf
@@ -53,8 +53,8 @@ def get_device_properties(device_idx=0, verbose=False):
     for i in range(device_count):
         device = cuda.Device(i)
         properties = device.get_attributes()
-        print(f"Device {i} ({device.name()}) Properties:")
-        if verbose:
+        if verbose >= 2:
+            print(f"Device {i} ({device.name()}) Properties:")
             pprint.pprint(properties)
 
     properties = cuda.Device(i).get_attributes()
@@ -78,24 +78,24 @@ def get_device_properties(device_idx=0, verbose=False):
     fp16_flops = fp32_flops * 2
     fp64_flops = fp32_flops / fp32_to_fp64_ratio
     fp16tc_flops = tc_flops_per_clk_per_sm * sm_count * sm_clock / 1e9
-    print("=========================================")
-    print(f"SMs: {sm_count}")
-    print(f"fp32 Cores: {fp32_core_count}")
-    print(f"Tensor Cores: {tensor_core_count}")
-    print(f"SM Clock: {sm_clock/ 1e6:.2f} GHz")
-    print(f"fp64: {fp64_flops:.2f} TFLOPs")
-    print(f"fp32: {fp32_flops:.2f} TFLOPs")
-    print(f"fp16: {fp16_flops:.2f} TFLOPs")
-    print(f"int8: {fp32_flops * 4:.2f} TFLOPs")
-    print(f"tc-fp16: {fp16tc_flops :.2f} TFLOPs")
-
     memory_clock = properties[cuda.device_attribute.MEMORY_CLOCK_RATE]
     memory_bus_width = properties[cuda.device_attribute.GLOBAL_MEMORY_BUS_WIDTH]
     memory_bandwidth = memory_clock * memory_bus_width * 2 / 8e9
     tc_flop_per_byte = fp16tc_flops / memory_bandwidth
-    print(f"memory bw: {memory_bandwidth :.2f} TB/s")
-    print(f"TC flop_per_byte: {tc_flop_per_byte :.2f}")
-    print("=========================================")
+    if verbose >= 1:
+        print("=========================================")
+        print(f"SMs: {sm_count}")
+        print(f"fp32 Cores: {fp32_core_count}")
+        print(f"Tensor Cores: {tensor_core_count}")
+        print(f"SM Clock: {sm_clock/ 1e6:.2f} GHz")
+        print(f"fp64: {fp64_flops:.2f} TFLOPs")
+        print(f"fp32: {fp32_flops:.2f} TFLOPs")
+        print(f"fp16: {fp16_flops:.2f} TFLOPs")
+        print(f"int8: {fp32_flops * 4:.2f} TFLOPs")
+        print(f"tc-fp16: {fp16tc_flops :.2f} TFLOPs")
+        print(f"memory bw: {memory_bandwidth :.2f} TB/s")
+        print(f"TC flop_per_byte: {tc_flop_per_byte :.2f}")
+        print("=========================================")
 
     return {
         "sm_count": sm_count,
@@ -113,5 +113,11 @@ def get_device_properties(device_idx=0, verbose=False):
     }
 
 
+def print_flops(tflops: float, op_type: str, prefix="run"):
+    props = get_device_properties()
+    perc = tflops * 100 / props[op_type]
+    print(f"{prefix}: {tflops:.2f} TFLOPs ({perc:.0f}%)", flush=True)
+
+
 if __name__ == "__main__":
-    get_device_properties(verbose=True)
+    get_device_properties(verbose=2)
