@@ -97,14 +97,14 @@ srun -N4 -l /bin/hostname
 # submit a script for later execution
 # on specific nodes, subsequent job steps spawn 4 tasks each;
 # in the script, options can be added with a prefix of "#SBATCH"
-sbatch -n4 -w "gpu-n31-[01-03]" -o demo.stdout ./examples/slurm-sbatch-demo-script.sh
+sbatch -n4 -w "gpu-n31-[01-03]" -o demo.stdout ./slurm-examples/slurm-sbatch-demo-script.sh
 
 # create a resource alloc and spawn job steps
 # create resource allocation
 salloc -N16 [-w hosts / -x hosts / --nodefile filename] bash
 # this start a shell within the allocation
 # transfer file to each node
-sbcast ./examples/slurm-runner-sbcast-demo.sh /tmp/runner.sh
+sbcast ./slurm-examples/slurm-runner-sbcast-demo.sh /tmp/runner.sh
 # launch the run
 srun /tmp/runner.sh
 srun rm /tmp/runner.sh
