@@ -1,3 +1,6 @@
 [submodule "model/nanoGPT"]
 	path = mlsys/model/nanoGPT
 	url = https://github.com/pkuwangh/nanoGPT.git
+[submodule "mlsys/environments/packages/nccl"]
+	path = mlsys/environments/packages/nccl
+	url = https://github.com/pkuwangh/nccl.git
