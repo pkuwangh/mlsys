@@ -4,3 +4,6 @@
 [submodule "mlsys/environments/packages/nccl"]
 	path = mlsys/environments/packages/nccl
 	url = https://github.com/pkuwangh/nccl.git
+[submodule "mlsys/environments/packages/pytorch-fork"]
+	path = mlsys/environments/packages/pytorch-fork
+	url = https://github.com/pkuwangh/pytorch.git
