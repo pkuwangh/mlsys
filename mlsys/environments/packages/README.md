@@ -38,5 +38,5 @@ export _GLIBCXX_USE_CXX11_ABI=1
 # nccl
 # look at ../source_me_packages.sh
 # build!
-USE_CUDA=1 TORCH_CUDA_ARCH_LIST="9.0" USE_NCCL=1 python3 setup.py develop
+USE_CUDA=1 TORCH_CUDA_ARCH_LIST="9.0" USE_NCCL=1 USE_SYSTEM_NCCL=1 python3 setup.py develop
 ```
