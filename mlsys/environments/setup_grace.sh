@@ -21,4 +21,6 @@ checkMsg " - To install directly, search with ./scripts/find_nccl.sh"
 # pytorch!
 infoMsg "To install PyTorch:"
 checkMsg " - To build on your own, follow packages/README.md"
-checkMsg " - To use pre-built, run ./scripts/install_pytorch_grace.sh"
+checkMsg " - To use pre-built, run"
+checkMsg "   - ./scripts/install_pytorch_grace_nccl.sh with NCCL/UCC support"
+checkMsg "   - ./scripts/install_pytorch_grace_plain.sh without NCCL support"
