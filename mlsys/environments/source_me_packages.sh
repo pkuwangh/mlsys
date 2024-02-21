@@ -15,21 +15,22 @@ else
     fi
 fi
 infoMsg "CUDA_HOME=${CUDA_HOME}"
+checkMsg "Set same for CUDA_PATH, CUDA_ROOT, CUDA_TOOLKIT_ROOT_DIR"
+export CUDA_PATH="${CUDA_HOME}"
+export CUDA_ROOT="${CUDA_HOME}"
+export CUDA_TOOLKIT_ROOT_DIR="${CUDA_HOME}"
 
 # nccl
-NCCL_PATH="${CURR_DIR}/packages/nccl/build"
-if [ -d "${NCCL_PATH}" ]; then
-    export NCCL_ROOT="${NCCL_PATH}"
-    export NCCL_LIB_DIR="${NCCL_ROOT}/lib"
-    export NCCL_INCLUDE_DIR="${NCCL_ROOT}/include"
-else
-    checkMsg "Locally built NCCL not found, using default NCCL_PATH"
-fi
+export NCCL_ROOT="${CURR_DIR}/packages/nccl/build"
 infoMsg "NCCL_ROOT=${NCCL_ROOT}"
+if [ ! -d "${NCCL_ROOT}" ]; then
+    checkMsg "Locally built NCCL not found (yet)"
+    checkMsg "Consider build NCCL or set env NCCL_ROOT properly"
+fi
 
 # system paths
 export PATH="${CUDA_HOME}/bin:${PATH}"
-export CPATH="${NCCL_PATH}/include:${CPATH}"
-export LIBRARY_PATH="${NCCL_PATH}/lib:${LIBRARY_PATH}"
-export LD_LIBRARY_PATH="${NCCL_PATH}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+export CPATH="${NCCL_ROOT}/include:${CPATH}"
+export LIBRARY_PATH="${NCCL_ROOT}/lib:${LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${NCCL_ROOT}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 infoMsg "nvcc=$(which nvcc)"
