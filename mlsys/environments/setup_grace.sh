@@ -1,14 +1,24 @@
 #!/bin/bash
 
+# get current directory
+CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${CURR_DIR}/scripts/common.sh"
+
+# system dependecies
+infoMsg "Installing system dependencies"
 sudo apt-get install libcudnn9-cuda-12 libcudnn9-dev-cuda-12
 sudo apt-get install libopenblas-dev mpich
 
+# python requirements
+infoMsg "Installing python modules"
 pip3 install numpy packaging
 
-# pip3 uninstall torch torchvision torchaudio
+# nccl!
+infoMsg "To install NCCL:"
+checkMsg " - To build on your own, follow packages/README.md"
+checkMsg " - To install directly, search with ./scripts/find_nccl.sh"
 
-# without nccl support
-# pip3 install http://10.31.241.55/nvdl/datasets/pip-scratch/jp/v60dp/pytorch/torch-2.2.0a0+81ea7a4.nv24.01-cp310-cp310-linux_aarch64.whl
-
-# with nccl support
-# pip3 install http://10.31.241.55/nvdl/datasets/pip-scratch/nvidia-pytorch/torch-2.3.0a0+ebedce2.nv99.99.sbsa.12772057-cp310-cp310-linux_aarch64.whl
+# pytorch!
+infoMsg "To install PyTorch:"
+checkMsg " - To build on your own, follow packages/README.md"
+checkMsg " - To use pre-built, run ./scripts/install_pytorch_grace.sh"

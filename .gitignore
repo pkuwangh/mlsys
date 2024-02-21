@@ -8,3 +8,6 @@
 *.swp
 
 __pycache__/
+
+/workspace/my_venv
+
