@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=process-group --nodes=2
+#SBATCH --job-name=process-group --nodes=2 --ntasks-per-node=1 --gpus-per-node=1
 
 export MLSYS_ROOT="/home/nvidia/haowan/mlsys"
 TARGET_BIN="${MLSYS_ROOT}/mlsys/dist-process/demo-process-group/srun.sh"

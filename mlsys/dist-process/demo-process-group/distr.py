@@ -77,7 +77,10 @@ if __name__ == "__main__":
 
     # Run a single training step
     demo_data_parallel()
+    torch.distributed.barrier()
+
     # Run a multi-gpu all reduce
     demo_all_reduce()
+    torch.distributed.barrier()
 
     torch.distributed.destroy_process_group()
