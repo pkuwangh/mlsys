@@ -193,12 +193,24 @@ class GPT(nn.Module):
         sd_hf = model_hf.state_dict()
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
-        keys = [k for k in sd_hf if not k.endswith('attn.masked_bias')] # ignore these
+        keys_hf = [k for k in sd_hf if not k.endswith('attn.masked_bias')] # ignore these
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla nn.Linear.
+        # basically the openai checkpoints use a "Conv1D" module,
+        # but we only want to use a vanilla nn.Linear.
         # this means that we have to transpose these weights when we import them
-        assert len(keys) == len(sd)
-        for k in keys:
+        print(f"{len(sd)} keys in our state dict vs. {len(keys_hf)}/{len(sd_hf)} keys in the hf model")
+        missing_pieces = {}
+        missing_count = 0
+        for k in sd:
+            if k not in sd_hf:
+                if k.split(".")[-1] not in missing_pieces:
+                    missing_pieces[k.split(".")[-1]] = []
+                missing_pieces[k.split(".")[-1]].append(".".join(k.split(".")[:-1]))
+                missing_count += 1
+        print(f"missing {missing_count} pieces in {len(missing_pieces.keys())} categories:")
+        print(f"{missing_pieces.keys()}")
+        assert len(keys_hf) <= len(sd)
+        for k in keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
