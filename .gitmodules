@@ -7,3 +7,6 @@
 [submodule "mlsys/environments/packages/pytorch-fork"]
 	path = mlsys/environments/packages/pytorch-fork
 	url = https://github.com/pkuwangh/pytorch.git
+[submodule "mlsys/services/redis/redis"]
+	path = mlsys/services/redis/redis
+	url = https://github.com/redis/redis.git
