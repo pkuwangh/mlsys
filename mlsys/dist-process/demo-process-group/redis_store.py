@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
+import atexit
+import os
 import redis
+import subprocess
 import time
 from datetime import timedelta
 from torch.distributed import Store
@@ -9,13 +12,24 @@ from typing import List, overload
 
 
 class RedisStore(Store):
-    def __init__(self, host: str, port: int, is_server: bool, wait_interval: float=0.1):
+    def __init__(
+        self, host: str, port: int, is_server: bool, wait_interval: float = 0.1
+    ):
         # call base class constructor
         super(RedisStore, self).__init__()
         if is_server:
             print("Starting Redis server", flush=True)
-        print(f"Connecting to Redis server at {host}:{port}", flush=True)
-        self._redis = redis.Redis(host=host, port=port, db=0)
+            curr_dir = os.path.dirname(os.path.abspath(__file__))
+            redis_dir = os.path.join(curr_dir, "../../services/redis")
+            redis_bin = os.path.join(redis_dir, "redis/src/redis-server")
+            redis_conf = os.path.join(redis_dir, "redis.conf")
+            proc = subprocess.Popen(
+                [redis_bin, redis_conf],
+                stdout=None,
+                stderr=None,
+                shell=False,
+            )
+            atexit.register(proc.terminate)
         if isinstance(_DEFAULT_PG_NCCL_TIMEOUT, timedelta):
             self._timeout = _DEFAULT_PG_NCCL_TIMEOUT
         elif isinstance(_DEFAULT_PG_TIMEOUT, timedelta):
@@ -23,6 +37,17 @@ class RedisStore(Store):
         else:
             self._timeout = timedelta(seconds=1200)
         self._wait_interval = wait_interval
+        print(f"Connecting to Redis server at {host}:{port}", flush=True)
+        self._redis = redis.Redis(host=host, port=port, db=0)
+        curr_time = time.time()
+        while True:
+            try:
+                self._redis.ping()
+                break
+            except redis.exceptions.ConnectionError:
+                if time.time() - curr_time > 60:
+                    raise TimeoutError("Timeout connecting to Redis server")
+                time.sleep(1)
 
     def set(self, key: str, value: str):
         self._redis.set(key, value)
@@ -58,9 +83,8 @@ class RedisStore(Store):
                 self._redis.set(key, desired_value)
             return existing_value
 
-
     def delete_key(self, key: str) -> bool:
-        return (self._redis.delete(key) > 0)
+        return self._redis.delete(key) > 0
 
     def num_keys(self) -> int:
         count = len(self._redis.keys())
