@@ -6,7 +6,7 @@ if [ -z ${MADDR} ]; then
 fi
 # init master address and port
 export MASTER_ADDR=${MADDR}
-export MASTER_PORT=12345
+export MASTER_PORT=6379
 
 # check if the environment variables are set
 if [ -z ${OMPI_COMM_WORLD_RANK} ]; then

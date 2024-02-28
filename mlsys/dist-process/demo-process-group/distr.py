@@ -9,6 +9,8 @@ import torch.optim as optim
 from datetime import datetime
 from torch.nn.parallel import DistributedDataParallel
 
+from redis_store import RedisStore
+
 
 class ToyModel(nn.Module):
     def __init__(self):
@@ -63,24 +65,35 @@ def demo_all_reduce():
 
 if __name__ == "__main__":
     # test env
-    MY_RANK = os.environ.get("RANK", "0")
-    MY_WORLD_SIZE = os.environ.get("WORLD_SIZE", "1")
-    if not MY_RANK or not MY_WORLD_SIZE:
-        print("RANK or WORLD_SIZE is not set.")
+    MY_RANK = int(os.environ.get("RANK", None))
+    MY_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", None))
+    MASTER_ADDR = os.environ.get("MASTER_ADDR", None)
+    MASTER_PORT = int(os.environ.get("MASTER_PORT", None))
+    if any([x is None for x in [MY_RANK, MY_WORLD_SIZE, MASTER_ADDR, MASTER_PORT]]):
+        print("RANK or WORLD_SIZE or MASTER_ADDR or MASTER_PORT is not set.")
         sys.exit(1)
 
     print("Initializing process group.")
     # initialize the distributed environment
     # create a process group and set the communication backend to be NCCL
     # assign each process a unique rank and initialize the network connections
-    torch.distributed.init_process_group("nccl")
+    if MASTER_PORT == 6379:
+        redis_store = RedisStore(MASTER_ADDR, MASTER_PORT, MY_RANK == 0)
+        torch.distributed.init_process_group(
+            backend="nccl",
+            world_size=MY_WORLD_SIZE,
+            rank=MY_RANK,
+            store=redis_store,
+        )
+    else:
+        torch.distributed.init_process_group(backend="nccl")
 
     # Run a single training step
     demo_data_parallel()
     torch.distributed.barrier()
 
     # Run a multi-gpu all reduce
-    demo_all_reduce()
-    torch.distributed.barrier()
+    # demo_all_reduce()
+    # torch.distributed.barrier()
 
     torch.distributed.destroy_process_group()
