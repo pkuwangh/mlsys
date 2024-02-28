@@ -8,7 +8,7 @@ warnMsg() {
     echo -e "\033[31;1m${1}\033[0m"
 }
 
-checkMsg() {
+debugMsg() {
     echo -e "\033[33;5m${1}\033[0m"
 }
 

@@ -8,14 +8,14 @@ source "${CURR_DIR}/scripts/common.sh"
 if [ -f "${CURR_DIR}/env_cuda_home.sh" ]; then
     source "${CURR_DIR}/env_cuda_home.sh"
 else
-    checkMsg "env_cuda_home.sh not found, using system default"
+    debugMsg "env_cuda_home.sh not found, using system default"
     if [ -z "${CUDA_HOME}" ]; then
-        checkMsg "CUDA_HOME not set, using default"
+        debugMsg "CUDA_HOME not set, using default"
         export CUDA_HOME="/usr/local/cuda"
     fi
 fi
 infoMsg "CUDA_HOME=${CUDA_HOME}"
-checkMsg "Set same for CUDA_PATH, CUDA_ROOT, CUDA_TOOLKIT_ROOT_DIR"
+debugMsg "Set same for CUDA_PATH, CUDA_ROOT, CUDA_TOOLKIT_ROOT_DIR"
 export CUDA_PATH="${CUDA_HOME}"
 export CUDA_ROOT="${CUDA_HOME}"
 export CUDA_TOOLKIT_ROOT_DIR="${CUDA_HOME}"
@@ -24,8 +24,8 @@ export CUDA_TOOLKIT_ROOT_DIR="${CUDA_HOME}"
 export NCCL_ROOT="${CURR_DIR}/packages/nccl/build"
 infoMsg "NCCL_ROOT=${NCCL_ROOT}"
 if [ ! -d "${NCCL_ROOT}" ]; then
-    checkMsg "Locally built NCCL not found (yet)"
-    checkMsg "Consider build NCCL or set env NCCL_ROOT properly"
+    debugMsg "Locally built NCCL not found (yet)"
+    debugMsg "Consider build NCCL or set env NCCL_ROOT properly"
 fi
 
 # system paths
