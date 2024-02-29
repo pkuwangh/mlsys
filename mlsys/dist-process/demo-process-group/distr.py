@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -87,10 +88,27 @@ if __name__ == "__main__":
         )
     else:
         torch.distributed.init_process_group(backend="nccl")
+    print("init_process_group done.", flush=True)
+    redis_store.dump_keys()
+    time.sleep(3)
+
+    print("\nEntering barrier1...", flush=True)
+    torch.distributed.barrier()
+    print("\nPassing barrier1...", flush=True)
+    redis_store.dump_keys()
+    time.sleep(3)
+
+    print("\nCreating group...", flush=True)
+    group = torch.distributed.new_group(range(MY_WORLD_SIZE), backend="gloo")
+    redis_store.dump_keys()
+    time.sleep(3)
 
     # Run a single training step
-    demo_data_parallel()
+    # demo_data_parallel()
+
+    print("\nEntering barrier2...", flush=True)
     torch.distributed.barrier()
+    print("\nPassing barrier2...", flush=True)
 
     # Run a multi-gpu all reduce
     # demo_all_reduce()

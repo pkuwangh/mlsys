@@ -8,7 +8,7 @@ import time
 from datetime import timedelta
 from torch.distributed import Store
 from torch._C._distributed_c10d import _DEFAULT_PG_TIMEOUT, _DEFAULT_PG_NCCL_TIMEOUT
-from typing import List, overload
+from typing import List, Optional
 
 
 class RedisStore(Store):
@@ -49,10 +49,16 @@ class RedisStore(Store):
                     raise TimeoutError("Timeout connecting to Redis server")
                 time.sleep(1)
 
+    def dump_keys(self):
+        all_keys = self._redis.keys()
+        print(f"all keys: {','.join([k.decode('utf-8') for k in all_keys])}")
+
     def set(self, key: str, value: str):
+        print(f"setting key={key} value={value}")
         self._redis.set(key, value)
 
     def get(self, key: str) -> bytes:
+        print(f"reading key={key}")
         retries = [0, 1, self._timeout.total_seconds()]
         for retry_interval in retries:
             if retry_interval > 0:
@@ -95,14 +101,12 @@ class RedisStore(Store):
     def set_timeout(self, timeout: timedelta):
         self._timeout = timeout
 
-    @overload
-    def wait(self, keys: List[str]):
-        self.wait(keys, self._timeout)
-
-    @overload
-    def wait(self, keys: List[str], timeout: timedelta):
+    def wait(self, keys: List[str], timeout: Optional[timedelta]=None):
+        print(f"Waiting for keys {keys}", flush=True)
+        eff_timeout = self._timeout if timeout is None else timeout
         start_time = time.time()
         pipe = self._redis.pipeline()
+        remaining_keys = [x for x in keys]
         while len(remaining_keys) > 0:
             for key in remaining_keys:
                 pipe.get(key)
@@ -112,7 +116,7 @@ class RedisStore(Store):
                 if value is None:
                     remaining_keys.append(keys[i])
             curr_time = time.time()
-            if (curr_time - start_time) > timeout.total_seconds():
+            if (curr_time - start_time) > eff_timeout.total_seconds():
                 raise TimeoutError(f"Timeout waiting for keys {remaining_keys}")
             time.sleep(self._wait_interval)
 
