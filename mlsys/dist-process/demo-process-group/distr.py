@@ -79,7 +79,7 @@ if __name__ == "__main__":
     # create a process group and set the communication backend to be NCCL
     # assign each process a unique rank and initialize the network connections
     if MASTER_PORT == 6379:
-        redis_store = RedisStore(MASTER_ADDR, MASTER_PORT, MY_RANK == 0)
+        redis_store = RedisStore(MASTER_ADDR, MASTER_PORT, MY_RANK == 0, verbose=True)
         torch.distributed.init_process_group(
             backend="nccl",
             world_size=MY_WORLD_SIZE,

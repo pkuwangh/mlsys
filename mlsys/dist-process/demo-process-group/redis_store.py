@@ -7,7 +7,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta
 from torch.distributed import Store
-from typing import List, Optional
+from typing import List, Optional, overload
 
 
 class RedisStore(Store):
@@ -112,6 +112,14 @@ class RedisStore(Store):
 
     def set_timeout(self, timeout: timedelta):
         self._timeout = timeout
+
+    @overload
+    def wait(self, keys: List[str]):
+        ...
+
+    @overload
+    def wait(self, keys: List[str], timeout: timedelta):
+        ...
 
     def wait(self, keys: List[str], timeout: Optional[timedelta]=None):
         if self._verbose:
