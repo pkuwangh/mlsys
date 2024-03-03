@@ -36,7 +36,7 @@ export PATH="${MLSYS_ROOT}/workspace/my_venv/bin:${PATH}"
 export NCCL_SOCKET_IFNAME=enP4s1f1
 # export NCCL_DEBUG=INFO
 
-echo "Rank=${RANK} on $(hostname)"
+# echo "Rank=${RANK} on $(hostname)"
 
 python3 "${MLSYS_ROOT}/mlsys/dist-process/demo-process-group/distr.py"
 

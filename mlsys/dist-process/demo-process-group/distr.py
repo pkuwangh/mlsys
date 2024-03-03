@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import socket
 import sys
 import time
 import torch
@@ -66,49 +67,75 @@ def demo_all_reduce():
 
 if __name__ == "__main__":
     # test env
-    MY_RANK = int(os.environ.get("RANK", None))
-    MY_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", None))
+    MY_RANK = os.environ.get("RANK", None)
+    MY_WORLD_SIZE = os.environ.get("WORLD_SIZE", None)
     MASTER_ADDR = os.environ.get("MASTER_ADDR", None)
-    MASTER_PORT = int(os.environ.get("MASTER_PORT", None))
+    MASTER_PORT = os.environ.get("MASTER_PORT", None)
     if any([x is None for x in [MY_RANK, MY_WORLD_SIZE, MASTER_ADDR, MASTER_PORT]]):
         print("RANK or WORLD_SIZE or MASTER_ADDR or MASTER_PORT is not set.")
         sys.exit(1)
 
-    print("Initializing process group.")
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(f"Initializing process group from {socket.gethostname()} at {datetime.now()}.")
+    init_start= time.time()
     # initialize the distributed environment
     # create a process group and set the communication backend to be NCCL
     # assign each process a unique rank and initialize the network connections
-    if MASTER_PORT == 6379:
-        redis_store = RedisStore(MASTER_ADDR, MASTER_PORT, MY_RANK == 0, verbose=True)
-        torch.distributed.init_process_group(
-            backend="nccl",
-            world_size=MY_WORLD_SIZE,
-            rank=MY_RANK,
-            store=redis_store,
-        )
-    else:
-        torch.distributed.init_process_group(backend="nccl")
-    print("init_process_group done.", flush=True)
-    redis_store.dump_keys()
-    time.sleep(3)
+    store = None
+    verbose = 0
+    verbose = 2 if (int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1) else 0
+    store = RedisStore(int(MY_RANK) == 0, num_shards=1, verbose=verbose)
+    torch.distributed.init_process_group(
+        backend="gloo",
+        world_size=int(MY_WORLD_SIZE),
+        rank=int(MY_RANK),
+        store=store,
+    )
+    init_done = time.time()
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(f"\ninit_process_group done; elapsed={init_done - init_start}", flush=True)
+        if store:
+            store.dump_stats()
+            store.reset_stats()
+    time.sleep(10)
 
-    print("\nEntering barrier1...", flush=True)
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(f"Entering barrier1... at {datetime.now()}", flush=True)
+    barrier1_start = time.time()
     torch.distributed.barrier()
-    print("\nPassing barrier1...", flush=True)
-    redis_store.dump_keys()
-    time.sleep(3)
+    barrier1_end = time.time()
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(f"\nPassing barrier1; elapsed={barrier1_end - barrier1_start}", flush=True)
+        if store:
+            store.dump_stats()
+            store.reset_stats()
+    sys.exit(0)
+    time.sleep(10)
 
-    print("\nCreating group...", flush=True)
-    group = torch.distributed.new_group(range(MY_WORLD_SIZE), backend="gloo")
-    redis_store.dump_keys()
-    time.sleep(3)
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(f"Creating group... at {datetime.now()}", flush=True)
+    group_start = time.time()
+    group = torch.distributed.new_group(range(int(MY_WORLD_SIZE)), backend="nccl")
+    group_end = time.time()
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(f"\nCreating group done; elapsed={group_end - group_start}", flush=True)
+        if store:
+            store.dump_stats()
+            store.reset_stats()
+    time.sleep(10)
 
     # Run a single training step
     # demo_data_parallel()
 
-    print("\nEntering barrier2...", flush=True)
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(f"\nEntering barrier2... at {datetime.now()}", flush=True)
+    barrier2_start = time.time()
     torch.distributed.barrier()
-    print("\nPassing barrier2...", flush=True)
+    barrier2_end = time.time()
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(f"\nPassing barrier2; elapsed={barrier2_end - barrier2_start}", flush=True)
+        if store:
+            store.dump_stats()
 
     # Run a multi-gpu all reduce
     # demo_all_reduce()
