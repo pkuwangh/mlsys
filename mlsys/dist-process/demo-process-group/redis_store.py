@@ -85,7 +85,7 @@ class RedisStore(Store):
         is_server: bool,
         timeout: timedelta = timedelta(seconds=1200),
         num_shards: int = 1,
-        max_connections: int = 1,
+        max_connections: Optional[int] = None,
         wait_interval: float = 0.1,
         verbose: int = 0,
     ):
@@ -156,6 +156,10 @@ class RedisStore(Store):
     def dump_stats(self):
         self._stats.dump()
 
+    def dump_and_reset_stats(self):
+        self.dump_stats()
+        self.reset_stats()
+
     def set(self, key: str, value: str):
         start_time = time.time()
         shard_idx = self.get_shard_idx(key)
@@ -169,7 +173,6 @@ class RedisStore(Store):
         shard_idx = self.get_shard_idx(key)
         if self._verbose > 0:
             print(f"Getting {key} shard={shard_idx} at {self._get_timestamp()}")
-        start_time = time.time()
         retry = 0
         value = b""
         while True:
@@ -197,8 +200,8 @@ class RedisStore(Store):
         expected_value: str,
         desired_value: str,
     ) -> bytes:
-        shard_idx = self.get_shard_idx(key)
         start_time = time.time()
+        shard_idx = self.get_shard_idx(key)
         existing_value = self._redis_clients[shard_idx].get(key)
         res = None
         if existing_value is None:
@@ -241,7 +244,6 @@ class RedisStore(Store):
         if self._verbose > 0:
             print(f"Waiting for {keys} at {self._get_timestamp()}")
         eff_timeout = self._timeout if timeout is None else timeout
-        start_time = time.time()
         remaining_keys = keys
         while len(remaining_keys) > 0:
             current_keys = remaining_keys
@@ -258,4 +260,7 @@ class RedisStore(Store):
                 raise TimeoutError(f"Timeout waiting for keys {remaining_keys}")
             time.sleep(self._wait_interval)
             retry += 1
+        if self._verbose > 1:
+            delay_ms = 1000 * (time.time() - start_time)
+            print(f"Done waiting for {keys} delay={delay_ms} retry={retry}")
         self._stats.add_delay("wait", time.time() - start_time, retry)
