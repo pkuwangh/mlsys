@@ -1,2 +1,2 @@
-/hostlist.*
-/slurm-*.out
+hostlist.*
+slurm-*.out
