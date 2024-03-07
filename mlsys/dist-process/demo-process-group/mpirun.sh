@@ -10,8 +10,8 @@ MADDR=$(hostname -I | awk '{print $1}')
 
 mpirun \
 	--hostfile hostlist.superpowers \
-	-np 800 \
-	-N 50 \
+	-np 16 \
+	-N 1 \
 	--bind-to none \
 	-x MADDR=$MADDR \
     -x MLSYS_ROOT=$MLSYS_ROOT \

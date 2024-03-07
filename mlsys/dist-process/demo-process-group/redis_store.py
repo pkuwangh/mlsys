@@ -103,8 +103,7 @@ class RedisStore(Store):
             redis_bin = os.path.join(redis_path, "redis/src/redis-server")
             redis_conf = os.path.join(redis_path, "redis.conf")
             print(
-                f"Starting {num_shards} Redis server using "
-                f"{redis_bin} {redis_conf} on {host}"
+                f"Starting {num_shards} Redis server using " f"{redis_bin} {redis_conf} on {host}"
             )
             procs = []
             for i in range(num_shards):

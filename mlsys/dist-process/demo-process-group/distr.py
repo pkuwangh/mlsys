@@ -77,16 +77,16 @@ if __name__ == "__main__":
 
     if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
         print(f"Initializing process group from {socket.gethostname()} at {datetime.now()}.")
-    init_start= time.time()
+    init_start = time.time()
     # initialize the distributed environment
     # create a process group and set the communication backend to be NCCL
     # assign each process a unique rank and initialize the network connections
     store = None
     verbose = 0
-    verbose = 2 if (int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1) else 0
+    verbose = 1 if (int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1) else 0
     store = RedisStore(int(MY_RANK) == 0, num_shards=1, verbose=verbose)
     torch.distributed.init_process_group(
-        backend="gloo",
+        backend="nccl",
         world_size=int(MY_WORLD_SIZE),
         rank=int(MY_RANK),
         store=store,
@@ -95,34 +95,44 @@ if __name__ == "__main__":
     if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
         print(f"\ninit_process_group done; elapsed={init_done - init_start}", flush=True)
         if store:
-            store.dump_stats()
-            store.reset_stats()
-    time.sleep(10)
+            store.dump_and_reset_stats()
+    time.sleep(5)
 
     if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
-        print(f"Entering barrier1... at {datetime.now()}", flush=True)
+        print(f"\nEntering barrier1... at {datetime.now()}", flush=True)
     barrier1_start = time.time()
     torch.distributed.barrier()
     barrier1_end = time.time()
     if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
         print(f"\nPassing barrier1; elapsed={barrier1_end - barrier1_start}", flush=True)
         if store:
-            store.dump_stats()
-            store.reset_stats()
-    sys.exit(0)
-    time.sleep(10)
+            store.dump_and_reset_stats()
+    time.sleep(5)
 
     if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
-        print(f"Creating group... at {datetime.now()}", flush=True)
+        print(f"\nCreating nccl group... at {datetime.now()}", flush=True)
     group_start = time.time()
     group = torch.distributed.new_group(range(int(MY_WORLD_SIZE)), backend="nccl")
     group_end = time.time()
     if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
-        print(f"\nCreating group done; elapsed={group_end - group_start}", flush=True)
+        print(f"\nCreating nccl group done; elapsed={group_end - group_start}", flush=True)
         if store:
-            store.dump_stats()
-            store.reset_stats()
-    time.sleep(10)
+            store.dump_and_reset_stats()
+    time.sleep(5)
+
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(f"\nCreating gloo group... at {datetime.now()}", flush=True)
+    gloo_group_start = time.time()
+    gloo_group = torch.distributed.new_group(range(int(MY_WORLD_SIZE)), backend="gloo")
+    gloo_group_end = time.time()
+    if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
+        print(
+            f"\nCreating gloo group done; elapsed={gloo_group_end - gloo_group_start}",
+            flush=True,
+        )
+        if store:
+            store.dump_and_reset_stats()
+    time.sleep(5)
 
     # Run a single training step
     # demo_data_parallel()
