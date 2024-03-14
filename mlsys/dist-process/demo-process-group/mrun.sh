@@ -29,7 +29,7 @@ fi
 export PYTHONPATH=${MLSYS_ROOT}/workspace/my_venv/lib/python3.10/site-packages
 export PYTHONUSERBASE="${PYTHONPATH}"
 # set system paths
-export LD_LIBRARY_PATH="${MLSYS_ROOT}/mlsys/environments/packages/nccl/build/lib:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${MLSYS_ROOT}/mlsys/environments/packages/nccl-internal/build/lib:${LD_LIBRARY_PATH}"
 export PATH="${MLSYS_ROOT}/workspace/my_venv/bin:${PATH}"
 
 # set NCCL interface

@@ -21,12 +21,13 @@ export CUDA_ROOT="${CUDA_HOME}"
 export CUDA_TOOLKIT_ROOT_DIR="${CUDA_HOME}"
 
 # nccl
-export NCCL_ROOT="${CURR_DIR}/packages/nccl/build"
+export NCCL_ROOT="${CURR_DIR}/packages/nccl-internal/build"
 infoMsg "NCCL_ROOT=${NCCL_ROOT}"
 if [ ! -d "${NCCL_ROOT}" ]; then
     debugMsg "Locally built NCCL not found (yet)"
     debugMsg "Consider build NCCL or set env NCCL_ROOT properly"
 fi
+ls -l "${NCCL_ROOT}/lib/libnccl.so.2"
 
 # system paths
 export PATH="${CUDA_HOME}/bin:${PATH}"

@@ -2,7 +2,7 @@
 	path = mlsys/model/nanoGPT
 	url = https://github.com/pkuwangh/nanoGPT.git
 [submodule "mlsys/environments/packages/nccl"]
-	path = mlsys/environments/packages/nccl
+	path = mlsys/environments/packages/nccl-fork
 	url = https://github.com/pkuwangh/nccl.git
 [submodule "mlsys/environments/packages/pytorch-fork"]
 	path = mlsys/environments/packages/pytorch-fork
