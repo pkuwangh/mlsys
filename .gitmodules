@@ -10,3 +10,6 @@
 [submodule "mlsys/services/redis/redis"]
 	path = mlsys/services/redis/redis
 	url = https://github.com/redis/redis.git
+[submodule "mlsys/services/telemetry/fluent-bit"]
+	path = mlsys/services/telemetry/fluent-bit
+	url = https://github.com/fluent/fluent-bit
