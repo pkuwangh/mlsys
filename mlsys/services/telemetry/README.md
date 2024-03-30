@@ -18,7 +18,7 @@ make -j24
 sudo mkdir -p /var/run/fluent
 sudo chown -R $USER:$USER /var/run/fluent
 ls -ld /var/run/fluent
-./fluent-bit/build/bin/fluent-bit -c conf-fluent-bit-forward-stdout.conf
+./fluent-bit/build/bin/fluent-bit -c conf-fluent-bit-forward-stdout.conf [-vv]
 ```
 
 ### Emit logs using fluent-cat
