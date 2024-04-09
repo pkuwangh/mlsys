@@ -8,7 +8,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 import torch.optim as optim
-from datetime import datetime
+from datetime import datetime, timedelta
 from torch.nn.parallel import DistributedDataParallel
 
 from redis_store import RedisStore
@@ -62,7 +62,7 @@ def demo_all_reduce():
     torch.distributed.all_reduce(output)
     torch.distributed.barrier()
     if int(rank) == 0:
-        print(f"rank={rank}, output={output}")
+        print(f"rank={rank}, output={output}\n\n")
 
 
 if __name__ == "__main__":
@@ -87,6 +87,7 @@ if __name__ == "__main__":
     store = RedisStore(int(MY_RANK) == 0, num_shards=1, verbose=verbose)
     torch.distributed.init_process_group(
         backend="nccl",
+        timeout=timedelta(seconds=30),
         world_size=int(MY_WORLD_SIZE),
         rank=int(MY_RANK),
         store=store,
@@ -96,7 +97,7 @@ if __name__ == "__main__":
         print(f"\ninit_process_group done; elapsed={init_done - init_start}", flush=True)
         if store:
             store.dump_and_reset_stats()
-    time.sleep(5)
+    time.sleep(1)
 
     if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
         print(f"\nEntering barrier1... at {datetime.now()}", flush=True)
@@ -107,7 +108,7 @@ if __name__ == "__main__":
         print(f"\nPassing barrier1; elapsed={barrier1_end - barrier1_start}", flush=True)
         if store:
             store.dump_and_reset_stats()
-    time.sleep(5)
+    time.sleep(1)
 
     if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
         print(f"\nCreating nccl group... at {datetime.now()}", flush=True)
@@ -118,7 +119,7 @@ if __name__ == "__main__":
         print(f"\nCreating nccl group done; elapsed={group_end - group_start}", flush=True)
         if store:
             store.dump_and_reset_stats()
-    time.sleep(5)
+    time.sleep(1)
 
     if int(MY_RANK) == 0 or int(MY_RANK) == int(MY_WORLD_SIZE) - 1:
         print(f"\nCreating gloo group... at {datetime.now()}", flush=True)
@@ -132,7 +133,7 @@ if __name__ == "__main__":
         )
         if store:
             store.dump_and_reset_stats()
-    time.sleep(5)
+    time.sleep(1)
 
     # Run a single training step
     # demo_data_parallel()
@@ -148,7 +149,9 @@ if __name__ == "__main__":
             store.dump_stats()
 
     # Run a multi-gpu all reduce
-    # demo_all_reduce()
-    # torch.distributed.barrier()
+    torch.distributed.barrier()
+    demo_all_reduce()
+    time.sleep(1)
+    demo_all_reduce()
 
     torch.distributed.destroy_process_group()

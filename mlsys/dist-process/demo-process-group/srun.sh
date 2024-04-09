@@ -31,6 +31,7 @@ export PYTHONUSERBASE="${PYTHONPATH}"
 # set system paths
 export LD_LIBRARY_PATH="${MLSYS_ROOT}/mlsys/environments/packages/nccl-internal/build/lib:${LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH="${MLSYS_ROOT}/mlsys/environments/packages/pytorch-internal/build/lib:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${MLSYS_ROOT}/mlsys/environments/packages/additional-libs:${LD_LIBRARY_PATH}"
 export PATH="${MLSYS_ROOT}/workspace/my_venv/bin:${PATH}"
 
 # set NCCL interface
@@ -38,6 +39,7 @@ export NCCL_SOCKET_IFNAME=enP4s1f1
 # export NCCL_DEBUG=INFO
 
 echo "Rank=${RANK} on $(hostname)"
+export DEAD_RANK="2"
 
 python3 "${MLSYS_ROOT}/mlsys/dist-process/demo-process-group/distr.py"
 
