@@ -15,3 +15,7 @@ if [ -f "${CURR_DIR}/workspace/my_venv/bin/activate" ]; then
     echo "Activating virtual env my_venv..."
     source "${CURR_DIR}/workspace/my_venv/bin/activate"
 fi
+
+# alias
+alias lt='ls -lhrt'
+
