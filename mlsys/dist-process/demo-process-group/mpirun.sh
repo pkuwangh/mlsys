@@ -9,7 +9,7 @@ MADDR=$(hostname -I | awk '{print $1}')
 # still need set LD_LIBRARY_PATH for CUDA
 
 mpirun \
-	--hostfile hostlist.superpowers \
+	--hostfile hostlist.local \
 	-np 16 \
 	-N 1 \
 	--bind-to none \

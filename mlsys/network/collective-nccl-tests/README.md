@@ -26,15 +26,15 @@ echo $LD_LIBRARY_PATH
 The expected final command should look like
 
 ```bash
-mpirun --mca btl tcp,self -np 2 --host s-s126-bot-dvt1c-ks-1174,s-s126-bot-dvt1c-ks-1175 -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH=$LD_LIBRARY_PATH sendrecv_perf -t1 -g1 -b16 -e2g -f2 -c0
+mpirun --mca btl tcp,self -np 2 --host host1,host2 -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH=$LD_LIBRARY_PATH sendrecv_perf -t1 -g1 -b16 -e2g -f2 -c0
 ```
 
 The runner script can help
 
 ```bash
 # provide comma-separated hosts directly
-./run-nccl-tests-baremetal-mpi.py -r s-s126-bot-dvt1c-ks-1174,s-s126-bot-dvt1c-ks-1175 -p /home/nvidia/haowan/nccl_test --test all_reduce --test sendrecv
+./run-nccl-tests-baremetal-mpi.py -r host1,host2 -p <path to nccl_test>/nccl_test --test all_reduce --test sendrecv
 
 # use a host file - at most 2 levels of hierarchy
-./run-nccl-tests-baremetal-mpi.py -f ./hosts/superpowers.yml -d l1_01 -p /home/nvidia/haowan/nccl_test --test all_reduce --test sendrecv
+./run-nccl-tests-baremetal-mpi.py -f ./hosts.local.yml -d l1_01 -p <path to nccl_test>/nccl_test --test all_reduce --test sendrecv
 ```
