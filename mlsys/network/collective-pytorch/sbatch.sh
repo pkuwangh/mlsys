@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=collective --nodes=4 --ntasks-per-node=1 --gpus-per-node=1
+#SBATCH --job-name=collective --nodes=8 --ntasks-per-node=1 --gpus-per-node=1
 
 export MLSYS_ROOT="/home/nvidia/haowan/mlsys"
 TARGET_BIN="${MLSYS_ROOT}/mlsys/network/collective-pytorch/srun.sh"
