@@ -3,6 +3,7 @@
 import torch
 
 print(f"PyTorch version: {torch.__version__}")
+print(f"PyTorch location: {torch.__file__}")
 
 if torch.cuda.is_available():
     print("CUDA is available. Using GPU.")

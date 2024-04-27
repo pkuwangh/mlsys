@@ -41,5 +41,5 @@ export NCCL_SOCKET_IFNAME=enP4s1f1
 echo "Rank=${RANK} on $(hostname)"
 export DEAD_RANK="2"
 
-python3 "${MLSYS_ROOT}/mlsys/dist-process/demo-process-group/distr.py"
+python3 "${MLSYS_ROOT}/mlsys/cluster/demo-process-group/distr.py"
 

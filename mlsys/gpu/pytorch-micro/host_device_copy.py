@@ -35,16 +35,20 @@ def test_host_device_copy(m, n, k, num_iterations, devices, warmup=False):
     print(f"bandwidth, rep run: {bw:.1f} GB/s")
 
 
-test_host_device_copy(1024, 1024, 1024, 1, ["cpu", "cuda:0"], warmup=True)
+m = 1024
+n = 1024 
+k = 1024
+
+test_host_device_copy(m, n, k, 1, ["cpu", "cuda:0"], warmup=True)
 print("\nHost-to-Host copy", flush=True)
-test_host_device_copy(1024, 1024, 1024, 10, ["cpu", "cpu"], warmup=True)
-test_host_device_copy(1024, 1024, 1024, 100, ["cpu", "cpu"])
+test_host_device_copy(m, n, k, 10, ["cpu", "cpu"], warmup=True)
+test_host_device_copy(m, n, k, 100, ["cpu", "cpu"])
 print("\nHost-to-Device copy", flush=True)
-test_host_device_copy(1024, 1024, 1024, 10, ["cpu", "cuda:0"], warmup=True)
-test_host_device_copy(1024, 1024, 1024, 100, ["cpu", "cuda:0"])
+test_host_device_copy(m, n, k, 10, ["cpu", "cuda:0"], warmup=True)
+test_host_device_copy(m, n, k, 100, ["cpu", "cuda:0"])
 print("\nDevice-to-Host copy", flush=True)
-test_host_device_copy(1024, 1024, 1024, 10, ["cuda:0", "cpu"], warmup=True)
-test_host_device_copy(1024, 1024, 1024, 100, ["cuda:0", "cpu"])
+test_host_device_copy(m, n, k, 10, ["cuda:0", "cpu"], warmup=True)
+test_host_device_copy(m, n, k, 100, ["cuda:0", "cpu"])
 print("\nDevice-to-Device copy", flush=True)
-test_host_device_copy(1024, 1024, 1024, 10, ["cuda:0", "cuda:0"], warmup=True)
-test_host_device_copy(1024, 1024, 1024, 100, ["cuda:0", "cuda:0"])
+test_host_device_copy(m, n, k, 10, ["cuda:0", "cuda:0"], warmup=True)
+test_host_device_copy(m, n, k, 100, ["cuda:0", "cuda:0"])

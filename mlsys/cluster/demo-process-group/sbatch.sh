@@ -4,7 +4,7 @@
 
 CURR_DIR=`pwd`
 export MLSYS_ROOT="${CURR_DIR}/../../.."
-TARGET_BIN="${MLSYS_ROOT}/mlsys/dist-process/demo-process-group/srun.sh"
+TARGET_BIN="${MLSYS_ROOT}/mlsys/cluster/demo-process-group/srun.sh"
 
 export MADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 
