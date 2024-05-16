@@ -25,7 +25,7 @@ else
 fi
 
 # create a list of other virtualenvs
-OTHER_VENVS=("yt-dlp" "super-resolution" "intern-video2")
+OTHER_VENVS=("yt-dlp" "real-basic-vsr" "intern-video2")
 
 for venv in "${OTHER_VENVS[@]}"; do
     if ! [ -f "${CURR_DIR}/workspace/${venv}/bin/activate" ]; then
