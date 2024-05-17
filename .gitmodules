@@ -13,3 +13,6 @@
 [submodule "mlsys/services/telemetry/fluent-bit"]
 	path = mlsys/services/telemetry/fluent-bit
 	url = https://github.com/fluent/fluent-bit
+[submodule "mlsys/apps/video-upscaling/RealBasicVSR"]
+	path = mlsys/apps/video-upscaling/RealBasicVSR
+	url = https://github.com/ckkelvinchan/RealBasicVSR.git

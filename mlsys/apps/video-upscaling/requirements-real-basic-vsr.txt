@@ -1,0 +1,5 @@
+ninja
+torch
+torchaudio
+torchvision
+openmim

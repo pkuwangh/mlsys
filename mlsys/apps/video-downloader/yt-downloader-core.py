@@ -30,12 +30,11 @@ def download_video(
         if not isinstance(video_info, dict):
             logger.error(f"video_info is not a dict??? type={type(video_info)}")
             return
-        if "title" not in video_info or "ext" not in video_info:
+        if "id" not in video_info or "ext" not in video_info:
             logger.error("id or ext not in the video_info dict???")
             return
-    # process the title
-    title_items = [x.lower() for x in video_info["title"].split()[:10]]
-    filename = "_".join(title_items)
+    # process the filename
+    filename = video_info["id"]
     # save the metadata info
     metadata_file = download_dir / f"{filename}.json"
     with open(metadata_file, "wt") as fp:
