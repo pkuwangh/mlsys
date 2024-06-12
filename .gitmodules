@@ -16,3 +16,6 @@
 [submodule "mlsys/apps/video-upscaling/RealBasicVSR"]
 	path = mlsys/apps/video-upscaling/RealBasicVSR
 	url = https://github.com/ckkelvinchan/RealBasicVSR.git
+[submodule "mlsys/apps/video-upscaling/SUPIR"]
+	path = mlsys/apps/video-upscaling/SUPIR
+	url = https://github.com/pkuwangh/SUPIR.git

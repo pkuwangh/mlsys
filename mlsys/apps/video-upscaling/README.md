@@ -1,5 +1,25 @@
 # Video Upscaling
 
+## SUPIR
+
+Installation & download checkpoints
+
+```bash
+./setup-supir.sh
+```
+
+Two more checkpoints need to be downloaded from [google drive](https://github.com/Fanghua-Yu/SUPIR?tab=readme-ov-file#models-we-provided).
+
+Usage for images
+
+```bash
+# Note this cuda device index should align with pytorch's device order, which is fastest first
+# It can be different than nvidia-smi's order, which is based on PCIe ID.
+export CUDA_VISIBLE_DEVICES=0
+python3 test.py --img_dir input/ --save_dir . --upscale 2 --SUPIR_sign Q
+python3 test.py --img_dir input/ --save_dir . --upscale 2 --SUPIR_sign F --s_cfg 4.0 --linear_CFG
+```
+
 ## RealBasicVSR
 
 Installation

@@ -16,7 +16,7 @@ if [ "${CURR_VENV}" != "${MY_VENV}" ]; then
 fi
 
 splitLine
-pip3 install -r "${CURR_DIR}/requirements-real-basic-vsr.txt"
+pip3 install -r "${CURR_DIR}/requirements/requirements-real-basic-vsr.txt"
 
 splitLine
 MAX_JOBS=16 mim install mmcv-full
