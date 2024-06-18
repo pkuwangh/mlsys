@@ -1,4 +1,4 @@
 #!/bin/bash
 
-sudo apt install -y clang-format
+sudo apt install clang-format numactl libboost-program-options-dev
 

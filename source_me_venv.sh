@@ -7,44 +7,33 @@ CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${CURR_DIR}/mlsys/environments/scripts/common.sh"
 
 # check if virtualenv is installed
-if ! [ -x "$(command -v virtualenv)" ]; then
-    warnMsg "Error: virtualenv is not installed."
-    debugMsg "To install, run: sudo apt install python3-pip && pip3 install virtualenv"
+debugMsg "Checking if micromamba is installed and list envs if yes ..."
+micromamba env list
+if [ $? -ne 0 ]; then
+    warnMsg "Error: micromamba is not installed."
+    debugMsg "To install, follow https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html#linux-and-macos"
     return
 fi
 
 splitLine
 # create default virtualenv
-MY_VENV="general"
+MY_VENV="mlsys_general"
 
-if ! [ -f "${CURR_DIR}/workspace/${MY_VENV}/bin/activate" ]; then
-    infoMsg "Creating virtual env ${MY_VENV}..."
-    virtualenv "${CURR_DIR}/workspace/${MY_VENV}"
-else
+if micromamba env list | grep -q "${MY_VENV}"; then
     debugMsg "Virtual env ${MY_VENV} already exists."
+else
+    infoMsg "Creating default virtual env ${MY_VENV} ..."
+    micromamba create -n "${MY_VENV}" -c conda-forge python=3.10 pip=23.2 -y
 fi
 
-# create a list of other virtualenvs
-OTHER_VENVS=("yt-dlp" "real-basic-vsr" "supir")
-
-for venv in "${OTHER_VENVS[@]}"; do
-    if ! [ -f "${CURR_DIR}/workspace/${venv}/bin/activate" ]; then
-        infoMsg "Creating virtual env ${venv}..."
-        virtualenv "${CURR_DIR}/workspace/${venv}"
-    else
-        debugMsg "Virtual env ${venv} already exists."
-    fi
-done
-
 splitLine
-PLAIN_ENV=$(getPlainEnv)
 CURR_VENV=$(getVenv)
 
-if [ "${CURR_VENV}" != "${PLAIN_ENV}" ]; then
+if [ "${CURR_VENV}" == "${MY_VENV}" ]; then
     debugMsg "Already in virtual environment: ${CURR_VENV}"
 else
     infoMsg "Activating default virtual env (${MY_VENV})..."
-    source "${CURR_DIR}/workspace/${MY_VENV}/bin/activate"
+    micromamba activate "${MY_VENV}"
 fi
 
 splitLine

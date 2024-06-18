@@ -26,12 +26,6 @@ continueOrExit() {
     fi
 }
 
-# get plain env
-getPlainEnv() {
-    local MY_VENV=$(python3 -c 'import sys ; print( sys.base_prefix.split("/")[-1] )')
-    echo $MY_VENV
-}
-
 # get current virtualenv
 getVenv() {
     local MY_VENV=$(python3 -c 'import sys ; print( sys.prefix.split("/")[-1] )')
@@ -41,8 +35,7 @@ getVenv() {
 # check if the virtual environment is activated
 checkVenv() {
     infoMsg "Checking python virtual environment..."
-    local IN_VENV=$(python3 -c 'import sys ; print( 0 if sys.prefix == sys.base_prefix else 1 )')
-    if [ $IN_VENV -eq 0 ]; then
+    if [ -z $CONDA_DEFAULT_ENV ]; then
         warnMsg "Please activate your virtual environment first."
         exit 1
     fi

@@ -57,7 +57,7 @@ def get_device_properties(device_idx=0, verbose=0):
             print(f"Device {i} ({device.name()}) Properties:")
             pprint.pprint(properties)
 
-    properties = cuda.Device(i).get_attributes()
+    properties = cuda.Device(0).get_attributes()
     sm_clock = properties[cuda.device_attribute.CLOCK_RATE]
     sm_count = properties[cuda.device_attribute.MULTIPROCESSOR_COUNT]
     ver_major = properties[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]

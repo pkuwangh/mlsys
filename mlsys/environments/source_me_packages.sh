@@ -35,25 +35,31 @@ if [ -z "${NCCL_ROOT}" ]; then
     NCCL_LOCAL_DEFAULT="${CURR_DIR}/packages/nccl/build"
     if [ -d "${NCCL_LOCAL_DEFAULT}" ]; then
         export NCCL_ROOT="${NCCL_LOCAL_DEFAULT}"
+        infoMsg "NCCL_ROOT=${NCCL_ROOT}"
+        ls -l "${NCCL_ROOT}/lib/libnccl.so.2"
+        export CPATH="${NCCL_ROOT}/include:${CPATH}"
+        export LIBRARY_PATH="${NCCL_ROOT}/lib:${LIBRARY_PATH}"
+        export LD_LIBRARY_PATH="${NCCL_ROOT}/lib:${LD_LIBRARY_PATH}"
     else
         NCCL_SYSTEM_DEFAULT="/usr/lib/$(uname -m)-linux-gnu"
         debugMsg "Locally built NCCL not found; trying system default at ${NCCL_SYSTEM_DEFAULT}"
         if [ -f "${NCCL_SYSTEM_DEFAULT}/libnccl.so.2" ]; then
-            export NCCL_ROOT="${NCCL_SYSTEM_DEFAULT}"
+            infoMsg "Found NCCL at ${NCCL_SYSTEM_DEFAULT}"
+        else
+            warnMsg "Could not find NCCL library"
+        fi
+        if [ -f "/usr/include/nccl.h" ]; then
+            infoMsg "Found NCCL header at /usr/include/nccl.h"
+        else
+            warnMsg "Could not find NCCL header"
         fi
     fi
-fi
-if [ -z "${NCCL_ROOT}" ]; then
-    warnMsg "NCCL_ROOT not set; NCCL may not work properly"
 else
-    infoMsg "NCCL_ROOT=${NCCL_ROOT}"
-    ls -l "${NCCL_ROOT}/lib/libnccl.so.2"
+    checkMsg "NCCL_ROOT=${NCCL_ROOT}"
 fi
 
 # system paths
 echo "-------- system paths --------"
 export PATH="${CUDA_HOME}/bin:${PATH}"
-export CPATH="${NCCL_ROOT}/include:${CPATH}"
-export LIBRARY_PATH="${NCCL_ROOT}/lib:${LIBRARY_PATH}"
-export LD_LIBRARY_PATH="${NCCL_ROOT}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
 infoMsg "nvcc=$(which nvcc)"
