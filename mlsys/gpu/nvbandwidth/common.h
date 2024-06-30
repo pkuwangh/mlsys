@@ -231,6 +231,7 @@ std::ostream &operator<<(std::ostream &o, const PeerValueMatrix<T> &matrix) {
     VERBOSE << "MIN " << matrix.key << " " << minVal << '\n';
     VERBOSE << "MAX " << matrix.key << " " << maxVal << '\n';
     VERBOSE << "AVG " << matrix.key << " " << sum / count << '\n';
+    o << "--------------------------------" << std::endl;
     return o;
 }
 

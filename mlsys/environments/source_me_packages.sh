@@ -55,7 +55,7 @@ if [ -z "${NCCL_ROOT}" ]; then
         fi
     fi
 else
-    checkMsg "NCCL_ROOT=${NCCL_ROOT}"
+    debugMsg "NCCL_ROOT=${NCCL_ROOT}"
 fi
 
 # system paths

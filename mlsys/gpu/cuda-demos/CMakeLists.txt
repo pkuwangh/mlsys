@@ -22,6 +22,12 @@ execute_process(
 )
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DGIT_VERSION=\\\"\"${GIT_VERSION}\"\\\"")
 
+if (MULTINODE)
+    find_package(MPI REQUIRED)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DMULTINODE")
+    string(REPLACE "-O3" "-O0" CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE}")
+endif()
+
 if(WIN32)
     set(NVML_LIB_NAME "nvml")
 else()
@@ -30,13 +36,19 @@ endif()
 
 set(TESTS
     "uvm_vec_add"
+    "mpi_egm"
 )
 
 foreach(TEST ${TESTS})
     add_executable(${TEST} ${TEST}.cu)
 
-    target_include_directories(${TEST} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} .)
-    target_link_libraries(${TEST} Boost::program_options ${NVML_LIB_NAME} cuda)
+    if (MULTINODE)
+        target_include_directories(${TEST} PRIVATE ${MPI_INCLUDE_PATH} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} .)
+        target_link_libraries(${TEST} MPI::MPI_CXX Boost::program_options ${NVML_LIB_NAME} cuda)
+    else()
+        target_include_directories(${TEST} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} .)
+        target_link_libraries(${TEST} Boost::program_options ${NVML_LIB_NAME} cuda)
+    endif()
 
     install(TARGETS ${TEST} DESTINATION "bin")
 endforeach()

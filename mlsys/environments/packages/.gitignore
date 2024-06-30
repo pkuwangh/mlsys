@@ -1,2 +1,4 @@
 pytorch-internal/
 nccl-internal/
+pytorch/
+nccl/

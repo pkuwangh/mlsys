@@ -10,6 +10,8 @@
         "--max-line-length=100",
         "--ignore=E402,F841,F401,E302,E305,W503,W504,E124"
     ],
+    "C_Cpp.clang_format_fallbackStyle": "{BasedOnStyle: LLVM, IndentWidth: 4}",
+    "C_Cpp.clang_format_style": "{BasedOnStyle: LLVM, IndentWidth: 4}",
     "files.associations": {
         "ios": "cpp",
         "*.ipp": "cpp",
