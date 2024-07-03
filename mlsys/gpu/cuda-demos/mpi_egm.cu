@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cuda.h>
 #include <mpi.h>
+#include <nvml.h>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -16,7 +17,7 @@
             fprintf(stderr, "[%s] %s in expression %s in %s() : %s:%d\n",      \
                     errNameStr, errDescStr, #x, __PRETTY_FUNCTION__, __FILE__, \
                     __LINE__);                                                 \
-            std::exit(1);                                                       \
+            std::exit(1);                                                      \
         }                                                                      \
     } while (0)
 
@@ -26,7 +27,17 @@
         if ((cuError) != cudaSuccess) {                                        \
             fprintf(stderr, "CUDA runtime error [%s] %s\n",                    \
                     cudaGetErrorName(cuError), cudaGetErrorString(cuError));   \
-            std::exit(1);                                                       \
+            std::exit(1);                                                      \
+        }                                                                      \
+    } while (0)
+
+#define NVML_ASSERT(x)                                                         \
+    do {                                                                       \
+        nvmlReturn_t nvmlResult = (x);                                         \
+        if ((nvmlResult) != NVML_SUCCESS) {                                    \
+            fprintf(stderr, "NVML error %d:%s\n", nvmlResult,                  \
+                    nvmlErrorString(nvmlResult));                              \
+            std::exit(1);                                                      \
         }                                                                      \
     } while (0)
 
@@ -75,6 +86,11 @@ int main(int argc, char **argv) {
 
     printf("Rank %d on %s out of %d total ranks\n", world_rank, hostname,
            world_size);
+
+    // cuda initialzation
+    CU_ASSERT_RESULT(cuInit(0));
+    NVML_ASSERT(nvmlInit());
+    MPI_Barrier(MPI_COMM_WORLD);
 
     // get device handle
     int cudaDev;
@@ -139,6 +155,8 @@ int main(int argc, char **argv) {
             &allocHandle, (void *)&fabricHandle, CU_MEM_HANDLE_TYPE_FABRIC));
         printf("allocHandle=%llx\n", allocHandle);
     }
+    // just for safety: wait after every rank is done importing
+    MPI_Barrier(MPI_COMM_WORLD);
 
     // map the memory
     float *buffer_egm;
@@ -181,19 +199,23 @@ int main(int argc, char **argv) {
         CU_ASSERT_ERROR(cudaDeviceSynchronize());
         CU_ASSERT_ERROR(cudaGetLastError());
     }
+
     // sync
     printf("Rank %d waiting at barrier\n", world_rank);
     fflush(stdout);
     MPI_Barrier(MPI_COMM_WORLD);
+    // extra safety
     CU_ASSERT_ERROR(cudaDeviceSynchronize());
     MPI_Barrier(MPI_COMM_WORLD);
+
     // read from other ranks
     if (world_rank == reader_rank) {
         float *sum;
         sum = (float *)malloc(sizeof(float) * num_blocks);
 
         // verify
-        printf("Reading from rank=%d to sum up first 10 elements\n", world_rank);
+        printf("Reading from rank=%d to sum up first 10 elements\n",
+               world_rank);
         reduce<<<num_blocks, block_size, block_size * sizeof(float)>>>(
             buffer_egm, sum, 10);
         CU_ASSERT_ERROR(cudaDeviceSynchronize());
@@ -207,8 +229,9 @@ int main(int argc, char **argv) {
         cudaEventCreate(&ckpt2);
         cudaEventCreate(&ckpt3);
         // copy
-        printf("cudaMemcpy buffer of size=%zuMB from rank=%d EGM to rank=%d HBM\n",
-               allocSize/1024/1024, 0, world_rank);
+        printf(
+            "cudaMemcpy buffer of size=%zuMB from rank=%d EGM to rank=%d HBM\n",
+            allocSize / 1024 / 1024, 0, world_rank);
         cudaEventRecord(ckpt1);
         CU_ASSERT_ERROR(cudaMemcpy(buffer_local, buffer_egm, allocSize,
                                    cudaMemcpyDeviceToDevice));

@@ -111,7 +111,7 @@ int benchmark(const std::string &allocator) {
     add<<<numBlocks, blockSize>>>(N, x, y);
     cudaEventRecord(ckpt2);
 
-    for (int k = 0; k < 100; ++k) {
+    for (int k = 0; k < 10; ++k) {
         add<<<numBlocks, blockSize>>>(N, x, y);
     }
     cudaEventRecord(ckpt3);
@@ -124,7 +124,7 @@ int benchmark(const std::string &allocator) {
     std::cout << "Elapsed time " << int(elapsed) << " mili-seconds - initial"
               << std::endl;
     cudaEventElapsedTime(&elapsed, ckpt2, ckpt3);
-    std::cout << "Elapsed time " << int(elapsed / 100)
+    std::cout << "Elapsed time " << int(elapsed / 10)
               << " mili-seconds - warmedup" << std::endl;
 
     float maxError = 0.0f;
