@@ -22,3 +22,6 @@
 [submodule "mlsys/inference/vllm/vllm"]
 	path = mlsys/inference/vllm/vllm
 	url = https://github.com/pkuwangh/vllm.git
+[submodule "mlsys/inference/tensorrt-llm/TensorRT-LLM"]
+	path = mlsys/inference/tensorrt-llm/TensorRT-LLM
+	url = https://github.com/pkuwangh/TensorRT-LLM.git
