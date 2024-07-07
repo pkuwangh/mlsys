@@ -3,7 +3,8 @@ TensorRT-*.tar.gz
 tensorrt/
 wheels-torch/
 
+tekit/
 gpt2/
 
 trt_artifacts/
-
+model.cache

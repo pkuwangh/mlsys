@@ -30,6 +30,14 @@ git lfs pull
 python3 ./scripts/build_wheel.py --clean --cuda_architectures "90-real" --trt_root $TRT_ROOT --nccl_root $NCCL_ROOT
 pip3 uninstall tensorrt_llm && pip3 install build/*whl
 popd
+
+# build tensorrt-llm (internal)
+pushd tekik/
+git submodule update --init
+git lfs pull
+python3 ./scripts/build_wheel.py --clean --cuda_architectures "90-real" --trt_root $TRT_ROOT --nccl_root $NCCL_ROOT
+pip3 uninstall tensorrt_llm && pip3 install build/*whl
+popd
 ```
 
 ## Running GPT2
