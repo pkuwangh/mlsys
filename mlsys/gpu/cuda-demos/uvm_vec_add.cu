@@ -7,6 +7,21 @@
 #include <set>
 #include <string>
 
+// CUDA error handling
+#define CU_ASSERT_RESULT(x)                                                    \
+    do {                                                                       \
+        CUresult cuResult = (x);                                               \
+        if ((cuResult) != CUDA_SUCCESS) {                                      \
+            const char *errDescStr, *errNameStr;                               \
+            cuGetErrorString(cuResult, &errDescStr);                           \
+            cuGetErrorName(cuResult, &errNameStr);                             \
+            fprintf(stderr, "[%s] %s in expression %s in %s() : %s:%d\n",      \
+                    errNameStr, errDescStr, #x, __PRETTY_FUNCTION__, __FILE__, \
+                    __LINE__);                                                 \
+            std::exit(1);                                                      \
+        }                                                                      \
+    } while (0)
+
 namespace po = boost::program_options;
 
 // Kernel function to add the elements of two arrays
@@ -30,7 +45,8 @@ int benchmark(const std::string &allocator) {
     } else if (allocator == "cudaMallocHost") {
         cudaMallocHost(&x, N * sizeof(float));
         cudaMallocHost(&y, N * sizeof(float));
-    } else if (allocator == "cuMemCreate") {
+    } else if (allocator == "cuMemCreate-Device" ||
+               allocator == "cuMemCreate-Host") {
         // get device handle
         int cudaDev;
         CUdevice currentDev;
@@ -43,7 +59,8 @@ int benchmark(const std::string &allocator) {
         CUmemLocationType type = CU_MEM_LOCATION_TYPE_DEVICE;
         cuDeviceGetAttribute(&cpuNumaNodeId, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,
                              currentDev);
-        bool hostMem = (cpuNumaNodeId != -1);
+        bool hostMem =
+            (cpuNumaNodeId != -1) && (allocator == "cuMemCreate-Host");
         type = hostMem ? CU_MEM_LOCATION_TYPE_HOST_NUMA : type;
         std::cout << "hostMem-" << hostMem << ", host numa ID=" << cpuNumaNodeId
                   << std::endl;
@@ -65,13 +82,15 @@ int benchmark(const std::string &allocator) {
                   << ", padded alloc size=" << allocSize
                   << ", granularity=" << granu << std::endl;
         // physical memory allocation
-        cuMemCreate(&handleX, allocSize, &memprop, 0);
-        cuMemCreate(&handleY, allocSize, &memprop, 0);
+        CU_ASSERT_RESULT(cuMemCreate(&handleX, allocSize, &memprop, 0));
+        CU_ASSERT_RESULT(cuMemCreate(&handleY, allocSize, &memprop, 0));
         // reserve an address space and map it to a pointer
-        cuMemAddressReserve((CUdeviceptr *)(&x), allocSize, 0, 0, 0);
-        cuMemAddressReserve((CUdeviceptr *)(&y), allocSize, 0, 0, 0);
-        cuMemMap((CUdeviceptr)x, allocSize, 0, handleX, 0);
-        cuMemMap((CUdeviceptr)y, allocSize, 0, handleY, 0);
+        CU_ASSERT_RESULT(
+            cuMemAddressReserve((CUdeviceptr *)(&x), allocSize, 0, 0, 0));
+        CU_ASSERT_RESULT(
+            cuMemAddressReserve((CUdeviceptr *)(&y), allocSize, 0, 0, 0));
+        CU_ASSERT_RESULT(cuMemMap((CUdeviceptr)x, allocSize, 0, handleX, 0));
+        CU_ASSERT_RESULT(cuMemMap((CUdeviceptr)y, allocSize, 0, handleY, 0));
         // explicitly protect mapped VA ranges
         CUmemAccessDesc accessDesc[2] = {{}};
         accessDesc[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -80,8 +99,10 @@ int benchmark(const std::string &allocator) {
         accessDesc[1].location.type = type;
         accessDesc[1].location.id = hostMem ? cpuNumaNodeId : currentDev;
         accessDesc[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        cuMemSetAccess((CUdeviceptr)x, allocSize, accessDesc, hostMem ? 2 : 1);
-        cuMemSetAccess((CUdeviceptr)y, allocSize, accessDesc, hostMem ? 2 : 1);
+        CU_ASSERT_RESULT(cuMemSetAccess((CUdeviceptr)x, allocSize, accessDesc,
+                                        hostMem ? 2 : 1));
+        CU_ASSERT_RESULT(cuMemSetAccess((CUdeviceptr)y, allocSize, accessDesc,
+                                        hostMem ? 2 : 1));
     } else if (allocator == "malloc") {
         x = (float *)(malloc(N * sizeof(float)));
         y = (float *)(malloc(N * sizeof(float)));
@@ -90,9 +111,21 @@ int benchmark(const std::string &allocator) {
         return -1;
     }
 
-    for (size_t i = 0; i < N; ++i) {
-        x[i] = 1.0f;
-        y[i] = 2.0f;
+    float *x_cpu, *y_cpu;
+    if (allocator == "cuMemCreate-Device") {
+        x_cpu = (float *)(malloc(N * sizeof(float)));
+        y_cpu = (float *)(malloc(N * sizeof(float)));
+        for (size_t i = 0; i < N; ++i) {
+            x_cpu[i] = 1.0f;
+            y_cpu[i] = 2.0f;
+        }
+        cudaMemcpy(x, x_cpu, N * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(y, y_cpu, N * sizeof(float), cudaMemcpyHostToDevice);
+    } else {
+        for (size_t i = 0; i < N; ++i) {
+            x[i] = 1.0f;
+            y[i] = 2.0f;
+        }
     }
 
     cudaEvent_t ckpt1, ckpt2, ckpt3;
@@ -128,8 +161,15 @@ int benchmark(const std::string &allocator) {
               << " mili-seconds - warmedup" << std::endl;
 
     float maxError = 0.0f;
-    for (size_t i = 0; i < N; i++) {
-        maxError = fmax(maxError, fabs(y[i] - 103.0f));
+    if (allocator == "cuMemCreate-Device") {
+        cudaMemcpy(y_cpu, y, N * sizeof(float), cudaMemcpyDeviceToHost);
+        for (size_t i = 0; i < N; i++) {
+            maxError = fmax(maxError, fabs(y_cpu[i] - 13.0f));
+        }
+    } else {
+        for (size_t i = 0; i < N; i++) {
+            maxError = fmax(maxError, fabs(y[i] - 13.0f));
+        }
     }
 
     cudaEventDestroy(ckpt1);
@@ -148,12 +188,17 @@ int benchmark(const std::string &allocator) {
         cudaFree(x);
         cudaFree(y);
     }
+    if (allocator == "cuMemCreate-Device") {
+        free(x_cpu);
+        free(y_cpu);
+    }
     return int(maxError);
 }
 
 int main(int argc, char **argv) {
     std::set<std::string> avail_allocators(
-        {"cudaMallocHost", "cudaMallocManaged", "cuMemCreate", "malloc"});
+        {"cudaMallocHost", "cudaMallocManaged", "cuMemCreate-Device",
+         "cuMemCreate-Host", "malloc"});
     std::string allocator;
     po::options_description all_opts("uvm_vec_add CLI");
     all_opts.add_options()("help,h", "Help message");
@@ -185,6 +230,7 @@ int main(int argc, char **argv) {
     int maxError = 0;
     if (allocator == "all") {
         for (const std::string &x : avail_allocators) {
+            std::cout << "\nBenchmarking " << x << std::endl;
             maxError = benchmark(x);
             std::cout << "Max error is " << maxError << std::endl;
         }

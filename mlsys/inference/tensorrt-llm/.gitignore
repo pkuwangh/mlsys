@@ -4,7 +4,9 @@ tensorrt/
 wheels-torch/
 
 tekit/
-gpt2/
+gpt2-*/
 
 trt_artifacts/
 model.cache
+
+output-*
