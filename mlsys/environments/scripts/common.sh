@@ -26,7 +26,7 @@ continueOrExit() {
     fi
 }
 
-# get current virtualenv
+# get current virtual env
 getVenv() {
     local MY_VENV=$(python3 -c 'import sys ; print( sys.prefix.split("/")[-1] )')
     echo $MY_VENV
@@ -41,7 +41,7 @@ checkVenv() {
     fi
     # double check
     which python3
-    continueOrExit "the above python virtualenv"
+    continueOrExit "the above python virtual environment"
 }
 
 # check my dev envrionment

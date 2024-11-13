@@ -105,6 +105,7 @@ int main(int argc, char **argv) {
     CU_ASSERT_RESULT(cuDeviceGetAttribute(
         &cpuNumaNodeId, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, currentDev));
     bool hostMem = (cpuNumaNodeId != -1);
+    // hostMem = false;
     location_type = hostMem ? CU_MEM_LOCATION_TYPE_HOST_NUMA : location_type;
     printf("hostMem-%d, host numa ID=%d\n", hostMem, cpuNumaNodeId);
 
@@ -116,7 +117,7 @@ int main(int argc, char **argv) {
     memprop.location.id = hostMem ? cpuNumaNodeId : currentDev;
 
     // size & granularity
-    size_t allocSize = ((size_t)(128) << 20) * sizeof(float);
+    size_t allocSize = ((size_t)(256) << 20) * sizeof(float);
     size_t granu = 0;
     CU_ASSERT_RESULT(cuMemGetAllocationGranularity(
         &granu, &memprop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
@@ -190,10 +191,10 @@ int main(int argc, char **argv) {
     size_t num_elements = allocSize / sizeof(float);
     int block_size = 256;
     int num_blocks = (num_elements + (size_t)(block_size - 1)) / block_size;
-    printf("num_elements=%zu, block_size=%d, num_blocks=%d\n", num_elements,
-           block_size, num_blocks);
+    // printf("num_elements=%zu, block_size=%d, num_blocks=%d\n", num_elements,
+    //        block_size, num_blocks);
     // write from writer_rank
-    if (world_rank == writer_rank) {
+    if (world_rank == writer_rank || world_size == 1) {
         printf("Write data from rank=%d to EGM buffer\n", world_rank);
         init<<<num_blocks, block_size>>>(buffer_egm, num_elements);
         CU_ASSERT_ERROR(cudaDeviceSynchronize());
@@ -209,7 +210,7 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
 
     // read from other ranks
-    if (world_rank == reader_rank) {
+    if (world_rank == reader_rank || world_size == 1) {
         float *sum;
         sum = (float *)malloc(sizeof(float) * num_blocks);
 
@@ -222,12 +223,14 @@ int main(int argc, char **argv) {
         CU_ASSERT_ERROR(cudaGetLastError());
         printf("sum[0]=%f\n", sum[0]);
 
-        float *buffer_local;
-        CU_ASSERT_ERROR(cudaMalloc(&buffer_local, allocSize));
         cudaEvent_t ckpt1, ckpt2, ckpt3;
+        float elapsed2 = 0, elapsed3 = 0;
         cudaEventCreate(&ckpt1);
         cudaEventCreate(&ckpt2);
         cudaEventCreate(&ckpt3);
+        // allocate local gpu buffer
+        float *buffer_local;
+        CU_ASSERT_ERROR(cudaMalloc(&buffer_local, allocSize));
         // copy
         printf(
             "cudaMemcpy buffer of size=%zuMB from rank=%d EGM to rank=%d HBM\n",
@@ -238,13 +241,12 @@ int main(int argc, char **argv) {
         cudaEventRecord(ckpt2);
         CU_ASSERT_ERROR(cudaDeviceSynchronize());
         cudaEventRecord(ckpt3);
-        float elapsed2 = 0, elapsed3 = 0;
         cudaEventElapsedTime(&elapsed2, ckpt1, ckpt2);
         cudaEventElapsedTime(&elapsed3, ckpt1, ckpt3);
         printf("Elapsed time %f/%f mili-seconds\n", elapsed2, elapsed3);
-        printf("Cross-node EGM->HBM copy bandwidth: %f GB/s\n",
+        printf("%s-node EGM->HBM copy bandwidth: %f GB/s\n",
+               world_size == 1 ? "Same" : "Cross",
                (allocSize / 1024.0 / 1024 / 1024) / (elapsed3 / 1000.0));
-
         // verify after copy
         printf("Verifying data after cudaMemcpy from rank=%d\n", world_rank);
         reduce<<<num_blocks, block_size, block_size * sizeof(float)>>>(
@@ -252,18 +254,38 @@ int main(int argc, char **argv) {
         CU_ASSERT_ERROR(cudaDeviceSynchronize());
         CU_ASSERT_ERROR(cudaGetLastError());
         printf("sum[0]=%f\n", sum[0]);
+        // reference copy
+        float *buffer_cpu;
+        buffer_cpu = (float *)malloc(allocSize);
+        for (size_t i = 0; i < num_elements; i++) {
+            buffer_cpu[i] = static_cast<float>(i);
+        }
+        printf(
+            "cudaMemcpy buffer of size=%zuMB from Host to Device\n",
+            allocSize / 1024 / 1024);
+        cudaEventRecord(ckpt1);
+        CU_ASSERT_ERROR(cudaMemcpy(buffer_local, buffer_cpu, allocSize,
+                                   cudaMemcpyHostToDevice));
+        cudaEventRecord(ckpt2);
+        CU_ASSERT_ERROR(cudaDeviceSynchronize());
+        cudaEventRecord(ckpt3);
+        cudaEventElapsedTime(&elapsed2, ckpt1, ckpt2);
+        cudaEventElapsedTime(&elapsed3, ckpt1, ckpt3);
+        printf("Elapsed time %f/%f mili-seconds\n", elapsed2, elapsed3);
+        printf("Same-node H2D copy bandwidth: %f GB/s\n",
+               (allocSize / 1024.0 / 1024 / 1024) / (elapsed3 / 1000.0));
+        CU_ASSERT_ERROR(cudaFree(buffer_local));
+        free(buffer_cpu);
     }
 
     // cleanup
     MPI_Barrier(MPI_COMM_WORLD);
 
-    printf("Cleaning up\n");
     CU_ASSERT_RESULT(cuMemUnmap((CUdeviceptr)buffer_egm, allocSize));
     CU_ASSERT_RESULT(cuMemRelease(allocHandle));
     CU_ASSERT_RESULT(cuMemAddressFree((CUdeviceptr)buffer_egm, allocSize));
 
     MPI_Finalize();
 
-    printf("Done!\n");
     return 0;
 }

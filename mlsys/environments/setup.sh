@@ -24,6 +24,10 @@ debugMsg " - To install directly, search with ./scripts/find_nccl.sh"
 infoMsg "To install PyTorch:"
 debugMsg " - To build on your own, follow packages/README.md"
 debugMsg " - To use pre-built, run"
-debugMsg "   - pip3 install -r requirements/requirements-pytorch.txt for x86_64"
-debugMsg "   - ./scripts/install_pytorch_grace_nccl.sh with NCCL/UCC support for aarch64"
-debugMsg "   - ./scripts/install_pytorch_grace_plain.sh without NCCL support for aarch64"
+debugMsg "   - x86_64: pip3 install -r requirements/requirements-torch.txt"
+debugMsg "   - aarch64: ./scripts/install_pytorch_grace_nccl.sh w/ NCCL/UCC support"
+debugMsg "   - aarch64: ./scripts/install_pytorch_grace_plain.sh w/o NCCL support"
+
+# transformers!
+infoMsg "Then consider installing transformers:"
+debugMsg "pip3 install -r requirements/requirements-llm.txt"
