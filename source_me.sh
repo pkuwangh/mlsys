@@ -27,6 +27,9 @@ fi
 unset __mamba_setup
 # <<< mamba initialize <<<
 
+# let micromamba ignore ~/.local/
+export PYTHONNOUSERSITE=1
+
 mkdir -p "${CURR_DIR}/micromamba"
 
 # check if micromamba is installed
