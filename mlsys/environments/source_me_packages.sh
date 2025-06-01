@@ -2,7 +2,7 @@
 
 # get current directory
 CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${CURR_DIR}/scripts/common.sh"
+source "${CURR_DIR}/../../scripts/common.sh"
 
 # cuda
 echo "-------- cuda --------"
@@ -32,7 +32,7 @@ fi
 echo "-------- nccl --------"
 if [ -z "${NCCL_ROOT}" ]; then
     debugMsg "NCCL_ROOT not set, trying locally built NCCL"
-    NCCL_LOCAL_DEFAULT="${CURR_DIR}/packages/nccl/build"
+    NCCL_LOCAL_DEFAULT="${CURR_DIR}/nccl/build"
     if [ -d "${NCCL_LOCAL_DEFAULT}" ]; then
         export NCCL_ROOT="${NCCL_LOCAL_DEFAULT}"
         infoMsg "NCCL_ROOT=${NCCL_ROOT}"

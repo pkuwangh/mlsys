@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # get current directory
-CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # get util functions
-source "${CURR_DIR}/mlsys/environments/scripts/common.sh"
+source "${ROOT_DIR}/scripts/common.sh"
 
 # alias
 alias lt='ls -lhrt'
@@ -12,34 +12,35 @@ alias tile_h='tmux select-layout even-vertical'
 alias tile_v='tmux select-layout even-horizontal'
 alias tile_4='tmux select-layout tiled'
 
-# >>> mamba initialize >>>
-# !! Contents within this block are managed by 'mamba init' !!
-export MAMBA_ROOT_PREFIX="${CURR_DIR}/micromamba"
-if [ -z "${MAMBA_EXE}" ]; then
-    export MAMBA_EXE="${MAMBA_ROOT_PREFIX}/bin/micromamba"
-fi
-__mamba_setup="$("$MAMBA_EXE" shell hook --shell bash --root-prefix "$MAMBA_ROOT_PREFIX" 2>/dev/null)"
-if [ $? -eq 0 ]; then
-    eval "$__mamba_setup"
+# install micromamba
+my_arch=$(uname -m)
+if [[ "$my_arch" == "x86_64" ]]; then
+    MAMBA_ARCH="linux-64"
+elif [[ "$my_arch" == "aarch64" ]]; then
+    MAMBA_ARCH="linux-aarch64"
 else
-    alias micromamba="$MAMBA_EXE" # Fallback on help from mamba activate
+    warnMsg "Unsupported architecture: $my_arch. Please install micromamba manually."
+    return
 fi
-unset __mamba_setup
-# <<< mamba initialize <<<
+# check if micromamba is already installed
+export MAMBA_ROOT_PREFIX="${ROOT_DIR}/micromamba"
+export MAMBA_EXE="${MAMBA_ROOT_PREFIX}/bin/micromamba"
+mkdir -p "${MAMBA_ROOT_PREFIX}"
+pushd "${MAMBA_ROOT_PREFIX}" > /dev/null
+echo "${MAMBA_EXE}"
+if [ ! -f "${MAMBA_EXE}" ]; then
+    debugMsg "Downloading micromamba to ${MAMBA_EXE} ..."
+    curl -Ls "https://micro.mamba.pm/api/micromamba/${MAMBA_ARCH}/latest" | tar -xvj bin/micromamba
+else
+    debugMsg "micromamba is already installed at ${MAMBA_EXE}"
+fi
+# set up micromamba environment for this shell
+eval "$(./bin/micromamba shell hook -s posix)"
+infoMsg "Micromamba is set up."
+popd > /dev/null
 
 # let micromamba ignore ~/.local/
 export PYTHONNOUSERSITE=1
-
-mkdir -p "${CURR_DIR}/micromamba"
-
-# check if micromamba is installed
-debugMsg "Checking if micromamba is installed ..."
-micromamba env list > /dev/null
-if [ $? -ne 0 ]; then
-    warnMsg "Error: micromamba is not installed."
-    debugMsg "To download, follow https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html#linux-and-macos"
-    return
-fi
 
 splitLine
 # create default virtual env

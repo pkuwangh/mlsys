@@ -26,11 +26,11 @@ if [ -z ${MLSYS_ROOT} ]; then
 fi
 
 # set python path
-export PYTHONPATH=${MLSYS_ROOT}/workspace/my_venv/lib/python3.10/site-packages
+export PYTHONPATH=${MLSYS_ROOT}/micromamba/envs/mlsys-pg/lib/python3.10/site-packages
 export PYTHONUSERBASE="${PYTHONPATH}"
 # set system paths
-export LD_LIBRARY_PATH="${MLSYS_ROOT}/mlsys/environments/packages/nccl-internal/build/lib:${LD_LIBRARY_PATH}"
-export PATH="${MLSYS_ROOT}/workspace/my_venv/bin:${PATH}"
+export LD_LIBRARY_PATH="${MLSYS_ROOT}/mlsys/environments/nccl/build/lib:${LD_LIBRARY_PATH}"
+export PATH="${MLSYS_ROOT}/micromamba/envs/mlsys-pg/bin:${PATH}"
 
 # set NCCL interface
 export NCCL_SOCKET_IFNAME=enP4s1f1

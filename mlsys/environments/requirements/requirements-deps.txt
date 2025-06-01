@@ -1,4 +1,0 @@
-numpy
-packaging
-pyyaml
-py-redis
