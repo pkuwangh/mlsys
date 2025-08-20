@@ -55,7 +55,7 @@ def dump_bandwidth(
             f"{torch.distributed.get_backend(group)} {test_name:<14s}:"
             f"  data_size={get_data_size_str(data_size)},"
             f"  num_iters={num_iters:>4d},"
-            f"  time={elapsed_time:4.1f}s,"
+            f"  time={elapsed_time*1e3:6.1f}ms,"
             f"  Alog-BW={get_bw_str(algo_bandwidth)},"
             f"  Bus-BW={get_bw_str(bus_bandwidth)}"
         )
@@ -186,6 +186,7 @@ def test_all(args, groups):
         group = group_info["group"]
         group_iter_scale = group_info["group_iter_scale"]
         for test_info in tests:
+            print_rank_0("----")
             for num in sorted(size_and_iters.keys()):
                 data = torch.randn(num // test_info["data_size_scale"], 1024)
                 if torch.distributed.get_backend(group) == "nccl":
@@ -201,19 +202,23 @@ def test_all(args, groups):
                 num_iters = max(1, int(num_iters))
                 # test
                 test_info["func"](group, tensor, data_size, num_iters)
-            print_rank_0("----")
         print_rank_0("====")
 
 
 def main(args):
     # initialize process group
-    MY_RANK = os.environ.get("RANK", None)
     MY_WORLD_SIZE = os.environ.get("WORLD_SIZE", None)
+    MY_RANK = os.environ.get("RANK", None)
+    MY_LOCAL_RANK = os.environ.get("LOCAL_RANK", None)
+    # set device
+    torch.cuda.set_device(int(MY_LOCAL_RANK))
+    print(f"rank={MY_RANK} using device={MY_LOCAL_RANK}", flush=True)
     # nccl group
     torch.distributed.init_process_group(
         backend="nccl",
         world_size=int(MY_WORLD_SIZE),
         rank=int(MY_RANK),
+        device_id=torch.device(int(MY_LOCAL_RANK)),
     )
     # gloo group
     gloo_group = torch.distributed.new_group(
