@@ -21,6 +21,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 else()
     set(Boost_USE_STATIC_LIBS ON)
 endif()
+# To work with conda/mamba environment
+set(Boost_USE_STATIC_LIBS OFF)
 find_package(Boost COMPONENTS program_options REQUIRED)
 
 set(src

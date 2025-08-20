@@ -38,13 +38,14 @@ fi
 eval "$(./bin/micromamba shell hook -s posix)"
 infoMsg "Micromamba is set up."
 popd > /dev/null
+export PATH="${MAMBA_ROOT_PREFIX}/bin:${PATH}"
 
 # let micromamba ignore ~/.local/
 export PYTHONNOUSERSITE=1
 
 splitLine
 # create default virtual env
-MY_VENV="mlsys_base"
+MY_VENV="mlsys-base"
 
 if micromamba env list | grep -q "${MY_VENV}"; then
     debugMsg "Virtual env ${MY_VENV} already exists."

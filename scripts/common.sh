@@ -22,8 +22,9 @@ continueOrExit() {
     read -p "Continue with ${1}? (y/N) " -n 1 -r
     echo ""
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
+        return 1
     fi
+    return 0
 }
 
 # get current virtual env
@@ -37,11 +38,12 @@ checkVenv() {
     infoMsg "Checking python virtual environment..."
     if [ -z $CONDA_DEFAULT_ENV ]; then
         warnMsg "Please activate your virtual environment first."
-        exit 1
+        return 1
     fi
     # double check
     which python3
     continueOrExit "the above python virtual environment"
+    return $?
 }
 
 # check my dev envrionment
