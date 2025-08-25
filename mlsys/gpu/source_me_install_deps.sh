@@ -3,7 +3,6 @@
 # get current directory
 CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# get util functions
 source "${CURR_DIR}/../../scripts/common.sh"
 
 splitLine
@@ -12,6 +11,7 @@ if [ $? -ne 0 ]; then
     return 1
 fi
 
+cleanupCondaBackEnvs
 micromamba install -y \
     -c nvidia/label/cuda-12.9.0 \
     cuda cuda-nvcc cuda-toolkit cuda-runtime \
@@ -25,4 +25,3 @@ which gcc
 gcc --version
 which nvcc
 nvcc --version
-

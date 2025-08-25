@@ -3,7 +3,7 @@
 # get current directory
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# get util functions
+# get env & util functions
 source "${ROOT_DIR}/scripts/common.sh"
 
 # alias
@@ -22,9 +22,7 @@ else
     warnMsg "Unsupported architecture: $my_arch. Please install micromamba manually."
     return
 fi
-# check if micromamba is already installed
-export MAMBA_ROOT_PREFIX="${ROOT_DIR}/micromamba"
-export MAMBA_EXE="${MAMBA_ROOT_PREFIX}/bin/micromamba"
+
 mkdir -p "${MAMBA_ROOT_PREFIX}"
 pushd "${MAMBA_ROOT_PREFIX}" > /dev/null
 echo "${MAMBA_EXE}"
@@ -34,11 +32,10 @@ if [ ! -f "${MAMBA_EXE}" ]; then
 else
     debugMsg "micromamba is already installed at ${MAMBA_EXE}"
 fi
-# set up micromamba environment for this shell
-eval "$(./bin/micromamba shell hook -s posix)"
-infoMsg "Micromamba is set up."
 popd > /dev/null
-export PATH="${MAMBA_ROOT_PREFIX}/bin:${PATH}"
+
+# load micromamba shell hook
+eval "$(${MAMBA_EXE} shell hook -s posix)"
 
 # let micromamba ignore ~/.local/
 export PYTHONNOUSERSITE=1

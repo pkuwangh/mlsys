@@ -3,20 +3,19 @@
 ## Install vLLM
 
 ```bash
-# install packages in a virtualenv
-micromamba create -n mlsys_vllm -c conda-forge python=3.10 pip=23.2 -y
-micromamba activate mlsys_vllm
-
-# python-only build
-cd vllm
-VLLM_USE_PRECOMPILED=1 pip install -e .
+# use virtualenv and install system deps
+source source_me_install_deps.sh
 
 # full build
 cd vllm
-pip install -e .
+uv pip install -r requirements/build.txt
+# build from source in editable mode
+uv pip install --no-build-isolation -e .
+# to make vscode/pylance happy
+uv pip install --no-build-isolation -e . --config-settings editable_mode=strict
 
 # additional deps
-pip3 install -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Benchmarks

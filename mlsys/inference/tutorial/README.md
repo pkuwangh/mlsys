@@ -4,8 +4,8 @@
 
 ```bash
 # install packages in a virtualenv
-micromamba create -n mlsys_inference_tutorial -c conda-forge python=3.10 pip=23.2 -y
-micromamba activate mlsys_inference_tutorial
+micromamba create -n mlsys-inference-tutorial -c conda-forge python=3.10 pip=23.2 -y
+micromamba activate mlsys-inference-tutorial
 pip3 install -r requirements.txt
 pip3 install ipykernel
 

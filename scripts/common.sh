@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# environment variables
+_CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_ROOT_DIR="${_CURR_DIR}/.."
+
+export MAMBA_ROOT_PREFIX="${_ROOT_DIR}/micromamba"
+export MAMBA_EXE="${MAMBA_ROOT_PREFIX}/bin/micromamba"
+
+
 # take one argument as the message
 infoMsg() {
     echo -e "\033[32;1m${1}\033[0m"
@@ -27,6 +35,11 @@ continueOrExit() {
     return 0
 }
 
+# cleanup conda leftover
+cleanupCondaBackEnvs() {
+    for v in $(env | awk -F= '/^CONDA_BACKUP_/ {print $1}'); do unset "$v"; done
+}
+
 # get current virtual env
 getVenv() {
     local MY_VENV=$(python3 -c 'import sys ; print( sys.prefix.split("/")[-1] )')
@@ -44,11 +57,4 @@ checkVenv() {
     which python3
     continueOrExit "the above python virtual environment"
     return $?
-}
-
-# check my dev envrionment
-checkDevEnv() {
-    infoMsg "Checking my dev environment..."
-    local CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    "${CURR_DIR}/../check_cuda.py"
 }
