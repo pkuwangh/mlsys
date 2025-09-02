@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
 
 def main(args):
+    # lazy import so the CLI help message can show up quickly
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model)
     print("=============================================")
@@ -20,7 +21,7 @@ def main(args):
     prompt = "Michael Burry is"
     inputs = tokenizer(prompt, return_tensors="pt")
     inputs = inputs.to(model.device)
-    print(f"Inputs:")
+    print("Inputs:")
     for k, v in inputs.items():
         print(f"\t{k}: {v.shape}")
     print(f"Model is on {model.device}")

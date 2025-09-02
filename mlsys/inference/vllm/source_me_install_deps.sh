@@ -22,7 +22,8 @@ micromamba install -n "${MY_VENV}" -y \
     -c nvidia/label/cuda-12.8.0 \
     cuda cuda-nvcc cuda-toolkit cuda-runtime cuda-nvtx-dev \
     -c conda-forge \
-    cmake=4.1.0 gcc=12.4 ninja=1.13.1 ccache=4.11
+    cmake=4.1.0 gcc=12.4 ninja=1.13.1 ccache=4.11 \
+    nvtx=0.2.13
 
 pip install black loguru ruff
 

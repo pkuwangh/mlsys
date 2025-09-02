@@ -11,19 +11,38 @@ cd vllm
 uv pip install -r requirements/build.txt
 # build from source in editable mode
 uv pip install --no-build-isolation -e .
-# to make vscode/pylance happy
-uv pip install --no-build-isolation -e . --config-settings editable_mode=strict
+# to make vscode/pylance happy and be able to find reference in source code
+uv pip install --no-build-isolation -e . --config-settings editable_mode=compat
 
 # additional deps
 pip install -r requirements.txt
 ```
 
-## Benchmarks
+## Quick start
 
 ```bash
-cd vllm/benchmarks
-mkdir -p results
+cd quickstart
 
+# profile batch inference
+nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop ./v01-offline-batch-inference.py
+```
+
+## Benchmarks
+
+### Offline throughput benchmark
+
+```bash
+# LLM
+vllm bench throughput \
+  --model=models/NousResearch/Hermes-3-Llama-3.1-8B \
+  --dataset-name=sonnet \
+  --dataset-path=vllm/benchmarks/sonnet.txt \
+  --num-prompts=100
+```
+
+### Archived
+
+```bash
 export HF_TOKEN=<hugginface token>
 wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
 
