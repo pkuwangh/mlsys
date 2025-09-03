@@ -63,7 +63,7 @@ export LIBRARY_PATH="${_SCATTERED_CUDA_HOME}/lib:${_SCATTERED_CUDA_HOME}/lib/stu
 export LD_LIBRARY_PATH="${_SCATTERED_CUDA_HOME}/lib:${_SCATTERED_CUDA_HOME}/lib/stub:${LD_LIBRARY_PATH}"
 
 uv pip install \
-    torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
     --index-url https://download.pytorch.org/whl/cu128
 
 python "${CURR_DIR}/check_cuda.py"
