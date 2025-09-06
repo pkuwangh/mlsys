@@ -7,38 +7,36 @@
 #include <unistd.h>
 
 // CUDA error handling
-#define CU_ASSERT_RESULT(x)                                                    \
-    do {                                                                       \
-        CUresult cuResult = (x);                                               \
-        if ((cuResult) != CUDA_SUCCESS) {                                      \
-            const char *errDescStr, *errNameStr;                               \
-            cuGetErrorString(cuResult, &errDescStr);                           \
-            cuGetErrorName(cuResult, &errNameStr);                             \
-            fprintf(stderr, "[%s] %s in expression %s in %s() : %s:%d\n",      \
-                    errNameStr, errDescStr, #x, __PRETTY_FUNCTION__, __FILE__, \
-                    __LINE__);                                                 \
-            std::exit(1);                                                      \
-        }                                                                      \
+#define CU_ASSERT_RESULT(x)                                                                                            \
+    do {                                                                                                               \
+        CUresult cuResult = (x);                                                                                       \
+        if ((cuResult) != CUDA_SUCCESS) {                                                                              \
+            const char *errDescStr, *errNameStr;                                                                       \
+            cuGetErrorString(cuResult, &errDescStr);                                                                   \
+            cuGetErrorName(cuResult, &errNameStr);                                                                     \
+            fprintf(stderr, "[%s] %s in expr %s in %s() : %s:%d\n", errNameStr, errDescStr, #x, __PRETTY_FUNCTION__,   \
+                    __FILE__, __LINE__);                                                                               \
+            std::exit(EXIT_FAILURE);                                                                                   \
+        }                                                                                                              \
     } while (0)
 
-#define CU_ASSERT_ERROR(x)                                                     \
-    do {                                                                       \
-        cudaError_t cuError = (x);                                             \
-        if ((cuError) != cudaSuccess) {                                        \
-            fprintf(stderr, "CUDA runtime error [%s] %s\n",                    \
-                    cudaGetErrorName(cuError), cudaGetErrorString(cuError));   \
-            std::exit(1);                                                      \
-        }                                                                      \
+#define CU_ASSERT_ERROR(x)                                                                                             \
+    do {                                                                                                               \
+        cudaError_t cuError = (x);                                                                                     \
+        if ((cuError) != cudaSuccess) {                                                                                \
+            fprintf(stderr, "[%s] %s in expr %s in %s() : %s:%D\n", cudaGetErrorName(cuError),                         \
+                    cudaGetErrorString(cuError), #x, __PRETTY_FUNCTION__, __FILE__, __LINE__);                         \
+            std::exit(EXIT_FAILURE);                                                                                   \
+        }                                                                                                              \
     } while (0)
 
-#define NVML_ASSERT(x)                                                         \
-    do {                                                                       \
-        nvmlReturn_t nvmlResult = (x);                                         \
-        if ((nvmlResult) != NVML_SUCCESS) {                                    \
-            fprintf(stderr, "NVML error %d:%s\n", nvmlResult,                  \
-                    nvmlErrorString(nvmlResult));                              \
-            std::exit(1);                                                      \
-        }                                                                      \
+#define NVML_ASSERT(x)                                                                                                 \
+    do {                                                                                                               \
+        nvmlReturn_t nvmlResult = (x);                                                                                 \
+        if ((nvmlResult) != NVML_SUCCESS) {                                                                            \
+            fprintf(stderr, "NVML error %d:%s\n", nvmlResult, nvmlErrorString(nvmlResult));                            \
+            std::exit(EXIT_FAILURE);                                                                                   \
+        }                                                                                                              \
     } while (0)
 
 // GPU kernels
@@ -84,8 +82,7 @@ int main(int argc, char **argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
-    printf("Rank %d on %s out of %d total ranks\n", world_rank, hostname,
-           world_size);
+    printf("Rank %d on %s out of %d total ranks\n", world_rank, hostname, world_size);
 
     // cuda initialzation
     CU_ASSERT_RESULT(cuInit(0));
@@ -102,12 +99,17 @@ int main(int argc, char **argv) {
     // get cpu NUMA id and set location type
     int cpuNumaNodeId = -1;
     CUmemLocationType location_type = CU_MEM_LOCATION_TYPE_DEVICE;
-    CU_ASSERT_RESULT(cuDeviceGetAttribute(
-        &cpuNumaNodeId, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, currentDev));
+    CU_ASSERT_RESULT(cuDeviceGetAttribute(&cpuNumaNodeId, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, currentDev));
     bool hostMem = (cpuNumaNodeId != -1);
     // hostMem = false;
     location_type = hostMem ? CU_MEM_LOCATION_TYPE_HOST_NUMA : location_type;
     printf("hostMem-%d, host numa ID=%d\n", hostMem, cpuNumaNodeId);
+
+    int vmm = 0;
+    CU_ASSERT_RESULT(cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, currentDev));
+    if (!vmm) {
+        throw std::runtime_error("Virtual memory management not supported on this device");
+    }
 
     // memory allocation property
     CUmemAllocationProp memprop = {};
@@ -119,22 +121,19 @@ int main(int argc, char **argv) {
     // size & granularity
     size_t allocSize = ((size_t)(256) << 20) * sizeof(float);
     size_t granu = 0;
-    CU_ASSERT_RESULT(cuMemGetAllocationGranularity(
-        &granu, &memprop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+    CU_ASSERT_RESULT(cuMemGetAllocationGranularity(&granu, &memprop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
     size_t origSize = allocSize;
     if (allocSize % granu > 0) {
         allocSize = granu * (allocSize / granu + 1);
     }
-    printf("requested size=%zu, padded alloc size=%zu, granularity=%zu\n",
-           origSize, allocSize, granu);
+    printf("requested size=%zu, padded alloc size=%zu, granularity=%zu\n", origSize, allocSize, granu);
 
     // allocate physical memory
     CUmemGenericAllocationHandle allocHandle;
     CUmemFabricHandle fabricHandle;
     if (world_rank == 0) {
         CU_ASSERT_RESULT(cuMemCreate(&allocHandle, allocSize, &memprop, 0));
-        CU_ASSERT_RESULT(cuMemExportToShareableHandle(
-            &fabricHandle, allocHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+        CU_ASSERT_RESULT(cuMemExportToShareableHandle(&fabricHandle, allocHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
         printf("allocHandle=%llx\n", allocHandle);
         printf("fabricHandle=");
         for (auto x : fabricHandle.data) {
@@ -152,8 +151,8 @@ int main(int argc, char **argv) {
             printf("%02x", x);
         }
         printf("\n");
-        CU_ASSERT_RESULT(cuMemImportFromShareableHandle(
-            &allocHandle, (void *)&fabricHandle, CU_MEM_HANDLE_TYPE_FABRIC));
+        CU_ASSERT_RESULT(
+            cuMemImportFromShareableHandle(&allocHandle, (void *)&fabricHandle, CU_MEM_HANDLE_TYPE_FABRIC));
         printf("allocHandle=%llx\n", allocHandle);
     }
     // just for safety: wait after every rank is done importing
@@ -161,10 +160,8 @@ int main(int argc, char **argv) {
 
     // map the memory
     float *buffer_egm;
-    CU_ASSERT_RESULT(
-        cuMemAddressReserve((CUdeviceptr *)&buffer_egm, allocSize, 0, 0, 0));
-    CU_ASSERT_RESULT(
-        cuMemMap((CUdeviceptr)buffer_egm, allocSize, 0, allocHandle, 0));
+    CU_ASSERT_RESULT(cuMemAddressReserve((CUdeviceptr *)&buffer_egm, allocSize, 0, 0, 0));
+    CU_ASSERT_RESULT(cuMemMap((CUdeviceptr)buffer_egm, allocSize, 0, allocHandle, 0));
 
     // explicitly protect mapped VA ranges
     CUmemAccessDesc accessDesc;
@@ -172,13 +169,11 @@ int main(int argc, char **argv) {
     // always make it accessible to the device
     accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     accessDesc.location.id = currentDev;
-    CU_ASSERT_RESULT(
-        cuMemSetAccess((CUdeviceptr)buffer_egm, allocSize, &accessDesc, 1));
+    CU_ASSERT_RESULT(cuMemSetAccess((CUdeviceptr)buffer_egm, allocSize, &accessDesc, 1));
     if (world_rank == 0 && location_type != CU_MEM_LOCATION_TYPE_DEVICE) {
         accessDesc.location.type = location_type;
         accessDesc.location.id = hostMem ? cpuNumaNodeId : currentDev;
-        CU_ASSERT_RESULT(
-            cuMemSetAccess((CUdeviceptr)buffer_egm, allocSize, &accessDesc, 1));
+        CU_ASSERT_RESULT(cuMemSetAccess((CUdeviceptr)buffer_egm, allocSize, &accessDesc, 1));
     }
 
     // Make sure every rank is done with mapping the fabric allocation
@@ -197,8 +192,8 @@ int main(int argc, char **argv) {
     if (world_rank == writer_rank || world_size == 1) {
         printf("Write data from rank=%d to EGM buffer\n", world_rank);
         init<<<num_blocks, block_size>>>(buffer_egm, num_elements);
-        CU_ASSERT_ERROR(cudaDeviceSynchronize());
         CU_ASSERT_ERROR(cudaGetLastError());
+        CU_ASSERT_ERROR(cudaDeviceSynchronize());
     }
 
     // sync
@@ -215,12 +210,10 @@ int main(int argc, char **argv) {
         sum = (float *)malloc(sizeof(float) * num_blocks);
 
         // verify
-        printf("Reading from rank=%d to sum up first 10 elements\n",
-               world_rank);
-        reduce<<<num_blocks, block_size, block_size * sizeof(float)>>>(
-            buffer_egm, sum, 10);
-        CU_ASSERT_ERROR(cudaDeviceSynchronize());
+        printf("Reading from rank=%d to sum up first 10 elements\n", world_rank);
+        reduce<<<num_blocks, block_size, block_size * sizeof(float)>>>(buffer_egm, sum, 10);
         CU_ASSERT_ERROR(cudaGetLastError());
+        CU_ASSERT_ERROR(cudaDeviceSynchronize());
         printf("sum[0]=%f\n", sum[0]);
 
         cudaEvent_t ckpt1, ckpt2, ckpt3;
@@ -232,27 +225,23 @@ int main(int argc, char **argv) {
         float *buffer_local;
         CU_ASSERT_ERROR(cudaMalloc(&buffer_local, allocSize));
         // copy
-        printf(
-            "cudaMemcpy buffer of size=%zuMB from rank=%d EGM to rank=%d HBM\n",
-            allocSize / 1024 / 1024, 0, world_rank);
+        printf("cudaMemcpy buffer of size=%zuMB from rank=%d EGM to rank=%d HBM\n", allocSize / 1024 / 1024, 0,
+               world_rank);
         cudaEventRecord(ckpt1);
-        CU_ASSERT_ERROR(cudaMemcpy(buffer_local, buffer_egm, allocSize,
-                                   cudaMemcpyDeviceToDevice));
+        CU_ASSERT_ERROR(cudaMemcpy(buffer_local, buffer_egm, allocSize, cudaMemcpyDeviceToDevice));
         cudaEventRecord(ckpt2);
         CU_ASSERT_ERROR(cudaDeviceSynchronize());
         cudaEventRecord(ckpt3);
         cudaEventElapsedTime(&elapsed2, ckpt1, ckpt2);
         cudaEventElapsedTime(&elapsed3, ckpt1, ckpt3);
         printf("Elapsed time %f/%f mili-seconds\n", elapsed2, elapsed3);
-        printf("%s-node EGM->HBM copy bandwidth: %f GB/s\n",
-               world_size == 1 ? "Same" : "Cross",
+        printf("%s-node EGM->HBM copy bandwidth: %f GB/s\n", world_size == 1 ? "Same" : "Cross",
                (allocSize / 1024.0 / 1024 / 1024) / (elapsed3 / 1000.0));
         // verify after copy
         printf("Verifying data after cudaMemcpy from rank=%d\n", world_rank);
-        reduce<<<num_blocks, block_size, block_size * sizeof(float)>>>(
-            buffer_local, sum, 10);
-        CU_ASSERT_ERROR(cudaDeviceSynchronize());
+        reduce<<<num_blocks, block_size, block_size * sizeof(float)>>>(buffer_local, sum, 10);
         CU_ASSERT_ERROR(cudaGetLastError());
+        CU_ASSERT_ERROR(cudaDeviceSynchronize());
         printf("sum[0]=%f\n", sum[0]);
         // reference copy
         float *buffer_cpu;
@@ -260,20 +249,16 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < num_elements; i++) {
             buffer_cpu[i] = static_cast<float>(i);
         }
-        printf(
-            "cudaMemcpy buffer of size=%zuMB from Host to Device\n",
-            allocSize / 1024 / 1024);
+        printf("cudaMemcpy buffer of size=%zuMB from Host to Device\n", allocSize / 1024 / 1024);
         cudaEventRecord(ckpt1);
-        CU_ASSERT_ERROR(cudaMemcpy(buffer_local, buffer_cpu, allocSize,
-                                   cudaMemcpyHostToDevice));
+        CU_ASSERT_ERROR(cudaMemcpy(buffer_local, buffer_cpu, allocSize, cudaMemcpyHostToDevice));
         cudaEventRecord(ckpt2);
         CU_ASSERT_ERROR(cudaDeviceSynchronize());
         cudaEventRecord(ckpt3);
         cudaEventElapsedTime(&elapsed2, ckpt1, ckpt2);
         cudaEventElapsedTime(&elapsed3, ckpt1, ckpt3);
         printf("Elapsed time %f/%f mili-seconds\n", elapsed2, elapsed3);
-        printf("Same-node H2D copy bandwidth: %f GB/s\n",
-               (allocSize / 1024.0 / 1024 / 1024) / (elapsed3 / 1000.0));
+        printf("Same-node H2D copy bandwidth: %f GB/s\n", (allocSize / 1024.0 / 1024 / 1024) / (elapsed3 / 1000.0));
         CU_ASSERT_ERROR(cudaFree(buffer_local));
         free(buffer_cpu);
     }

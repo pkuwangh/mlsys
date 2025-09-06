@@ -30,7 +30,8 @@ def CompCap2Throughput(major, minor):
         # 4 mixed-precision Fourth-Generation Tensor Cores supporting fp8, fp16, __nv_bfloat16, tf32, sub-byte and fp64 for compute capability 8.9
         (8, 9): (128, 2, 64, 4, 2048),  # L40, Ada family
         # 4 mixed-precision Fourth-generation Tensor Cores supporting the new FP8 input type in either E4M3 or E5M2 for exponent (E) and mantissa (M), half-precision (fp16), __nv_bfloat16, tf32, INT8 and double precision (fp64) matrix arithmetic
-        (9, 0): (128, 64, 64, 4, 4096),
+        (9, 0): (128, 64, 64, 4, 4096), # H100
+        (10, 0): (128, 64, 128, 4, 8192),  # B200?
     }
     # check if we know the mapping
     if (major, minor) in throughput_mapping:
@@ -39,7 +40,7 @@ def CompCap2Throughput(major, minor):
         return (0, 0, 0, 0, 0)
 
 
-def get_device_properties(device_idx=0, verbose=0):
+def get_device_properties(verbose=0) -> dict[str, float | int | str]:
     # https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities
     # Ada  https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf
     # A100 https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf
@@ -62,9 +63,16 @@ def get_device_properties(device_idx=0, verbose=0):
     sm_count = properties[cuda.device_attribute.MULTIPROCESSOR_COUNT]
     ver_major = properties[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]
     ver_minor = properties[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]
-    fp32_to_fp64_ratio = properties[
-        cuda.device_attribute.SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO
-    ]
+    fp32_to_fp64_ratio = properties[cuda.device_attribute.SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO]
+
+    if verbose >= 1:
+        print(
+            f"CUDA Device 0: {cuda.Device(0).name()}, "
+            f"Compute Capability: {ver_major}.{ver_minor}, "
+            f"SM Clock: {sm_clock/1e6:.2f} GHz, "
+            f"SMs: {sm_count}"
+        )
+
     (
         fp32_per_sm,
         fp64_per_sm,
@@ -113,8 +121,7 @@ def get_device_properties(device_idx=0, verbose=0):
     }
 
 
-def print_flops(tflops: float, op_type: str, prefix="run"):
-    props = get_device_properties()
+def print_flops(tflops: float, op_type: str, props: dict[str, float | int | str], prefix="run"):
     perc = tflops * 100 / props[op_type]
     print(f"{prefix}: {tflops:.2f} TFLOPs ({perc:.0f}%)", flush=True)
 

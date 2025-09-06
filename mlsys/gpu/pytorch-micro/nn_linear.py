@@ -6,7 +6,14 @@ import time
 from utils import get_device_properties, print_flops
 
 
-def test_nn_linear(m, n, p, num_iterations, warmup=False):
+def test_nn_linear(
+    m: int,
+    n: int,
+    p: int,
+    num_iterations: int,
+    device_props: dict[str, float | int | str],
+    warmup=False,
+):
     net = torch.nn.Linear(n, p).cuda().half()
     input = torch.randn(m, n).cuda().half()
     torch.cuda.synchronize()
@@ -32,18 +39,21 @@ def test_nn_linear(m, n, p, num_iterations, warmup=False):
     tflops = num_iterations * n_flop_per_iter / (end_iters - end_1st) / 1e12
 
     print(f"m={m} n={n} p={p}")
-    if get_device_properties().get("tensor_core_count", 0) > 0:
-        print_flops(tflops_1st, "tc_fp16_flops", prefix="1st run")
-        print_flops(tflops, "tc_fp16_flops", prefix="rep run")
+    if device_props.get("tensor_core_count", 0) > 0:
+        print_flops(tflops_1st, "tc_fp16_flops", device_props, prefix="1st run")
+        print_flops(tflops, "tc_fp16_flops", device_props, prefix="rep run")
     else:
-        print_flops(tflops_1st, "fp16_flops", prefix="1st run")
-        print_flops(tflops, "fp16_flops", prefix="rep run")
+        print_flops(tflops_1st, "fp16_flops", device_props, prefix="1st run")
+        print_flops(tflops, "fp16_flops", device_props, prefix="rep run")
 
-test_nn_linear(8192, 8192, 8192, 10, warmup=True)
+
+device_props = get_device_properties(verbose=1)
+
+test_nn_linear(8192, 8192, 8192, 10, device_props, warmup=True)
 print("Matrix multiplication using torch.nn.Linear", flush=True)
-test_nn_linear(512, 512, 512, 100000)
-test_nn_linear(1024, 1024, 1024, 10000)
-test_nn_linear(2048, 2048, 2048, 10000)
-test_nn_linear(4096, 4096, 4096, 1000)
-test_nn_linear(8192, 8192, 8192, 100)
-test_nn_linear(16384, 16384, 16384, 10)
+test_nn_linear(512, 512, 512, 100000, device_props)
+test_nn_linear(1024, 1024, 1024, 10000, device_props)
+test_nn_linear(2048, 2048, 2048, 10000, device_props)
+test_nn_linear(4096, 4096, 4096, 1000, device_props)
+test_nn_linear(8192, 8192, 8192, 100, device_props)
+test_nn_linear(16384, 16384, 16384, 10, device_props)

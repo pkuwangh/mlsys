@@ -5,7 +5,15 @@ import time
 
 from utils import get_device_properties, print_flops
 
-def test_matmul(m, n, p, num_iterations, warmup=False):
+
+def test_matmul(
+    m: int,
+    n: int,
+    p: int,
+    num_iterations: int,
+    device_props: dict[str, float | int | str],
+    warmup=False,
+):
     # Create random matrices
     A = torch.randn(m, n).cuda().half()
     B = torch.randn(n, p).cuda().half()
@@ -32,19 +40,21 @@ def test_matmul(m, n, p, num_iterations, warmup=False):
     tflops = num_iterations * n_flop_per_iter / (end_iters - end_1st) / 1e12
 
     print(f"m={m} n={n} p={p}")
-    if get_device_properties().get("tensor_core_count", 0) > 0:
-        print_flops(tflops_1st, "tc_fp16_flops", prefix="1st run")
-        print_flops(tflops, "tc_fp16_flops", prefix="rep run")
+    if device_props.get("tensor_core_count", 0) > 0:
+        print_flops(tflops_1st, "tc_fp16_flops", device_pros, prefix="1st run")
+        print_flops(tflops, "tc_fp16_flops", device_pros, prefix="rep run")
     else:
-        print_flops(tflops_1st, "fp16_flops", prefix="1st run")
-        print_flops(tflops, "fp16_flops", prefix="rep run")
+        print_flops(tflops_1st, "fp16_flops", device_pros, prefix="1st run")
+        print_flops(tflops, "fp16_flops", device_pros, prefix="rep run")
 
 
-test_matmul(8192, 8192, 8192, 10, warmup=True)
+device_pros = get_device_properties(verbose=1)
+
+test_matmul(8192, 8192, 8192, 10, device_pros, warmup=True)
 print("Matrix multiplication using torch.matmul", flush=True)
-test_matmul(512, 512, 512, 100000)
-test_matmul(1024, 1024, 1024, 10000)
-test_matmul(2048, 2048, 2048, 10000)
-test_matmul(4096, 4096, 4096, 1000)
-test_matmul(8192, 8192, 8192, 100)
-test_matmul(16384, 16384, 16384, 10)
+test_matmul(512, 512, 512, 100000, device_pros)
+test_matmul(1024, 1024, 1024, 10000, device_pros)
+test_matmul(2048, 2048, 2048, 10000, device_pros)
+test_matmul(4096, 4096, 4096, 1000, device_pros)
+test_matmul(8192, 8192, 8192, 100, device_pros)
+test_matmul(16384, 16384, 16384, 10, device_pros)
