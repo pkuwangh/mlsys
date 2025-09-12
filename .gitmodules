@@ -25,3 +25,6 @@
 [submodule "mlsys/inference/tensorrt-llm/TensorRT-LLM"]
 	path = mlsys/inference/tensorrt-llm/TensorRT-LLM
 	url = https://github.com/pkuwangh/TensorRT-LLM.git
+[submodule "mlsys/inference/nano-vllm/nano-vllm"]
+	path = mlsys/inference/nano-vllm/nano-vllm
+	url = https://github.com/pkuwangh/nano-vllm.git

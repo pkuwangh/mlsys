@@ -13,9 +13,6 @@ uv pip install -r requirements/build.txt
 uv pip install --no-build-isolation -e .[bench]
 # to make vscode/pylance happy and be able to find reference in source code
 uv pip install --no-build-isolation -e .[bench] --config-settings editable_mode=compat
-
-# additional deps
-pip install -r requirements.txt
 ```
 
 ## Quick start
