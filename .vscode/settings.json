@@ -13,8 +13,8 @@
     "C_Cpp.clang_format_fallbackStyle": "{BasedOnStyle: LLVM, IndentWidth: 4, ColumnLimit: 120}",
     "C_Cpp.clang_format_style": "{BasedOnStyle: LLVM, IndentWidth: 4, ColumnLimit: 120}",
     "files.associations": {
-        "*.cu": "cuda",
-        "*.cuh": "cuda",
+        "*.cu": "cpp-cuda",
+        "*.cuh": "cpp-cuda",
         "ios": "cpp",
         "*.ipp": "cpp",
         "__nullptr": "cpp",

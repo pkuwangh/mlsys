@@ -23,6 +23,9 @@ export CUDA_HOME="${CONDA_PREFIX}"
 export CUDA_PATH="${CUDA_HOME}"
 export CUDACXX="${CUDA_HOME}/bin/nvcc"
 
+# for conda-installed CUDA, real home is under /targets/$(uname -m)-linux
+_SCATTERED_CUDA_HOME="${CUDA_HOME}/targets/$(uname -m)-linux"
+
 # link critical header files
 _HEADERS=("cuda.h" "cuda_runtime.h" "cuda_runtime_api.h" "device_functions.h")
 for header in "${_HEADERS[@]}"; do
@@ -30,9 +33,6 @@ for header in "${_HEADERS[@]}"; do
         ln -s "${_SCATTERED_CUDA_HOME}/include/${header}" "${CUDA_HOME}/include/${header}"
     fi
 done
-
-# for conda-installed CUDA, real home is under /targets/$(uname -m)-linux
-_SCATTERED_CUDA_HOME="${CUDA_HOME}/targets/$(uname -m)-linux"
 
 # libcudart.so is under /targets/x86_64-linux/lib, but is linked to /lib
 # libcuda.so is under /targets/x86_64-linux/lib/stub
