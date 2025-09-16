@@ -25,6 +25,16 @@ export CUDACXX="${CUDA_HOME}/bin/nvcc"
 
 # for conda-installed CUDA, real home is under /targets/$(uname -m)-linux
 _SCATTERED_CUDA_HOME="${CUDA_HOME}/targets/$(uname -m)-linux"
+if [ ! -d "${_SCATTERED_CUDA_HOME}" ]; then
+    debugMsg "Cannot find scattered CUDA home: ${_SCATTERED_CUDA_HOME}"
+    _OLD_SCATTERED_CUDA_HOME=$_SCATTERED_CUDA_HOME
+    _SCATTERED_CUDA_HOME="${CUDA_HOME}/targets/sbsa-linux"
+    if [ ! -d "${_SCATTERED_CUDA_HOME}" ]; then
+        warnMsg "Cannot find scattered CUDA home: ${_OLD_SCATTERED_CUDA_HOME} and ${_SCATTERED_CUDA_HOME}"
+        return 1
+    fi
+fi
+infoMsg "Using scattered CUDA home: ${_SCATTERED_CUDA_HOME}"
 
 # link critical header files
 _HEADERS=("cuda.h" "cuda_runtime.h" "cuda_runtime_api.h" "device_functions.h")

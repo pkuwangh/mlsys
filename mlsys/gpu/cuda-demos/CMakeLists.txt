@@ -38,6 +38,7 @@ else()
 endif()
 
 set(TESTS
+    "uvm_pingpong"
     "uvm_vec_add"
     "mpi_egm"
 )
