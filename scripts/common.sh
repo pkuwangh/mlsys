@@ -1,13 +1,5 @@
 #!/bin/bash
 
-# environment variables
-_CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-_ROOT_DIR="${_CURR_DIR}/.."
-
-export MAMBA_ROOT_PREFIX="${_ROOT_DIR}/micromamba"
-export MAMBA_EXE="${MAMBA_ROOT_PREFIX}/bin/micromamba"
-
-
 # take one argument as the message
 infoMsg() {
     echo -e "\033[32;1m${1}\033[0m"
