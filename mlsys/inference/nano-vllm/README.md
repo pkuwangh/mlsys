@@ -1,5 +1,16 @@
 # nano-vllm
 
+- [nano-vllm](#nano-vllm)
+  - [Install nano-vllm](#install-nano-vllm)
+  - [Quick start](#quick-start)
+  - [Walk through](#walk-through)
+    - [Engine workflow](#engine-workflow)
+    - [Scheduling](#scheduling)
+    - [Block Manager](#block-manager)
+    - [Model Runner](#model-runner)
+      - [Setup](#setup)
+      - [Preparation before each iteration](#preparation-before-each-iteration)
+
 ## Install nano-vllm
 
 ```bash
@@ -100,3 +111,48 @@ class BlockManager:
     - add to `hash_to_block_id`
   - else, must be a partial block with `block.hash == -1`
 
+### Model Runner
+
+#### Setup
+
+- create an instance of the target model, which includes
+  - embedding layer: `weight = nn.Parameter(vocab_size_per_partition, hidden_size)`
+    - `y = F.embedding(x, weight)` - expects `weight` shaped `(num_embeddings, embedding_size)`
+      - `x: (B, T)`
+      - `y = weight[input]`: `(B, T, H)`: gather rows of `weight` corresponding to the indices in `x`.
+  - list of decodere layers
+    - RMSNorm: `weight = nn.Parameter(hidden_size)`
+      - `x = x + residual`
+      - `next_residual = x`
+      - `var = x.pow(2).mean(dim=-1, keepdim=True)`: per-token mean square across H dimension.
+      - `x = x * torch.rsqrt(var + eps)`: apply per-token root mean square with a small eps
+      - `x = x * weight`: apply learnable scale vector `weight (H)`
+    - Attention
+      - Proj for QKV: column-parallel linear `(B, T, H) -> (B, T, num_heads * H + 2 * num_kv_heads * H)`
+      - re-shape QKV into `(B * T, num_heads/num_kv_heads, head_dim)` because RMSNorm & rotary are per-token per-head.
+      - RMSNorm for Q & K: apply per-head RMSNorm
+      - Rotary Emb for Q & K: `positions: (B, T)`
+      - Core Attention: `(B * T, num_heads/num_kv_heads, head_dim)`
+        - since `B & T` is flattened, which is why `cu_seqlens_q` & `cu_seqlens_k` are needed.
+      - Proj O:
+        - flatten `(B * T, num_heads, head_dim) -> (B * T, H)`
+        - row-parallel linear `(H, H)` and view-back to `(B, T, H)`
+    - RMSNorm: post-attention layer norm, residual from input layer norm
+    - MLP:
+      - gate_up_proj: `u = x @ W_up; g = x @ W_gate`, so the Linear layer `output_sizes` takes `[4H] * 2`.
+      - activation: `h = SiLU(g) * u`
+      - down_proj: `y = h @ W_down`
+  - RMSnorm layer in the end
+  - to compute `logits`, apply `lm_head (vocab_size, H)`
+    - `y = F.linear(x, weight)` - expects `weight` shaped `(output_features, input_features)`
+- allocate KV cache (actual tensors!)
+  - `kv_cache = torch.empty(2, n_hidden_layers, n_kvcache_blocks, block_size, n_kv_heads, head_dim)`
+  - `module.k_cache = kv_cache[0, layer_id]`
+  - `module.v_cache = kv_cache[1, layer_id]`
+
+#### Preparation before each iteration
+
+- construct `input_ids` & `positions` tensors
+- calculate `cu_seqlens_q` & `cu_seqlen_k` as attention kernel works on flattened tensor `(B * T, A, d)`
+- build `slot_mapping` to tell attention kernel where to write the kv cache for input tokens
+- prepare `block_tables` which has the info on where to find the kv cache for previous tokens
