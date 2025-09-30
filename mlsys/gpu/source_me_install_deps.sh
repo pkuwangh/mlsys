@@ -18,6 +18,8 @@ micromamba install -y \
     -c conda-forge \
     cmake=4.1.0 gcc=12.4 libboost-devel=1.88.0 openmpi-mpicxx=5.0.8
 
+pip install black loguru ruff "huggingface_hub[cli]"
+
 # for cmake find_package
 export CUDA_HOME="${CONDA_PREFIX}"
 export CUDA_PATH="${CUDA_HOME}"

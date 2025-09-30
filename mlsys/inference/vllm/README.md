@@ -22,6 +22,15 @@ cd quickstart
 
 # profile batch inference
 nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop ./v01-offline-batch-inference.py
+
+# benchmark
+wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
+nsys profile --delay 45 \
+    vllm bench throughput \
+    --model models/meta-llama/Llama-3.1-8B-Instruct/ \
+    --dataset-name sharegpt \
+    --dataset-path ./ShareGPT_V3_unfiltered_cleaned_split.json \
+    --num-prompts 200
 ```
 
 ## Benchmarks
@@ -57,11 +66,9 @@ vllm bench throughput \
 
 ```bash
 export HF_TOKEN=<hugginface token>
-wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
-
 # throughput benchmark
 python3 benchmark_throughput.py \
-    --output-json results//throughput_llama8B_tp1.json \
+    --output-json results/throughput_llama8B_tp1.json \
     --model meta-llama/Meta-Llama-3.1-8B-Instruct \
     --tensor-parallel-size 1 \
     --load-format dummy \

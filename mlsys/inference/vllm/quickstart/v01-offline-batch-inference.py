@@ -21,21 +21,39 @@ def run(llm: LLM, prompts: list[str]) -> list[RequestOutput]:
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=32)
     logger.info(f"sampling_params: {sampling_params}")
 
+    # concept
+    # - engine_core: EngineCoreClient
+    #   - model_executor: UniProcExecutor
+    #     - driver_worker: WorkerWrapperBase
+    #       - worker: gpu_worker.Worker
+    #         - model_runner: GPUModelRunner
+    #           - model: LlamaForCausalLM
+    #           - kv_caches: list[Tensor]
+    #     - collective_rpc to execute a RPC call on the worker; in constructor
+    #       - init_worker
+    #       - init_device
+    #       - load_model
+    #   - _initialize_kv_caches
+    #     - model_executor.initialize_from_config -> worker.initialize_from_config
+    #     - model_executor.compile_on_warm_up_model -> worker.compile_on_warm_up_model
+    #       - model_runner.capture_model
+
     # generate call trace
-    # - llm_engine.add_request one by one
-    #   - input_preprocessor.preprocess
-    #   - llm_engine._add_processed_request
-    #     - create sequence group and add to scheduler
-    #       - if sampling_params.n > 1 for parallel sampling, call _add_process_request n times
-    #   - llm_engine._run_engine
-    #     while llm_engine.has_unfinished_requests:
-    #       - step_outputs = llm_engine.step()  # one decoding iteration
+    # - llm._validate_and_add_requests
+    #   - llm_engine.add_request one by one
+    #     - processor.process_input
+    #     - engine_core.add_request
+    #       - if sampling_params.n > 1 for parallel sampling, call add_request n times
+    # - llm._run_engine
+    #   while llm_engine.has_unfinished_requests:
+    #     - step_outputs = llm_engine.step()  # one decoding iteration
+    #       - EngineCore.step
     #         - scheduler.schedule; also token blocks to be swapped in/out
     #         - module_executor.execute_model
     #         - scheduler_context.append_output
     #         - process module output
     logger.info("Generating text...")
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
     return outputs
 
 
@@ -44,16 +62,16 @@ if __name__ == "__main__":
     torch.cuda.set_device(0)
     torch.zeros(1, device="cuda")
 
+    llm = setup()
+
     prompts = [
         "Hello, my name is",
         "The president of the United States is",
         "The capital of France is",
         "The future of AI is",
     ]
-    prompts = prompts * 8  # 32 sequences in total
+    prompts = prompts
     logger.info(f"Prepared {len(prompts)} prompts for generation.")
-
-    llm = setup()
 
     cudart().cudaProfilerStart()
     outputs = run(llm, prompts)
