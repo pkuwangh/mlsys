@@ -1,4 +1,5 @@
 nvbandwidth/build/
 cuda-demos/build/
+matmul/build/
 bin/
 log

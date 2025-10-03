@@ -98,5 +98,8 @@
         "streambuf": "cpp",
         "typeindex": "cpp",
         "valarray": "cpp"
+    },
+    "[cpp]": {
+        "editor.defaultFormatter": "xaver.clang-format"
     }
 }
