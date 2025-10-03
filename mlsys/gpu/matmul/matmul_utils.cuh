@@ -70,12 +70,18 @@ class MatmulBuffers {
 
     void reset() {
         checkCuda(cudaMemset(dC, 0, hC.size() * sizeof(float)), "cudaMemset dC");
+        checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
         num_iters = 0;
     }
 
     void printResult() {
         checkCuda(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy dC->hC");
         printMatrix(hC.data(), M, N, "C");
+    }
+
+    std::vector<float> copyResultVector() {
+        checkCuda(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy dC->hC");
+        return hC;
     }
 
     void printTFLOPS(float elapsed_ms, std::string kernel_name) {
