@@ -14,7 +14,7 @@ from vllm.outputs import RequestOutput
 def setup() -> LLM:
     model_path = get_model_path("NousResearch/Hermes-3-Llama-3.1-8B/")
     logger.warning(f"[pid={os.getpid()}] Loading model from: {model_path}")
-    return LLM(model=model_path)
+    return LLM(model=model_path, tensor_parallel_size=2)
 
 
 @nvtx.annotate("run")
@@ -28,9 +28,9 @@ def run(llm: LLM, prompts: list[str]) -> list[RequestOutput]:
 
 
 if __name__ == "__main__":
-    # init cuda context; otherwise nsys gets nothing!
-    torch.cuda.set_device(0)
-    torch.zeros(1, device="cuda")
+    # with TP=2, the worker will init the cuda context?
+    # torch.cuda.set_device(0)
+    # torch.zeros(1, device="cuda")
 
     llm = setup()
 
