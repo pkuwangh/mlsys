@@ -3,6 +3,8 @@
 #include "matmul_utils.cuh"
 #include <cuda_runtime.h>
 
+#define BLOCK_DIM 32
+
 __global__ void matmul_basic(const float *A, const float *B, float *C, int M, int K, int N) {
     // each thread computes one element of the result matrix
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -20,7 +22,7 @@ __global__ void matmul_basic(const float *A, const float *B, float *C, int M, in
 }
 
 void runMatmulBasic(MatmulBuffers &buffers) {
-    dim3 blockDim = dim3(16, 16);
+    dim3 blockDim = dim3(BLOCK_DIM, BLOCK_DIM);
     dim3 gridDim = makeGrid2D(buffers.M, buffers.N, blockDim);
 
     matmul_basic<<<gridDim, blockDim>>>(buffers.dA, buffers.dB, buffers.dC, buffers.M, buffers.K, buffers.N);

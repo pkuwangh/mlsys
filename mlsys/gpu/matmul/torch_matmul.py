@@ -46,8 +46,8 @@ torch.cuda.init()
 torch.cuda.set_device(0)
 
 # check configuration
-print(f"{torch.backends.cuda.matmul.allow_tf32=}; will set to True")
-print(f"{torch.get_float32_matmul_precision()=}; will set to high")
+print(f"{torch.backends.cuda.matmul.allow_tf32=}")
+print(f"{torch.get_float32_matmul_precision()=}")
 print(f"{torch.are_deterministic_algorithms_enabled()=}")
 
 # TF32 has slight lower precision than FP32 but can be run on Tensor Cores

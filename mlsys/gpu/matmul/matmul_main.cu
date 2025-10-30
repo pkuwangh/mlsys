@@ -3,9 +3,27 @@
 #include <vector>
 
 #include "matmul_kernel_basic.cuh"
-#include "matmul_kernel_tiled_shmem.cuh"
+#include "matmul_kernel_shmem_basic.cuh"
 #include "matmul_utils.cuh"
 
+// dump cuda-related device information
+void dumpDeviceInfo() {
+    int device_count;
+    checkCuda(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+    std::printf("Device count: %d\n", device_count);
+    cudaDeviceProp prop;
+    checkCuda(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
+    std::printf("Device name: %s\n", prop.name);
+    std::printf("Device compute capability: %d.%d\n", prop.major, prop.minor);
+    std::printf("Device total memory: %zu bytes\n", prop.totalGlobalMem);
+    // dump factors that limit the number of blocks
+    std::printf("max threads per SM: %d\n", prop.maxThreadsPerMultiProcessor);
+    std::printf("max blocks per SM: %d\n", prop.maxBlocksPerMultiProcessor);
+    std::printf("# of registers per SM: %d\n", prop.regsPerMultiprocessor);
+    std::printf("shared memory per SM: %zu bytes\n", prop.sharedMemPerMultiprocessor);
+}
+
+// sanity tests on basic kernel with small matrix sizes
 void sanityTests() {
     std::printf("Sanity functional correctness check\n");
     MatmulBuffers buffers = MatmulBuffers(2, 4, 2);
@@ -17,14 +35,15 @@ void sanityTests() {
     runMatmulBasic(buffers);
     buffers.printResult();
 
-    // std::printf("tiled shmem kernel\n");
+    // std::printf("shmem-basic kernel\n");
     // buffers.reset();
-    // runMatmulTiledShmem(buffers);
+    // runMatmulShmemBasic(buffers);
     // buffers.printResult();
 
     std::printf("--------------------------------\n");
 }
 
+// verify correctness against reference result
 void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, std::string kernel_name) {
     std::vector<float> result = buffers.copyResultVector();
     int num_errors = 0;
@@ -41,6 +60,7 @@ void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, st
     std::printf("%s correctness check %s\n", kernel_name.c_str(), num_errors == 0 ? "passed" : "failed");
 }
 
+// functional tests against basic kernel
 void functionalTests() {
     std::printf("Functional correctness check against basic kernel\n");
     MatmulBuffers buffers = MatmulBuffers(32, 64, 64);
@@ -48,12 +68,15 @@ void functionalTests() {
     std::vector<float> ref = buffers.copyResultVector();
     verifyCorrectness(ref, buffers, "basic");
 
-    // verify tiled shmem kernel
+    // verify shmem-basic kernel
     buffers.reset();
-    runMatmulTiledShmem(buffers);
-    verifyCorrectness(ref, buffers, "tiled shmem");
+    runMatmulShmemBasic(buffers);
+    verifyCorrectness(ref, buffers, "shmem-basic");
+
+    std::printf("--------------------------------\n");
 }
 
+// performance tests
 void perfTests(MatmulBuffers &buffers, std::function<void(MatmulBuffers &)> run_kernel, std::string kernel_name) {
     int num_warmup_iters = 1;
     int num_total_iters = 100;
@@ -71,6 +94,8 @@ void perfTests(MatmulBuffers &buffers, std::function<void(MatmulBuffers &)> run_
 }
 
 int main() {
+    dumpDeviceInfo();
+
     // sanity functional correctness check on basic kernel
     sanityTests();
 
@@ -80,7 +105,7 @@ int main() {
     // perf test
     MatmulBuffers buffers = MatmulBuffers(4096, 8192, 8192);
     perfTests(buffers, runMatmulBasic, "matmul-basic");
-    perfTests(buffers, runMatmulTiledShmem, "matmul-tiled-shmem");
+    perfTests(buffers, runMatmulShmemBasic, "matmul-shmem-basic");
 
     return 0;
 }

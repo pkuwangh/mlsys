@@ -37,6 +37,7 @@ foreach(TEST ${TESTS})
     add_executable(${TEST} ${TEST}.cu)
 
     target_include_directories(${TEST} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} .)
+    target_compile_options(${TEST} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v>)
     target_link_libraries(${TEST} ${NVML_LIB_NAME} cuda)
 
     install(TARGETS ${TEST} DESTINATION "bin")

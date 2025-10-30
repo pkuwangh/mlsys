@@ -24,3 +24,10 @@ matmul kernels:
   - `warpgroupsize1x1x1`: no multi-warp-group cooperations per CTA tile
   - `execute_segment_k_on_kernel`: K-dimension is segmented inside the kernel
   - `5x`: unroll / pipeline depth
+
+## CUDA
+
+- Basic kernel
+  - `--ptxas-options=-v` shows
+    - 32 registers per thread, limit # blocks to 65536 / (1024 * 32) = 2
+    - with max threads per SM of 2048, that limit is also 2 blocks.
