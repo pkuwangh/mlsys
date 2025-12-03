@@ -33,6 +33,9 @@ set(TESTS
     "matmul_main"
 )
 
+# nvcc flags
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-v")
+
 foreach(TEST ${TESTS})
     add_executable(${TEST} ${TEST}.cu)
 
