@@ -28,3 +28,6 @@
 [submodule "mlsys/inference/nano-vllm/nano-vllm"]
 	path = mlsys/inference/nano-vllm/nano-vllm
 	url = https://github.com/pkuwangh/nano-vllm.git
+[submodule "mlsys/inference/sglang/sglang"]
+	path = mlsys/inference/sglang/sglang
+	url = https://github.com/pkuwangh/sglang.git

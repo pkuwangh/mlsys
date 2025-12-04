@@ -15,7 +15,7 @@ uv pip install --no-build-isolation -e .[bench]
 uv pip install --no-build-isolation -e .[bench] --config-settings editable_mode=compat
 ```
 
-## Quick start
+## Quick Start
 
 ```bash
 cd quickstart

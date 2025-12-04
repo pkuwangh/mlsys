@@ -5,13 +5,13 @@ CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "${CURR_DIR}/../../../scripts/common.sh"
 
-MY_VENV="mlsys-vllm"
+MY_VENV="mlsys-sglang"
 
 micromamba deactivate
 if micromamba env list | grep -q "${MY_VENV}"; then
     debugMsg "Virtual env ${MY_VENV} already exists."
 else
-    micromamba create -n "${MY_VENV}" -c conda-forge python=3.10 pip=25.0 "setuptools<80.0.0" -y
+    micromamba create -n "${MY_VENV}" -c conda-forge "python=3.10" "pip=25.0" "setuptools>=80.0.0" -y
 fi
 micromamba activate "${MY_VENV}"
 
@@ -19,13 +19,12 @@ splitLine
 # For whatever reason, installing CUDA adds e.g. $CONDA_BACKUP_CFLAGS back up $CFLAGS
 cleanupCondaBackEnvs
 micromamba install -n "${MY_VENV}" -y \
-    -c nvidia/label/cuda-12.8.0 \
+    -c nvidia/label/cuda-13.0.2 \
     cuda cuda-nvcc cuda-toolkit cuda-runtime cuda-nvtx-dev \
     -c conda-forge \
-    cmake=4.1.0 gcc=12.4 ninja=1.13.1 ccache=4.11 \
-    nvtx=0.2.13
+    nvtx=0.2.14
 
-pip install black loguru ruff
+pip install black loguru ruff "huggingface_hub[cli]"
 
 splitLine
 infoMsg "Checking nvcc"
@@ -33,10 +32,7 @@ which nvcc
 nvcc --version
 
 splitLine
-infoMsg "Set various environment variables for vLLM build"
-
-export CCACHE_NOHASHDIR="true"
-export CCACHE_DIR="${CURR_DIR}/.ccache"
+infoMsg "Set various environment variables for sglang build"
 
 # for cmake find_package
 export CUDA_HOME="${CONDA_PREFIX}"
@@ -61,9 +57,3 @@ export CPATH="${_SCATTERED_CUDA_HOME}/include:${CPATH}"
 # libcuda.so is under /targets/x86_64-linux/lib/stub
 export LIBRARY_PATH="${_SCATTERED_CUDA_HOME}/lib:${_SCATTERED_CUDA_HOME}/lib/stub:${LIBRARY_PATH}"
 export LD_LIBRARY_PATH="${_SCATTERED_CUDA_HOME}/lib:${_SCATTERED_CUDA_HOME}/lib/stub:${LD_LIBRARY_PATH}"
-
-uv pip install \
-    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
-    --index-url https://download.pytorch.org/whl/cu128
-
-python "${CURR_DIR}/check_cuda.py"
