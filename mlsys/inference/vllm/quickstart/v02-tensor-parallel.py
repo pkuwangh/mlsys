@@ -14,7 +14,11 @@ from vllm.outputs import RequestOutput
 def setup() -> LLM:
     model_path = get_model_path("NousResearch/Hermes-3-Llama-3.1-8B/")
     logger.warning(f"[pid={os.getpid()}] Loading model from: {model_path}")
-    return LLM(model=model_path, tensor_parallel_size=2)
+    return LLM(
+        model=model_path,
+        tensor_parallel_size=2,
+        compilation_config={"cudagraph_mode": "piecewise"},
+    )
 
 
 @nvtx.annotate("run")

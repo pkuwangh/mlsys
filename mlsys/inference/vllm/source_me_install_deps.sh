@@ -19,14 +19,14 @@ splitLine
 # For whatever reason, installing CUDA adds e.g. $CONDA_BACKUP_CFLAGS back up $CFLAGS
 cleanupCondaBackEnvs
 micromamba install -n "${MY_VENV}" -y \
-    -c nvidia/label/cuda-13.0.2 \
+    -c nvidia/label/cuda-12.8.0 \
     cuda cuda-nvcc cuda-toolkit cuda-runtime cuda-nvtx-dev \
     -c conda-forge \
     gcc=12.4 ccache=4.11 \
     nvtx=0.2.13 \
     --strict-channel-priority
 
-uv pip install cmake==4.2.0 ninja==1.13.0
+uv pip install cmake==4.1.0 ninja==1.13.0
 
 pip install black loguru ruff
 
@@ -59,6 +59,8 @@ done
 
 # cuda.h etc. are under /targets/x86_64-linux/include
 export CPATH="${_SCATTERED_CUDA_HOME}/include:${CPATH}"
+# cccl, cuda core compute libraries
+export CPATH="${_SCATTERED_CUDA_HOME}/include/cccl:${CPATH}"
 
 # libcudart.so is under /targets/x86_64-linux/lib, but is linked to /lib
 # libcuda.so is under /targets/x86_64-linux/lib/stub
@@ -66,7 +68,7 @@ export LIBRARY_PATH="${_SCATTERED_CUDA_HOME}/lib:${_SCATTERED_CUDA_HOME}/lib/stu
 export LD_LIBRARY_PATH="${_SCATTERED_CUDA_HOME}/lib:${_SCATTERED_CUDA_HOME}/lib/stub:${LD_LIBRARY_PATH}"
 
 uv pip install \
-    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+    torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 \
     --index-url https://download.pytorch.org/whl/cu128
 
 python "${CURR_DIR}/check_cuda.py"
