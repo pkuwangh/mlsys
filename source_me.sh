@@ -63,6 +63,8 @@ else
     micromamba activate "${MY_VENV}"
 fi
 
+micromamba install -y git-lfs
+
 splitLine
 debugMsg "Listing all virtual envs ..."
 micromamba env list
