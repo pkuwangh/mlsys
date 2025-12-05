@@ -31,3 +31,6 @@
 [submodule "mlsys/inference/sglang/sglang"]
 	path = mlsys/inference/sglang/sglang
 	url = https://github.com/pkuwangh/sglang.git
+[submodule "mlsys/inference/oss-models/cosmos-predict2.5"]
+	path = mlsys/inference/oss-models/cosmos-predict2.5
+	url = https://github.com/nvidia-cosmos/cosmos-predict2.5.git

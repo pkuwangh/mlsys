@@ -5,7 +5,7 @@ CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "${CURR_DIR}/../../../scripts/common.sh"
 
-MY_VENV="mlsys-sglang"
+MY_VENV="mlsys-cosmos-predict"
 
 micromamba deactivate
 if micromamba env list | grep -q "${MY_VENV}"; then
@@ -25,7 +25,7 @@ micromamba install -n "${MY_VENV}" -y \
     nvtx=0.2.14 \
     --strict-channel-priority
 
-pip install black loguru ruff
+pip install black loguru ruff huggingface_hub
 
 splitLine
 infoMsg "Checking nvcc"

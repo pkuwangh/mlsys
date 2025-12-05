@@ -11,7 +11,7 @@ micromamba deactivate
 if micromamba env list | grep -q "${MY_VENV}"; then
     debugMsg "Virtual env ${MY_VENV} already exists."
 else
-    micromamba create -n "${MY_VENV}" -c conda-forge python=3.10 pip=25.0 "setuptools<80.0.0" -y
+    micromamba create -n "${MY_VENV}" -c conda-forge python=3.12 pip=25.0 "setuptools<80.0.0" -y
 fi
 micromamba activate "${MY_VENV}"
 
@@ -19,11 +19,14 @@ splitLine
 # For whatever reason, installing CUDA adds e.g. $CONDA_BACKUP_CFLAGS back up $CFLAGS
 cleanupCondaBackEnvs
 micromamba install -n "${MY_VENV}" -y \
-    -c nvidia/label/cuda-12.8.0 \
+    -c nvidia/label/cuda-13.0.2 \
     cuda cuda-nvcc cuda-toolkit cuda-runtime cuda-nvtx-dev \
     -c conda-forge \
-    cmake=4.1.0 gcc=12.4 ninja=1.13.1 ccache=4.11 \
-    nvtx=0.2.13
+    gcc=12.4 ccache=4.11 \
+    nvtx=0.2.13 \
+    --strict-channel-priority
+
+uv pip install cmake==4.2.0 ninja==1.13.0
 
 pip install black loguru ruff
 
