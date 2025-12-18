@@ -20,6 +20,7 @@ inline void fillSequential(float *data, int count) {
 }
 
 inline dim3 makeGrid2D(int rows, int cols, dim3 block) {
+    // x, y (, z)
     return dim3((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
 }
 

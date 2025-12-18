@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(cuda_demos
     LANGUAGES CUDA CXX)
 
-set(CMAKE_CUDA_ARCHITECTURES 90-real;90-virtual;100-real;100-virtual)
+set(CMAKE_CUDA_ARCHITECTURES 86-real;86-virtual;90-real;90-virtual;100-real;100-virtual)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
