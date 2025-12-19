@@ -17,9 +17,9 @@ __global__ void matmul_a01_basic(float *A, float *B, float *C, int M, int K, int
 
     float acc = 0.0f;
     // for each element in MxN matrix, K iterations
-    for (int e = 0; e < K; ++e) {
+    for (int i = 0; i < K; ++i) {
         // 2 global mem accesses and 1 fma per iteration
-        acc += A[gy * K + e] * B[e * N + gx];
+        acc += A[gy * K + i] * B[i * N + gx];
     }
     // total: M*N*K*2 global mem access + M*N*K*1 fma
     C[gy * N + gx] = acc;
@@ -30,6 +30,6 @@ void runMatmulA01Basic(MatmulBuffers &buffers) {
     dim3 gridDim = makeGrid2D(buffers.M, buffers.N, blockDim);
 
     matmul_a01_basic<<<gridDim, blockDim>>>(buffers.dA, buffers.dB, buffers.dC, buffers.M, buffers.K, buffers.N);
-    checkCuda(cudaGetLastError(), "launch matmul_basic");
+    // checkCuda(cudaGetLastError(), "launch matmul_basic");
     buffers.num_iters += 1;
 }

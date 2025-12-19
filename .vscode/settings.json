@@ -100,6 +100,6 @@
         "valarray": "cpp"
     },
     "[cpp]": {
-        "editor.defaultFormatter": "xaver.clang-format"
+        "editor.defaultFormatter": "ebextensions.clang-format-2025"
     }
 }

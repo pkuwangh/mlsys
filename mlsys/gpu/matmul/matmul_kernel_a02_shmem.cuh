@@ -61,7 +61,6 @@ void runMatmulA02Shmem(MatmulBuffers &buffers) {
     dim3 gridDim = dim3(buffers.N / A02_BLOCK_DIM, buffers.M / A02_BLOCK_DIM);
 
     matmul_a02_shmem<A02_BLOCK_DIM><<<gridDim, blockDim>>>(buffers.dA, buffers.dB, buffers.dC, buffers.M, buffers.K, buffers.N);
-
-    // checkCuda(cudaGetLastError(), "launch matmul_tiled_shmem");
+    // checkCuda(cudaGetLastError(), "launch matmul_a02_shmem");
     buffers.num_iters += 1;
 }

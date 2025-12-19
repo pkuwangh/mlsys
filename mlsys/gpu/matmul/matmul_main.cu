@@ -4,6 +4,7 @@
 
 #include "matmul_kernel_a01_basic.cuh"
 #include "matmul_kernel_a02_shmem.cuh"
+#include "matmul_kernel_a03_thread_tile_1d.cuh"
 #include "matmul_utils.cuh"
 
 // dump cuda-related device information
@@ -26,7 +27,7 @@ void dumpDeviceInfo() {
 // sanity tests on basic kernel with small matrix sizes
 void sanityTests() {
     std::printf("Sanity functional correctness check\n");
-    MatmulBuffers buffers = MatmulBuffers(2, 4, 4);
+    MatmulBuffers buffers = MatmulBuffers(4, 8, 8);
     printMatrix(buffers.hA.data(), buffers.M, buffers.K, "A");
     printMatrix(buffers.hB.data(), buffers.K, buffers.N, "B");
 
@@ -38,6 +39,11 @@ void sanityTests() {
     // std::printf("a02-shmem kernel\n");
     // buffers.reset();
     // runMatmulA02Shmem(buffers);
+    // buffers.printResult();
+
+    // std::printf("a03-thread-tile-1d kernel\n");
+    // buffers.reset();
+    // runMatmulA03ThreadTile1D(buffers);
     // buffers.printResult();
 
     std::printf("--------------------------------\n");
@@ -63,7 +69,7 @@ void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, st
 // functional tests against a01-basic kernel
 void functionalTests() {
     std::printf("Functional correctness check against a01-basic kernel\n");
-    MatmulBuffers buffers = MatmulBuffers(32, 64, 64);
+    MatmulBuffers buffers = MatmulBuffers(64, 128, 128);
     runMatmulA01Basic(buffers);
     std::vector<float> ref = buffers.copyResultVector();
     verifyCorrectness(ref, buffers, "a01-basic");
@@ -72,6 +78,11 @@ void functionalTests() {
     buffers.reset();
     runMatmulA02Shmem(buffers);
     verifyCorrectness(ref, buffers, "a02-shmem");
+
+    // verify a03-thread-tile-1d kernel
+    buffers.reset();
+    runMatmulA03ThreadTile1D(buffers);
+    verifyCorrectness(ref, buffers, "a03-thread-tile-1d");
 
     std::printf("--------------------------------\n");
 }
@@ -106,6 +117,7 @@ int main() {
     MatmulBuffers buffers = MatmulBuffers(4096, 8192, 8192);
     perfTests(buffers, runMatmulA01Basic, "matmul-a01-basic");
     perfTests(buffers, runMatmulA02Shmem, "matmul-a02-shmem");
+    perfTests(buffers, runMatmulA03ThreadTile1D, "matmul-a03-thread-tile-1d");
 
     return 0;
 }
