@@ -24,27 +24,28 @@ void dumpDeviceInfo() {
     std::printf("shared memory per SM: %zu bytes\n", prop.sharedMemPerMultiprocessor);
 }
 
+class MatmulRunner {
+  public:
+    std::string name;
+    std::function<void(MatmulBuffers &)> func;
+    MatmulRunner(std::string name, std::function<void(MatmulBuffers &)> func) : name(name), func(func) {}
+
+    void run(MatmulBuffers &buffers) { func(buffers); }
+};
+
 // sanity tests on basic kernel with small matrix sizes
-void sanityTests() {
+void sanityTests(std::vector<MatmulRunner> runners) {
     std::printf("Sanity functional correctness check\n");
     MatmulBuffers buffers = MatmulBuffers(4, 8, 8);
     printMatrix(buffers.hA.data(), buffers.M, buffers.K, "A");
     printMatrix(buffers.hB.data(), buffers.K, buffers.N, "B");
 
-    std::printf("a01-basic kernel\n");
-    buffers.reset();
-    runMatmulA01Basic(buffers);
-    buffers.printResult();
-
-    // std::printf("a02-shmem kernel\n");
-    // buffers.reset();
-    // runMatmulA02Shmem(buffers);
-    // buffers.printResult();
-
-    // std::printf("a03-thread-tile-1d kernel\n");
-    // buffers.reset();
-    // runMatmulA03ThreadTile1D(buffers);
-    // buffers.printResult();
+    for (auto runner : runners) {
+        std::printf("%s kernel\n", runner.name.c_str());
+        buffers.reset();
+        runner.run(buffers);
+        buffers.printResult();
+    }
 
     std::printf("--------------------------------\n");
 }
@@ -57,7 +58,7 @@ void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, st
         float error = std::abs(result[i] - ref[i]);
         if (error > 1.0) {
             std::printf("Error at index %d: %f != %f\n", i, result[i], ref[i]);
-            ++ num_errors;
+            ++num_errors;
             if (num_errors >= 4) {
                 break;
             }
@@ -67,28 +68,22 @@ void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, st
 }
 
 // functional tests against a01-basic kernel
-void functionalTests() {
+void functionalTests(std::vector<MatmulRunner> runners) {
     std::printf("Functional correctness check against a01-basic kernel\n");
-    MatmulBuffers buffers = MatmulBuffers(64, 128, 128);
+    MatmulBuffers buffers = MatmulBuffers(128, 256, 256);
     runMatmulA01Basic(buffers);
     std::vector<float> ref = buffers.copyResultVector();
-    verifyCorrectness(ref, buffers, "a01-basic");
 
-    // verify a02-shmem kernel
-    buffers.reset();
-    runMatmulA02Shmem(buffers);
-    verifyCorrectness(ref, buffers, "a02-shmem");
-
-    // verify a03-thread-tile-1d kernel
-    buffers.reset();
-    runMatmulA03ThreadTile1D(buffers);
-    verifyCorrectness(ref, buffers, "a03-thread-tile-1d");
-
+    for (auto runner : runners) {
+        buffers.reset();
+        runner.run(buffers);
+        verifyCorrectness(ref, buffers, runner.name);
+    }
     std::printf("--------------------------------\n");
 }
 
 // performance tests
-void perfTests(MatmulBuffers &buffers, std::function<void(MatmulBuffers &)> run_kernel, std::string kernel_name) {
+void perfTest(MatmulBuffers &buffers, std::function<void(MatmulBuffers &)> run_kernel, std::string kernel_name) {
     int num_warmup_iters = 1;
     int num_total_iters = 10;
     DeviceTimer timer;
@@ -108,16 +103,21 @@ int main() {
     dumpDeviceInfo();
 
     // sanity functional correctness check on a01-basic kernel
-    sanityTests();
+    sanityTests({MatmulRunner("a01-basic", runMatmulA01Basic)});
 
+    std::vector<MatmulRunner> all_runners = {
+        MatmulRunner("a01-basic", runMatmulA01Basic),
+        MatmulRunner("a02-shmem", runMatmulA02Shmem),
+        MatmulRunner("a03-thread-tile-1d", runMatmulA03ThreadTile1D),
+    };
     // verify correctness against a01-basic kernel
-    functionalTests();
+    functionalTests(all_runners);
 
     // perf test
     MatmulBuffers buffers = MatmulBuffers(4096, 8192, 8192);
-    perfTests(buffers, runMatmulA01Basic, "matmul-a01-basic");
-    perfTests(buffers, runMatmulA02Shmem, "matmul-a02-shmem");
-    perfTests(buffers, runMatmulA03ThreadTile1D, "matmul-a03-thread-tile-1d");
+    for (auto runner : all_runners) {
+        perfTest(buffers, runner.func, runner.name);
+    }
 
     return 0;
 }
