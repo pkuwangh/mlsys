@@ -5,6 +5,11 @@
 #include "matmul_kernel_a01_basic.cuh"
 #include "matmul_kernel_a02_shmem.cuh"
 #include "matmul_kernel_a03_thread_tile_1d.cuh"
+#include "matmul_kernel_a04_thread_tile_2d.cuh"
+#include "matmul_kernel_a05_thread_tile_2d_cache.cuh"
+#include "matmul_kernel_a06_thread_tile_float4.cuh"
+#include "matmul_kernel_a07_double_buffering.cuh"
+#include "matmul_kernel_a08_tuning.cuh"
 #include "matmul_utils.cuh"
 
 // dump cuda-related device information
@@ -16,7 +21,11 @@ void dumpDeviceInfo() {
     checkCuda(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
     std::printf("Device name: %s\n", prop.name);
     std::printf("Device compute capability: %d.%d\n", prop.major, prop.minor);
+    std::printf("Device SM count: %d\n", prop.multiProcessorCount);
     std::printf("Device total memory: %zu bytes\n", prop.totalGlobalMem);
+    // per block limits
+    std::printf("max threads per block: %d\n", prop.maxThreadsPerBlock);
+    std::printf("shared memory per block: %zu bytes\n", prop.sharedMemPerBlock);
     // dump factors that limit the number of blocks
     std::printf("max threads per SM: %d\n", prop.maxThreadsPerMultiProcessor);
     std::printf("max blocks per SM: %d\n", prop.maxBlocksPerMultiProcessor);
@@ -109,7 +118,13 @@ int main() {
         MatmulRunner("a01-basic", runMatmulA01Basic),
         MatmulRunner("a02-shmem", runMatmulA02Shmem),
         MatmulRunner("a03-thread-tile-1d", runMatmulA03ThreadTile1D),
+        MatmulRunner("a04-thread-tile-2d", runMatmulA04ThreadTile2D),
+        MatmulRunner("a05-thread-tile-2d-cache", runMatmulA05ThreadTile2DCache),
+        MatmulRunner("a06-thread-tile-float4", runMatmulA06ThreadTileFloat4),
+        MatmulRunner("a07-double-buffering", runMatmulA07DoubleBuffering),
+        MatmulRunner("a08-tuning", runMatmulA08Tuning),
     };
+
     // verify correctness against a01-basic kernel
     functionalTests(all_runners);
 

@@ -27,8 +27,9 @@ __global__ void matmul_a03_thread_tile_1d(float *A, float *B, float *C, int M, i
     int by = blockIdx.y;
     int block_size = blockDim.x;  // BM * BN / TM, as each thread handles TM elements.
 
+    // (tx, ty) points to this thread's tile's top-left element's position in result BM * BN tile.
     int tx = threadIdx.x % BN;
-    int ty = threadIdx.x / BN * TM; // ty points to this thread's position in result BM * BN tile.
+    int ty = threadIdx.x / BN * TM;
 
     // move to the first tile; and point to the first element of the tile
     A += by * BM * K;
@@ -83,7 +84,7 @@ __global__ void matmul_a03_thread_tile_1d(float *A, float *B, float *C, int M, i
 }
 
 void runMatmulA03ThreadTile1D(MatmulBuffers &buffers) {
-    dim3 blockDim = dim3(A03_BLOCK_MN_DIM * A03_BLOCK_K_DIM, 1);
+    dim3 blockDim = dim3(A03_BLOCK_MN_DIM * A03_BLOCK_MN_DIM / A03_THREAD_TILE_SIZE, 1);
     dim3 gridDim = dim3(buffers.N / A03_BLOCK_MN_DIM, buffers.M / A03_BLOCK_MN_DIM);
 
     matmul_a03_thread_tile_1d<A03_BLOCK_MN_DIM, A03_BLOCK_MN_DIM, A03_BLOCK_K_DIM, A03_THREAD_TILE_SIZE>
