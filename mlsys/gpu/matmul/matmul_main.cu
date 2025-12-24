@@ -5,6 +5,10 @@
 #include "matmul_kernel_a01_basic.cuh"
 #include "matmul_kernel_a02_shmem.cuh"
 #include "matmul_kernel_a03_thread_tile_1d.cuh"
+#include "matmul_kernel_a04_thread_tile_2d.cuh"
+#include "matmul_kernel_a05_thread_tile_2d_cache.cuh"
+#include "matmul_kernel_a06_thread_tile_float4.cuh"
+#include "matmul_kernel_a07_double_buffering.cuh"
 #include "matmul_utils.cuh"
 
 // dump cuda-related device information
@@ -109,7 +113,12 @@ int main() {
         MatmulRunner("a01-basic", runMatmulA01Basic),
         MatmulRunner("a02-shmem", runMatmulA02Shmem),
         MatmulRunner("a03-thread-tile-1d", runMatmulA03ThreadTile1D),
+        MatmulRunner("a04-thread-tile-2d", runMatmulA04ThreadTile2D),
+        MatmulRunner("a05-thread-tile-2d-cache", runMatmulA05ThreadTile2DCache),
+        MatmulRunner("a06-thread-tile-float4", runMatmulA06ThreadTileFloat4),
+        MatmulRunner("a07-double-buffering", runMatmulA07DoubleBuffering),
     };
+
     // verify correctness against a01-basic kernel
     functionalTests(all_runners);
 
