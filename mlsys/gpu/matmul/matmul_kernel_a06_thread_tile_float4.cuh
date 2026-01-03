@@ -49,6 +49,7 @@ __global__ void matmul_a06_thread_tile_float4(float *A, float *B, float *C, int 
     int b_tile_y_stride = block_size / (BN / 4);
 
     // load As and put them into register to do transpose
+    // not really necessary here, but useful when doing double buffering.
     float ld_a_reg[4 * ld_As_rounds] = {0.0f};
 
     // cache As & Bs

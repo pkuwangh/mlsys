@@ -10,6 +10,7 @@
 #include "matmul_kernel_a06_thread_tile_float4.cuh"
 #include "matmul_kernel_a07_double_buffering.cuh"
 #include "matmul_kernel_a08_tuning.cuh"
+#include "matmul_kernel_b01_warp_tile.cuh"
 #include "matmul_utils.cuh"
 
 // dump cuda-related device information
@@ -123,6 +124,7 @@ int main() {
         MatmulRunner("a06-thread-tile-float4", runMatmulA06ThreadTileFloat4),
         MatmulRunner("a07-double-buffering", runMatmulA07DoubleBuffering),
         MatmulRunner("a08-tuning", runMatmulA08Tuning),
+        MatmulRunner("b01-warp-tile", runMatmulB01WarpTile),
     };
 
     // verify correctness against a01-basic kernel
