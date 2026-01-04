@@ -1,10 +1,13 @@
 #pragma once
 
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
+#include <cuda_bf16.h>
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 #include <string>
+
+using bf16 = __nv_bfloat16;
 
 inline void checkCuda(cudaError_t err, const char *message) {
     if (err != cudaSuccess) {
@@ -16,6 +19,12 @@ inline void checkCuda(cudaError_t err, const char *message) {
 inline void fillSequential(float *data, int count) {
     for (int i = 0; i < count; ++i) {
         data[i] = static_cast<float>(i);
+    }
+}
+
+inline void fillSequential(bf16 *data, int count) {
+    for (int i = 0; i < count; ++i) {
+        data[i] = __float2bfloat16(static_cast<float>(i));
     }
 }
 
@@ -45,6 +54,12 @@ class MatmulBuffers {
     float *dA{};
     float *dB{};
     float *dC{};
+    std::vector<bf16> hA_bf16;
+    std::vector<bf16> hB_bf16;
+    std::vector<bf16> hC_bf16;
+    bf16 *dA_bf16{};
+    bf16 *dB_bf16{};
+    bf16 *dC_bf16{};
     int num_iters;
 
     MatmulBuffers(int M, int K, int N) {
@@ -54,6 +69,9 @@ class MatmulBuffers {
         hA = std::vector<float>(M * K);
         hB = std::vector<float>(K * N);
         hC = std::vector<float>(M * N);
+        hA_bf16 = std::vector<bf16>(M * K);
+        hB_bf16 = std::vector<bf16>(K * N);
+        hC_bf16 = std::vector<bf16>(M * N);
         init();
     }
 
@@ -66,22 +84,50 @@ class MatmulBuffers {
         checkCuda(cudaMalloc(&dC, hC.size() * sizeof(float)), "cudaMalloc dC");
         checkCuda(cudaMemcpy(dA, hA.data(), hA.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy hA->dA");
         checkCuda(cudaMemcpy(dB, hB.data(), hB.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy hB->dB");
+        // BF16 buffers
+        fillSequential(hA_bf16.data(), hA_bf16.size());
+        fillSequential(hB_bf16.data(), hB_bf16.size());
+        checkCuda(cudaMalloc(&dA_bf16, hA_bf16.size() * sizeof(bf16)), "cudaMalloc dA_bf16");
+        checkCuda(cudaMalloc(&dB_bf16, hB_bf16.size() * sizeof(bf16)), "cudaMalloc dB_bf16");
+        checkCuda(cudaMalloc(&dC_bf16, hC_bf16.size() * sizeof(bf16)), "cudaMalloc dC_bf16");
+        checkCuda(cudaMemcpy(dA_bf16, hA_bf16.data(), hA_bf16.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+                  "cudaMemcpy hA_bf16->dA_bf16");
+        checkCuda(cudaMemcpy(dB_bf16, hB_bf16.data(), hB_bf16.size() * sizeof(bf16), cudaMemcpyHostToDevice),
+                  "cudaMemcpy hB_bf16->dB_bf16");
         reset();
     }
 
     void reset() {
         checkCuda(cudaMemset(dC, 0, hC.size() * sizeof(float)), "cudaMemset dC");
+        checkCuda(cudaMemset(dC_bf16, 0, hC_bf16.size() * sizeof(bf16)), "cudaMemset dC_bf16");
         checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
         num_iters = 0;
     }
 
-    void printResult() {
-        checkCuda(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy dC->hC");
+    void printResult(bool use_bf16 = false) {
+        if (use_bf16) {
+            checkCuda(cudaMemcpy(hC_bf16.data(), dC_bf16, hC_bf16.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
+                      "cudaMemcpy dC_bf16->hC_bf16");
+            for (int i = 0; i < hC_bf16.size(); ++i) {
+                hC[i] = __bfloat162float(hC_bf16[i]);
+            }
+        } else {
+            checkCuda(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                      "cudaMemcpy dC->hC");
+        }
         printMatrix(hC.data(), M, N, "C");
     }
 
-    std::vector<float> copyResultVector() {
-        checkCuda(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy dC->hC");
+    std::vector<float> copyResultVector(bool use_bf16 = false) {
+        if (use_bf16) {
+            checkCuda(cudaMemcpy(hC_bf16.data(), dC_bf16, hC_bf16.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
+                      "cudaMemcpy dC_bf16->hC_bf16");
+            for (int i = 0; i < hC_bf16.size(); ++i) {
+                hC[i] = __bfloat162float(hC_bf16[i]);
+            }
+        } else {
+            checkCuda(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy dC->hC");
+        }
         return hC;
     }
 
@@ -95,6 +141,9 @@ class MatmulBuffers {
         cudaFree(dA);
         cudaFree(dB);
         cudaFree(dC);
+        cudaFree(dA_bf16);
+        cudaFree(dB_bf16);
+        cudaFree(dC_bf16);
     }
 };
 

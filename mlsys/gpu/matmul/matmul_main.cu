@@ -11,10 +11,11 @@
 #include "matmul_kernel_a07_double_buffering.cuh"
 #include "matmul_kernel_a08_tuning.cuh"
 #include "matmul_kernel_b01_warp_tile.cuh"
+#include "matmul_kernel_c01_warp_tile_bf16.cuh"
 #include "matmul_utils.cuh"
 
 // dump cuda-related device information
-void dumpDeviceInfo() {
+int dumpAndGetDeviceInfo() {
     int device_count;
     checkCuda(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
     std::printf("Device count: %d\n", device_count);
@@ -32,13 +33,16 @@ void dumpDeviceInfo() {
     std::printf("max blocks per SM: %d\n", prop.maxBlocksPerMultiProcessor);
     std::printf("# of registers per SM: %d\n", prop.regsPerMultiprocessor);
     std::printf("shared memory per SM: %zu bytes\n", prop.sharedMemPerMultiprocessor);
+    return prop.major * 10 + prop.minor;
 }
 
 class MatmulRunner {
   public:
     std::string name;
     std::function<void(MatmulBuffers &)> func;
-    MatmulRunner(std::string name, std::function<void(MatmulBuffers &)> func) : name(name), func(func) {}
+    bool use_bf16;
+    MatmulRunner(std::string name, std::function<void(MatmulBuffers &)> func, bool use_bf16 = false)
+        : name(name), func(func), use_bf16(use_bf16) {}
 
     void run(MatmulBuffers &buffers) { func(buffers); }
 };
@@ -61,12 +65,13 @@ void sanityTests(std::vector<MatmulRunner> runners) {
 }
 
 // verify correctness against reference result
-void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, std::string kernel_name) {
-    std::vector<float> result = buffers.copyResultVector();
+void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, std::string kernel_name, bool use_bf16) {
+    std::vector<float> result = buffers.copyResultVector(use_bf16);
     int num_errors = 0;
     for (int i = 0; i < result.size(); i++) {
         float error = std::abs(result[i] - ref[i]);
-        if (error > 1.0) {
+        float relative_error = error / std::abs(ref[i]);
+        if (relative_error > 0.01f) {
             std::printf("Error at index %d: %f != %f\n", i, result[i], ref[i]);
             ++num_errors;
             if (num_errors >= 4) {
@@ -87,7 +92,7 @@ void functionalTests(std::vector<MatmulRunner> runners) {
     for (auto runner : runners) {
         buffers.reset();
         runner.run(buffers);
-        verifyCorrectness(ref, buffers, runner.name);
+        verifyCorrectness(ref, buffers, runner.name, runner.use_bf16);
     }
     std::printf("--------------------------------\n");
 }
@@ -110,7 +115,7 @@ void perfTest(MatmulBuffers &buffers, std::function<void(MatmulBuffers &)> run_k
 }
 
 int main() {
-    dumpDeviceInfo();
+    int device_capability = dumpAndGetDeviceInfo();
 
     // sanity functional correctness check on a01-basic kernel
     sanityTests({MatmulRunner("a01-basic", runMatmulA01Basic)});
@@ -125,6 +130,7 @@ int main() {
         MatmulRunner("a07-double-buffering", runMatmulA07DoubleBuffering),
         MatmulRunner("a08-tuning", runMatmulA08Tuning),
         MatmulRunner("b01-warp-tile", runMatmulB01WarpTile),
+        MatmulRunner("c01-warp-tile-bf16", runMatmulC01WarpTileBf16, true),
     };
 
     // verify correctness against a01-basic kernel
