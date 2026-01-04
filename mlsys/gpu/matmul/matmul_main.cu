@@ -12,6 +12,7 @@
 #include "matmul_kernel_a08_tuning.cuh"
 #include "matmul_kernel_b01_warp_tile.cuh"
 #include "matmul_kernel_c01_warp_tile_bf16.cuh"
+// #include "matmul_kernel_d01_tensor_core_tma.cuh"
 #include "matmul_utils.cuh"
 
 // dump cuda-related device information
