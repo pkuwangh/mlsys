@@ -7,7 +7,7 @@
 
 // each thread computes one element of the result matrix
 
-__global__ void matmul_a01_basic(float *A, float *B, float *C, int M, int K, int N) {
+__global__ void matmul_a01_basic(float* A, float* B, float* C, int M, int K, int N) {
     int gx = blockIdx.x * blockDim.x + threadIdx.x;
     int gy = blockIdx.y * blockDim.y + threadIdx.y;
 

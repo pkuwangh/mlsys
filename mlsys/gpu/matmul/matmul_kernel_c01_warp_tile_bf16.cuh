@@ -28,7 +28,7 @@
 
 template <const int BM, const int BN, const int BK, const int WM, const int WN, const int WM_ITER, const int TM,
           const int TN>
-__global__ void matmul_c01_warp_tile_bf16(bf16 *A, bf16 *B, bf16 *C, int M, int K, int N) {
+__global__ void matmul_c01_warp_tile_bf16(bf16* A, bf16* B, bf16* C, int M, int K, int N) {
     // shared memory size: BM * BK * sizeof(bf16) + BK * BN * sizeof(bf16)
     __shared__ bf16 As[BM * BK];
     __shared__ bf16 Bs[BK * BN];

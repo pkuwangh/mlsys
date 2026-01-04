@@ -18,7 +18,7 @@
 // - let each thread runs longer that should be more friendly to pipelining.
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void matmul_a04_thread_tile_2d(float *A, float *B, float *C, int M, int K, int N) {
+__global__ void matmul_a04_thread_tile_2d(float* A, float* B, float* C, int M, int K, int N) {
     // shared memory size: BM * BK * sizeof(float) + BK * BN * sizeof(float)
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];

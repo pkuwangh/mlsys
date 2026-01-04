@@ -18,7 +18,7 @@
 //    K elements reading from B matrix, it can be shared by TM elements from A matrix.
 
 template <const int BM, const int BN, const int BK, const int TM>
-__global__ void matmul_a03_thread_tile_1d(float *A, float *B, float *C, int M, int K, int N) {
+__global__ void matmul_a03_thread_tile_1d(float* A, float* B, float* C, int M, int K, int N) {
     // shared memory size: BM * BK * sizeof(float) + BK * BN * sizeof(float)
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];

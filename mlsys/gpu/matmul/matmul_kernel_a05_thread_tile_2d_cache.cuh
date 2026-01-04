@@ -12,7 +12,7 @@
 // Just a small tweak to a04_thread_tile_2d to cache elements loaded from As & Bs.
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void matmul_a05_thread_tile_2d_cache(float *A, float *B, float *C, int M, int K, int N) {
+__global__ void matmul_a05_thread_tile_2d_cache(float* A, float* B, float* C, int M, int K, int N) {
     // shared memory size: BM * BK * sizeof(float) + BK * BN * sizeof(float)
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];

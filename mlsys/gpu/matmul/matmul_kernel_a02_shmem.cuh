@@ -13,7 +13,7 @@
 // each thread corresponds to one element of the result BM * BN tile
 
 template <const int TILE_SIZE>
-__global__ void matmul_a02_shmem(float *A, float *B, float *C, int M, int K, int N) {
+__global__ void matmul_a02_shmem(float* A, float* B, float* C, int M, int K, int N) {
     const int BM = TILE_SIZE;
     const int BN = TILE_SIZE;
     const int BK = TILE_SIZE;

@@ -32,7 +32,7 @@
 
 template <const int BM, const int BN, const int BK, const int WM, const int WN, const int WM_ITER, const int TM,
           const int TN>
-__global__ void matmul_b01_warp_tile(float *A, float *B, float *C, int M, int K, int N) {
+__global__ void matmul_b01_warp_tile(float* A, float* B, float* C, int M, int K, int N) {
     // shared memory size: BM * BK * sizeof(float) + BK * BN * sizeof(float)
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
