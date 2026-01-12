@@ -6,7 +6,6 @@
 #define B01_OFFSET(row, col, num_cols) ((row) * (num_cols) + (col))
 #define B01_FETCH_FLOAT4(element) (reinterpret_cast<float4 *>(&(element))[0])
 
-#define WARPSIZE 32
 // block tile 128 x 128 - each thread block handles a 128x128 Csub.
 #define B01_BLOCK_TILE_M 128
 #define B01_BLOCK_TILE_N 128

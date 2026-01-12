@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 #include <string>
 
+#define WARPSIZE 32
+
 using bf16 = __nv_bfloat16;
 
 inline void checkCuda(cudaError_t err, const char *message) {
@@ -126,7 +128,8 @@ class MatmulBuffers {
                 hC[i] = __bfloat162float(hC_bf16[i]);
             }
         } else {
-            checkCuda(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy dC->hC");
+            checkCuda(cudaMemcpy(hC.data(), dC, hC.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                      "cudaMemcpy dC->hC");
         }
         return hC;
     }

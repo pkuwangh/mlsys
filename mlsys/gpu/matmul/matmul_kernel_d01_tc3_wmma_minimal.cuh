@@ -8,7 +8,9 @@
 #define D01_WMMA_M 16
 #define D01_WMMA_N 16
 #define D01_WMMA_K 16
-#define D01_WARP_SIZE 32
+
+// minimal example of using tensor core for matmul
+// each block has exactly one warp, which sends a 16x16 tile to tensor core
 
 __global__ void matmul_d01_tc3_wmma_minimal(bf16 *A, bf16 *B, float *C, int M, int K, int N) {
     // tiles organized as 2d grid
@@ -54,7 +56,7 @@ __global__ void matmul_d01_tc3_wmma_minimal(bf16 *A, bf16 *B, float *C, int M, i
 }
 
 void runMatmulD01Tc3WmmaMinimal(MatmulBuffers &buffers) {
-    dim3 blockDim = dim3(D01_WARP_SIZE, 1);
+    dim3 blockDim = dim3(WARPSIZE, 1);
     dim3 gridDim = dim3(buffers.N / D01_WMMA_N, buffers.M / D01_WMMA_M);
 
     matmul_d01_tc3_wmma_minimal<<<gridDim, blockDim>>>(buffers.dA_bf16, buffers.dB_bf16, buffers.dC, buffers.M,
