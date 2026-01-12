@@ -14,6 +14,7 @@
 #include "matmul_kernel_c01_warp_tile_bf16.cuh"
 #include "matmul_kernel_d01_tc3_wmma_minimal.cuh"
 #include "matmul_kernel_d02_tc3_wmma_shmem.cuh"
+#include "matmul_kernel_d03_tc3_wmma_async.cuh"
 #include "matmul_utils.cuh"
 
 // dump cuda-related device information
@@ -135,6 +136,7 @@ int main() {
         MatmulRunner("c01-warp-tile-bf16", runMatmulC01WarpTileBf16, true),
         MatmulRunner("d01-tc3-wmma-minimal", runMatmulD01Tc3WmmaMinimal),
         MatmulRunner("d02-tc3-wmma-shmem", runMatmulD02Tc3WmmaShmem),
+        MatmulRunner("d03-tc3-wmma-async", runMatmulD03Tc3WmmaAsync),
     };
 
     // verify correctness against a01-basic kernel

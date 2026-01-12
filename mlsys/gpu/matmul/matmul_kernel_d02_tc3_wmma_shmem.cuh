@@ -1,13 +1,13 @@
 #pragma once
 
-#include "matmul_utils.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include "matmul_utils.cuh"
+
 #define D02_OFFSET(row, col, num_cols) ((row) * (num_cols) + (col))
 #define D02_FETCH_FLOAT2(element) (reinterpret_cast<float2 *>(&(element))[0])
-#define D02_FETCH_FLOAT4(element) (reinterpret_cast<float4 *>(&(element))[0])
 
 #define D02_WMMA_M 16
 #define D02_WMMA_N 16
@@ -44,7 +44,7 @@ __global__ void matmul_d02_tc3_wmma_shmem(bf16 *A, bf16 *B, float *C, int M, int
     constexpr int warp_iter_m = BM / warp_sub_m;
     constexpr int warp_iter_n = BN / warp_sub_n;
 
-    // warp position in block tile
+    // warp position in block
     int warp_idx = threadIdx.x / WARPSIZE;
     int warp_row = warp_idx / NUM_WARP_N;
     int warp_col = warp_idx % NUM_WARP_N;
@@ -56,7 +56,9 @@ __global__ void matmul_d02_tc3_wmma_shmem(bf16 *A, bf16 *B, float *C, int M, int
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_c[warp_iter_m][warp_iter_n];
 
     // initialize output fragment to zero
+    #pragma unroll
     for (int warp_sub_row_idx = 0; warp_sub_row_idx < warp_iter_m; ++warp_sub_row_idx) {
+        #pragma unroll
         for (int warp_sub_col_idx = 0; warp_sub_col_idx < warp_iter_n; ++warp_sub_col_idx) {
             nvcuda::wmma::fill_fragment(frag_c[warp_sub_row_idx][warp_sub_col_idx], 0.0f);
         }
@@ -94,13 +96,18 @@ __global__ void matmul_d02_tc3_wmma_shmem(bf16 *A, bf16 *B, float *C, int M, int
 
         for (int k = 0; k < BK; k += WMMA_K) {
             #pragma unroll
+            for (int warp_sub_col_idx = 0; warp_sub_col_idx < warp_iter_n; ++warp_sub_col_idx) {
+                const int col = warp_col * WMMA_N + warp_sub_col_idx * warp_sub_n;
+                nvcuda::wmma::load_matrix_sync(frag_b[warp_sub_col_idx], Bs + k * BN + col, BN);
+            }
+
+            #pragma unroll
             for (int warp_sub_row_idx = 0; warp_sub_row_idx < warp_iter_m; ++warp_sub_row_idx) {
                 const int row = warp_row * WMMA_M + warp_sub_row_idx * warp_sub_m;
                 nvcuda::wmma::load_matrix_sync(frag_a, As + row * BK + k, BK);
+
                 #pragma unroll
                 for (int warp_sub_col_idx = 0; warp_sub_col_idx < warp_iter_n; ++warp_sub_col_idx) {
-                    const int col = warp_col * WMMA_N + warp_sub_col_idx * warp_sub_n;
-                    nvcuda::wmma::load_matrix_sync(frag_b[warp_sub_col_idx], Bs + k * BN + col, BN);
                     nvcuda::wmma::mma_sync(frag_c[warp_sub_row_idx][warp_sub_col_idx], frag_a, frag_b[warp_sub_col_idx],
                                            frag_c[warp_sub_row_idx][warp_sub_col_idx]);
                 }
@@ -113,6 +120,7 @@ __global__ void matmul_d02_tc3_wmma_shmem(bf16 *A, bf16 *B, float *C, int M, int
     // store results
     for (int warp_sub_row_idx = 0; warp_sub_row_idx < warp_iter_m; ++warp_sub_row_idx) {
         const int row = warp_row * WMMA_M + warp_sub_row_idx * warp_sub_m;
+        #pragma unroll
         for (int warp_sub_col_idx = 0; warp_sub_col_idx < warp_iter_n; ++warp_sub_col_idx) {
             const int col = warp_col * WMMA_N + warp_sub_col_idx * warp_sub_n;
             nvcuda::wmma::store_matrix_sync(C + row * N + col, frag_c[warp_sub_row_idx][warp_sub_col_idx], N,

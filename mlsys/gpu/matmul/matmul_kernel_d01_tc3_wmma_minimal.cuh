@@ -1,9 +1,10 @@
 #pragma once
 
-#include "matmul_utils.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
+
+#include "matmul_utils.cuh"
 
 #define D01_WMMA_M 16
 #define D01_WMMA_N 16
