@@ -3,7 +3,18 @@ cmake_minimum_required(VERSION 3.20)
 project(cuda_demos
     LANGUAGES CUDA CXX)
 
-set(CMAKE_CUDA_ARCHITECTURES 86-real;86-virtual;90-real;90-virtual;100-real;100-virtual)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 90a-real;90a-virtual)
+endif()
+
+# Check if we're building for SM_90+ (Hopper) - enables WGMMA/TMA kernels
+foreach(ARCH ${CMAKE_CUDA_ARCHITECTURES})
+    string(REGEX MATCH "^([0-9]+)" ARCH_NUM "${ARCH}")
+    if(ARCH_NUM AND ARCH_NUM GREATER_EQUAL 90)
+        set(HAS_GEN4_TENSOR_CORE TRUE)
+        break()
+    endif()
+endforeach()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,6 +50,11 @@ foreach(TEST ${TESTS})
     target_include_directories(${TEST} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} .)
     target_compile_options(${TEST} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v>)
     target_link_libraries(${TEST} ${NVML_LIB_NAME} cuda)
+
+    # Enable SM_90+ kernels (WGMMA/TMA) if building for Hopper+
+    if(HAS_GEN4_TENSOR_CORE)
+        target_compile_definitions(${TEST} PRIVATE HAS_GEN4_TENSOR_CORE)
+    endif()
 
     install(TARGETS ${TEST} DESTINATION "bin")
 endforeach()

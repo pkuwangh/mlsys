@@ -4,3 +4,4 @@ AccessModifierOffset: -2
 TabWidth: 4
 UseTab: Never
 ColumnLimit: 120
+IndentPPDirectives: AfterHash

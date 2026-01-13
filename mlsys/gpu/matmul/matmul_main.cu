@@ -15,6 +15,9 @@
 #include "matmul_kernel_d01_tc3_wmma_minimal.cuh"
 #include "matmul_kernel_d02_tc3_wmma_shmem.cuh"
 #include "matmul_kernel_d03_tc3_wmma_async.cuh"
+#ifdef HAS_GEN4_TENSOR_CORE
+#include "matmul_kernel_e01_tc4_basic.cuh"
+#endif
 #include "matmul_utils.cuh"
 
 // dump cuda-related device information
@@ -44,8 +47,10 @@ class MatmulRunner {
     std::string name;
     std::function<void(MatmulBuffers &)> func;
     bool use_bf16;
-    MatmulRunner(std::string name, std::function<void(MatmulBuffers &)> func, bool use_bf16 = false)
-        : name(name), func(func), use_bf16(use_bf16) {}
+    bool use_col_major;
+    MatmulRunner(std::string name, std::function<void(MatmulBuffers &)> func, bool use_bf16 = false,
+                 bool use_col_major = false)
+        : name(name), func(func), use_bf16(use_bf16), use_col_major(use_col_major) {}
 
     void run(MatmulBuffers &buffers) { func(buffers); }
 };
@@ -68,8 +73,9 @@ void sanityTests(std::vector<MatmulRunner> runners) {
 }
 
 // verify correctness against reference result
-void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, std::string kernel_name, bool use_bf16) {
-    std::vector<float> result = buffers.copyResultVector(use_bf16);
+void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, std::string kernel_name, bool use_bf16,
+                       bool use_col_major) {
+    std::vector<float> result = buffers.copyResultVector(use_bf16, use_col_major);
     int num_errors = 0;
     for (int i = 0; i < result.size(); i++) {
         float error = std::abs(result[i] - ref[i]);
@@ -95,7 +101,7 @@ void functionalTests(std::vector<MatmulRunner> runners) {
     for (auto runner : runners) {
         buffers.reset();
         runner.run(buffers);
-        verifyCorrectness(ref, buffers, runner.name, runner.use_bf16);
+        verifyCorrectness(ref, buffers, runner.name, runner.use_bf16, runner.use_col_major);
     }
     std::printf("--------------------------------\n");
 }
@@ -124,29 +130,31 @@ int main() {
     sanityTests({MatmulRunner("a01-basic", runMatmulA01Basic)});
 
     std::vector<MatmulRunner> all_runners = {
-        MatmulRunner("a01-basic", runMatmulA01Basic),
-        MatmulRunner("a02-shmem", runMatmulA02Shmem),
+        MatmulRunner("a01-basic", runMatmulA01Basic), MatmulRunner("a02-shmem", runMatmulA02Shmem),
         MatmulRunner("a03-thread-tile-1d", runMatmulA03ThreadTile1D),
         MatmulRunner("a04-thread-tile-2d", runMatmulA04ThreadTile2D),
         MatmulRunner("a05-thread-tile-2d-cache", runMatmulA05ThreadTile2DCache),
         MatmulRunner("a06-thread-tile-float4", runMatmulA06ThreadTileFloat4),
         MatmulRunner("a07-double-buffering", runMatmulA07DoubleBuffering),
-        MatmulRunner("a08-tuning", runMatmulA08Tuning),
-        MatmulRunner("b01-warp-tile", runMatmulB01WarpTile),
+        MatmulRunner("a08-tuning", runMatmulA08Tuning), MatmulRunner("b01-warp-tile", runMatmulB01WarpTile),
         MatmulRunner("c01-warp-tile-bf16", runMatmulC01WarpTileBf16, true),
         MatmulRunner("d01-tc3-wmma-minimal", runMatmulD01Tc3WmmaMinimal),
         MatmulRunner("d02-tc3-wmma-shmem", runMatmulD02Tc3WmmaShmem),
         MatmulRunner("d03-tc3-wmma-async", runMatmulD03Tc3WmmaAsync),
     };
 
-    // verify correctness against a01-basic kernel
-    functionalTests(all_runners);
+#ifdef HAS_GEN4_TENSOR_CORE
+    all_runners.push_back(MatmulRunner("e01-tc4-basic", runMatmulE01Tc4Basic, true, true));
+#endif
 
-    // perf test
-    MatmulBuffers buffers = MatmulBuffers(4096, 8192, 8192);
-    for (auto runner : all_runners) {
-        perfTest(buffers, runner.func, runner.name);
-    }
+// verify correctness against a01-basic kernel
+functionalTests(all_runners);
 
-    return 0;
+// perf test
+MatmulBuffers buffers = MatmulBuffers(4096, 8192, 8192);
+for (auto runner : all_runners) {
+    perfTest(buffers, runner.func, runner.name);
+}
+
+return 0;
 }

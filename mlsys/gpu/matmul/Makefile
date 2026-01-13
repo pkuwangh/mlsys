@@ -3,9 +3,9 @@ default:
 	cmake -B build -DCMAKE_INSTALL_PREFIX=$(shell pwd) -DCMAKE_BUILD_TYPE=Release .
 	make -j${nproc} -C build install
 
-debug:
+amphere:
 	mkdir -p bin/
-	cmake -B build -DCMAKE_INSTALL_PREFIX=$(shell pwd) -DCMAKE_BUILD_TYPE=Debug -DCMAKE_VERBOSE_MAKEFILE=ON .
+	cmake -B build -DCMAKE_INSTALL_PREFIX=$(shell pwd) -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86-real;86-virtual" .
 	make -j${nproc} -C build install
 
 clean:

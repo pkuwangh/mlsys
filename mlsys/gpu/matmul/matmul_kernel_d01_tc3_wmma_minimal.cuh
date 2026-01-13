@@ -61,7 +61,7 @@ void runMatmulD01Tc3WmmaMinimal(MatmulBuffers &buffers) {
     dim3 gridDim = dim3(buffers.N / D01_WMMA_N, buffers.M / D01_WMMA_M);
 
     matmul_d01_tc3_wmma_minimal<<<gridDim, blockDim>>>(buffers.dA_bf16, buffers.dB_bf16, buffers.dC, buffers.M,
-                                                          buffers.K, buffers.N);
+                                                       buffers.K, buffers.N);
     // checkCuda(cudaGetLastError(), "launch matmul_d01_tc3_wmma_minimal");
     buffers.num_iters += 1;
 }
