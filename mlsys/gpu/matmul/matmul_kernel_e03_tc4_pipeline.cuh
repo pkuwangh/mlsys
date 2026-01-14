@@ -6,28 +6,27 @@
 
 #include "matmul_utils.cuh"
 
-#define E02_BM 128
-#define E02_BN 128
-#define E02_BK 64
-#define E02_BLOCK_SIZE 128
+#define E03_BM 128
+#define E03_BN 128
+#define E03_BK 64
+#define E03_BLOCK_SIZE 128*2
+#define E03_QSIZE 5
 
-namespace e02 {
+namespace e03 {
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
-// increase the block tile size to 128x128 from 64x64
-// also increase the tc size to m64n128k16 from m64n64k16
-// then run each warpgroup for multiple iterations
-
-// basic warp-tiling with tensor core and TMA
-// better warp-tiling would be having each warp handle multiple tiles over iterations.
-// high-level flow:
-// 1. launch TMA bulk async copy from GMEM to SMEM, from thread 0
-// 2. barrier to block until all threads arrived & TMA finished
-// 3. wgmma fence before the first wgmma.mma_async
-// 4. submit wgmma.mma_async calls, back-to-back with same shape and accumulating into the same regs.
-// 5. commit into a wgmma-group and wait for it.
+// setup a pipeline with 5 slots, controlled by empty / full barriers for each slot
+// split the CTA into producer warpgroup and consumer warpgroup
+// - producer
+//   - waits for empty barrier
+//   - loads the next tile on K dimention into SMEM
+//   - mark full barrier for this slot
+// - consumer
+//   - waits for full barrier
+//   - read SMEM and run wgmma.mma_async
+//   - mark empty barrier for this slot
 
 __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
 
@@ -62,7 +61,7 @@ template <int N> __device__ void warpgroup_wait() {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma256(float d[16][8], bf16* sA, bf16* sB) {
+__device__ __forceinline__ void wgmma256(float d[16][8], bf16* sA, bf16* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
@@ -148,7 +147,7 @@ __device__ __forceinline__ void wgmma192(float d[12][8], bf16* sA, bf16* sB) {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma128(float d[8][8], bf16* sA, bf16* sB) {
+__device__ __forceinline__ void wgmma128(float d[8][8], bf16* sA, bf16* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
@@ -182,7 +181,7 @@ __device__ void wgmma128(float d[8][8], bf16* sA, bf16* sB) {
 }
 
 template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
+__device__ __forceinline__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     // similar to the fence, the mma_async is sync & aligned
@@ -207,7 +206,7 @@ __device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma32(float d[2][8], bf16* sA, bf16* sB) {
+__device__ __forceinline__ void wgmma32(float d[2][8], bf16* sA, bf16* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
@@ -227,7 +226,7 @@ __device__ void wgmma32(float d[2][8], bf16* sA, bf16* sB) {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma16(float d[1][8], bf16* sA, bf16* sB) {
+__device__ __forceinline__ void wgmma16(float d[1][8], bf16* sA, bf16* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
@@ -245,7 +244,7 @@ __device__ void wgmma16(float d[1][8], bf16* sA, bf16* sB) {
 }
 
 template<int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ inline void wgmma(float d[WGMMA_N/16][8], bf16* sA, bf16* sB) {
+__device__ __forceinline__ void wgmma(float d[WGMMA_N/16][8], bf16* sA, bf16* sB) {
     static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 256);
     if  constexpr (WGMMA_N == 256)
         wgmma256<1, 1, 1, 0, 0>(d, sA, sB);
@@ -285,25 +284,26 @@ void create_tensor_map(CUtensorMap *tma_map, bf16 *gmem_ptr, int blocks_height, 
     assert(result == CUDA_SUCCESS);
 }
 
-template <int BM, int BN, int BK, int NUM_THREADS>
+template <int BM, int BN, int BK, int QSIZE>
+struct SMem {
+    alignas(128) bf16 A[BM*BK*QSIZE];
+    alignas(128) bf16 B[BK*BN*QSIZE];
+};
+
+template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE>
 __global__ void __launch_bounds__(NUM_THREADS)
-matmul_e02_tc4_wg_tiling(const CUtensorMap *tensorMapA, const CUtensorMap *tensorMapB, bf16 *C, int M, int N, int K) {
+matmul_e03_tc4_pipeline(const CUtensorMap *tensorMapA, const CUtensorMap *tensorMapB, bf16 *C, int M, int N, int K) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
-    constexpr int B_WG_M = BM / (NUM_THREADS / 128);
+    constexpr int NUM_CONSUMERS = (NUM_THREADS / 128) - 1;
     // shared memory for A & B
-    __shared__ alignas(128) bf16 sA[BM*BK];
-    __shared__ alignas(128) bf16 sB[BN*BK];
+    extern __shared__ __align__(128) uint8_t smem[];
+    SMem<BM, BN, BK, QSIZE> &s = *reinterpret_cast<SMem<BM, BN, BK, QSIZE>*>(smem);
+    bf16 *sA = s.A;
+    bf16 *sB = s.B;
 
-    // SMEM barriers for A & B
+    // full/empty barriers for the pipeline
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ barrier barA, barB;
-
-    // accumulator, note C is column-major
-    // each 128-thread warpgroup covers B_WG_M rows so it runs B_WG_M / WGMMA_M iterations
-    // then the same (WGMMA_N / 16) x 8 organization
-    float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8];
-    static_assert(sizeof(d) * NUM_THREADS == BM * BN * sizeof(float));
-    memset(d, 0, sizeof(d));
+    __shared__ barrier full[QSIZE], empty[QSIZE];
 
     // the number of sliding blocks in the K dimension
     const int num_blocks_k = K / BK;
@@ -311,12 +311,16 @@ matmul_e02_tc4_wg_tiling(const CUtensorMap *tensorMapA, const CUtensorMap *tenso
     const int num_block_n = blockIdx.x % (N / BN);
     const int num_block_m = blockIdx.x / (N / BN);
 
-    // warpgroup index in case NUM_THREADS > 128
+    // warpgroup index and thread index within my warpgroup
     const int wg_idx = threadIdx.x / 128;
+    const int tid = threadIdx.x % 128;
 
     if (threadIdx.x == 0) {
-        init(&barA, blockDim.x);
-        init(&barB, blockDim.x);
+        for (int i = 0 ; i < QSIZE; ++i) {
+            // all threads from consumer warpgroup plus 1 as producer
+            init(&full[i], NUM_CONSUMERS * 128 + 1);
+            init(&empty[i], NUM_CONSUMERS * 128 + 1);
+        }
         // make initialized barrier visible to async proxy (TMA)
         // Hopper's proxy memory model orders visibility b/w the async proxy (TMA) and
         // the generic proxy (normal thread ld/st) at CTA scope.
@@ -325,72 +329,72 @@ matmul_e02_tc4_wg_tiling(const CUtensorMap *tensorMapA, const CUtensorMap *tenso
     // make sure barriers are visible to all threads
     __syncthreads();
 
-    barrier::arrival_token tokenA, tokenB;
-
-    for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter) {
-        // only one thread launches TMA
-        if (threadIdx.x == 0) {
-            // dest ptr, tensor map, coord-0, coord-1, barrier
-            // offset into GMEM for this CTA: (block_k_iter * BK, num_block_m * BM)
-            cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tensorMapA, block_k_iter * BK, num_block_m * BM,
-                                                          barA);
-            // count thread arrivals, i.e. 1 from thread 0
-            // update barrier with # bytes to wait for
-            tokenA = cuda::device::barrier_arrive_tx(barA, 1, BM * BK * sizeof(bf16));
-            // note B is column-major, so the block window also slides right
-            // to (block_k_iter * BK, num_block_n * BN)
-            cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tensorMapB, block_k_iter * BK, num_block_n * BN,
-                                                          barB);
-            tokenB = cuda::device::barrier_arrive_tx(barB, 1, BN * BK * sizeof(bf16));
-        } else {
-            // only contribute to thread arrival
-            tokenA = barA.arrive();
-            tokenB = barB.arrive();
-        }
-        // block until all threads arrived && TMA finished
-        barA.wait(std::move(tokenA));
-        barB.wait(std::move(tokenB));
-        // TODO: why do we need this?
-        __syncthreads();
-
-        // tensor core matmul
-        // wgmma.mma_async leverages 4 collaborating warps to compute the matmul
-        // for bf16 operands, `wgmma` supports the shapes in the form of `m64nNk16`,
-        // where `N` can be 8, 16, 24, ..., 256 and larger N value tends to be more efficient.
-
-        // all 4 warps need to arrive at this fence
-        warpgroup_arrive();
-        #pragma unroll
-        for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
-            // shift by my warpgroup assignment plus the iteration index
-            bf16* wgmma_sA = sA + BK * (m_it + wg_idx * B_WG_M / WGMMA_M) * WGMMA_M;
-            #pragma unroll
-            for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
-                // shift As & Bs on K dimension, still same set of d[] along K dimension
-                wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K], &sB[k_it * WGMMA_K]);
+    if (wg_idx == 0) {
+        // producer
+        if (tid == 0) {
+            // only have one thread issues TMA commands
+            int q_idx = 0;
+            for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++q_idx) {
+                if (q_idx == QSIZE) q_idx = 0;
+                // contributes to the arrival, empty[q_idx].arrive()
+                // gets back a token and wait until the barrier reaches the phase associated the token
+                empty[q_idx].wait(empty[q_idx].arrive());
+                // launch TMA bulk async copy
+                cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[q_idx * BK * BM], tensorMapA, block_k_iter * BK,
+                                                              num_block_m * BM, full[q_idx]);
+                cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[q_idx * BK * BN], tensorMapB, block_k_iter * BK,
+                                                              num_block_n * BN, full[q_idx]);
+                // update barrier with # bytes expected
+                // contributes to my arrival for the full state of current slot
+                barrier::arrival_token _ =
+                    cuda::device::barrier_arrive_tx(full[q_idx], 1, (BK * BN + BK * BM) * sizeof(bf16));
             }
         }
-        // commit all prior wgmma.mma_async operations into a wgmma-group.
-        warpgroup_commit_batch();
-        warpgroup_wait<0>();
-    }
+    } else {
+        // consumers
+        // first, mark all slots empty
+        for (int i = 0; i < QSIZE; ++i) {
+            barrier::arrival_token _ = empty[i].arrive();
+        }
+        float d[BM / WGMMA_M][WGMMA_N / 16][8];
+        memset(d, 0, sizeof(d));
+        int q_idx = 0;
+        for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++q_idx) {
+            if (q_idx == QSIZE) q_idx = 0;
+            // arrive behave like a sync and block on the producer's arrival
+            full[q_idx].wait(full[q_idx].arrive());
+            // wgmma calls
+            warpgroup_arrive();
+            #pragma unroll
+            for (int m_it = 0; m_it < BM / WGMMA_M; ++m_it) {
+                // shift by
+                // 1. q_idx in the smem block, which is now larger to include all QSIZE block tiles
+                // 2. interaction index when each warpgroup handles multiple warpgroup tiles
+                // note wg_idx is not here and things do not really work with multiple consumers
+                bf16* wgmma_sA = sA + BK * (q_idx * BM + m_it * WGMMA_M);
+                bf16* wgmma_sB = sB + BK * (q_idx * BN);
+                #pragma unroll
+                for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
+                    wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d[m_it], &wgmma_sA[k_it * WGMMA_K], &wgmma_sB[k_it * WGMMA_K]);
+                }
+            }
+            warpgroup_commit_batch();
+            warpgroup_wait<0>();
+            // mark this slot empty by contributing to my arrival here
+            barrier::arrival_token _ = empty[q_idx].arrive();
+        }
 
-    // Store
-    {
-        int tid = threadIdx.x % 128;
-        int lane = tid & (WARPSIZE - 1);
-        int warp = tid / WARPSIZE;
-        // C matrix is column-major, but row still refers to M dimension
-        // each wrap covers 16 rows in the 64x64 C submatrix
-        // row index below covers 0-7 of my allocated rows, but it also writes row + 8
-        uint32_t row = warp * 16 + lane / 4;
+        // store back to C
+        int lane = tid % 32;
+        int warp = tid / 32;
+        int row = warp * 16 + lane / 4;
         bf16 *block_C = C + num_block_n * BN * M + num_block_m * BM;
 
         #pragma unroll
-        for (uint32_t m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
-            int yo = m_it*WGMMA_M + wg_idx*B_WG_M;
+        for (int m_it = 0; m_it < BM/WGMMA_M; ++m_it) {
+            int yo = m_it*WGMMA_M;
             #pragma unroll
-            for (uint32_t w = 0; w < WGMMA_N/16; ++w) {
+            for (int w = 0; w < WGMMA_N/16; ++w) {
                 int col = 16*w + 2*(tid % 4);
                 #define IDX(i, j) ((j)*M + ((i) + yo))
 
@@ -398,11 +402,12 @@ matmul_e02_tc4_wg_tiling(const CUtensorMap *tensorMapA, const CUtensorMap *tenso
                 block_C[IDX(row, col+1)] = d[m_it][w][1];
                 block_C[IDX(row+8, col)] = d[m_it][w][2];
                 block_C[IDX(row+8, col+1)] = d[m_it][w][3];
+
                 block_C[IDX(row, col+8)] = d[m_it][w][4];
                 block_C[IDX(row, col+9)] = d[m_it][w][5];
                 block_C[IDX(row+8, col+8)] = d[m_it][w][6];
                 block_C[IDX(row+8, col+9)] = d[m_it][w][7];
-                
+
                 #undef IDX
             }
         }
@@ -419,23 +424,28 @@ __host__ static inline CUtensorMap *allocate_and_create_tensor_map(bf16 *src, in
     return tma_map_d;
 }
 
-} // namespace e02
+} // namespace e03
 
-CUtensorMap *e02_d_tma_map_A = 0;
-CUtensorMap *e02_d_tma_map_B = 0;
+CUtensorMap *e03_d_tma_map_A = 0;
+CUtensorMap *e03_d_tma_map_B = 0;
 
-void runMatmulE02Tc4WgTiling(MatmulBuffers &buffers) {
-    if (!e02_d_tma_map_A) {
-        e02_d_tma_map_A = e02::allocate_and_create_tensor_map<E02_BM, E02_BK>(buffers.dA_bf16, buffers.M / E02_BM,
-                                                                              buffers.K / E02_BK);
-        e02_d_tma_map_B = e02::allocate_and_create_tensor_map<E02_BN, E02_BK>(buffers.dB_bf16_t, buffers.N / E02_BN,
-                                                                              buffers.K / E02_BK);
+void runMatmulE03Tc4Pipeline(MatmulBuffers &buffers) {
+    if (!e03_d_tma_map_A) {
+        e03_d_tma_map_A = e03::allocate_and_create_tensor_map<E03_BM, E03_BK>(buffers.dA_bf16, buffers.M / E03_BM,
+                                                                              buffers.K / E03_BK);
+        e03_d_tma_map_B = e03::allocate_and_create_tensor_map<E03_BN, E03_BK>(buffers.dB_bf16_t, buffers.N / E03_BN,
+                                                                              buffers.K / E03_BK);
     }
-    dim3 blockDim = dim3(E02_BLOCK_SIZE, 1);
-    dim3 gridDim = dim3((buffers.M / E02_BM) * (buffers.N / E02_BN), 1);
+    dim3 blockDim = dim3(E03_BLOCK_SIZE, 1);
+    dim3 gridDim = dim3((buffers.M / E03_BM) * (buffers.N / E03_BN), 1);
 
-    e02::matmul_e02_tc4_wg_tiling<E02_BM, E02_BN, E02_BK, E02_BLOCK_SIZE>
-        <<<gridDim, blockDim>>>(e02_d_tma_map_A, e02_d_tma_map_B, buffers.dC_bf16, buffers.M, buffers.N, buffers.K);
-    // checkCuda(cudaGetLastError(), "launch matmul_e02_tc4_wg_tiling");
+    auto* kernel = e03::matmul_e03_tc4_pipeline<E03_BM, E03_BN, E03_BK, E03_BLOCK_SIZE, E03_QSIZE>;
+    size_t shmem_size = sizeof(e03::SMem<E03_BM, E03_BN, E03_BK, E03_QSIZE>);
+    checkCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size),
+              "cudaFuncSetAttribute");
+
+    kernel<<<gridDim, blockDim, shmem_size>>>(e03_d_tma_map_A, e03_d_tma_map_B, buffers.dC_bf16, buffers.M, buffers.N,
+                                              buffers.K);
+    checkCuda(cudaGetLastError(), "launch matmul_e03_tc4_pipeline");
     buffers.num_iters += 1;
 }

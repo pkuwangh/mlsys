@@ -18,6 +18,7 @@
 #ifdef HAS_GEN4_TENSOR_CORE
 #include "matmul_kernel_e01_tc4_basic.cuh"
 #include "matmul_kernel_e02_tc4_wg_tiling.cuh"
+#include "matmul_kernel_e03_tc4_pipeline.cuh"
 #endif
 #include "matmul_utils.cuh"
 
@@ -149,6 +150,7 @@ int main() {
 #ifdef HAS_GEN4_TENSOR_CORE
     all_runners.push_back(MatmulRunner("e01-tc4-basic", runMatmulE01Tc4Basic, true, true));
     all_runners.push_back(MatmulRunner("e02-tc4-wg-tiling", runMatmulE02Tc4WgTiling, true, true));
+    all_runners.push_back(MatmulRunner("e03-tc4-pipeline", runMatmulE03Tc4Pipeline, true, true));
 #endif
 
 // verify correctness against a01-basic kernel

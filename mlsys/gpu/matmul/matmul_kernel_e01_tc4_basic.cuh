@@ -245,8 +245,10 @@ CUtensorMap *e01_d_tma_map_B = 0;
 
 void runMatmulE01Tc4Basic(MatmulBuffers &buffers) {
     if (!e01_d_tma_map_A) {
-        e01_d_tma_map_A = e01::allocate_and_create_tensor_map<E01_BM, E01_BK>(buffers.dA_bf16, buffers.M / E01_BM, buffers.K / E01_BK);
-        e01_d_tma_map_B = e01::allocate_and_create_tensor_map<E01_BN, E01_BK>(buffers.dB_bf16_t, buffers.N / E01_BN, buffers.K / E01_BK);
+        e01_d_tma_map_A = e01::allocate_and_create_tensor_map<E01_BM, E01_BK>(buffers.dA_bf16, buffers.M / E01_BM,
+                                                                              buffers.K / E01_BK);
+        e01_d_tma_map_B = e01::allocate_and_create_tensor_map<E01_BN, E01_BK>(buffers.dB_bf16_t, buffers.N / E01_BN,
+                                                                              buffers.K / E01_BK);
     }
     dim3 blockDim = dim3(E01_BLOCK_SIZE, 1);
     dim3 gridDim = dim3((buffers.M / E01_BM) * (buffers.N / E01_BN), 1);
