@@ -13,11 +13,19 @@
 #define E01_WGMMA_N 64
 #define E01_WGMMA_K 16
 
+namespace e01 {
+
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
 // basic warp-tiling with tensor core and TMA
 // better warp-tiling would be having each warp handle multiple tiles over iterations.
+// high-level flow:
+// 1. launch TMA bulk async copy from GMEM to SMEM, from thread 0
+// 2. barrier to block until all threads arrived & TMA finished
+// 3. wgmma fence before the first wgmma.mma_async
+// 4. submit wgmma.mma_async calls, back-to-back with same shape and accumulating into the same regs.
+// 5. commit into a wgmma-group and wait for it.
 
 __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
 
@@ -35,7 +43,8 @@ __device__ void warpgroup_arrive() {
     // `::: "memory"` is a compiler hint to disable memory reordering over this fence
     // fence to establish ordering b/w prior access to any warpgroup registers
     // and subsequent access to the same registers
-    // `.aligned` means all warps in the warp-group execute this in lockstep
+    // `.sync` means the executing thread to wait until all threads in the warp excute this fence
+    // `.aligned` means all threads in the warpgroup execute this in lockstep
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
 
@@ -54,6 +63,7 @@ template <int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ void wgmma64(float d[4][8], bf16 *sA, bf16 *sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
+    // similar to the fence, the mma_async is sync & aligned
     asm volatile("{\n"
                  "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
                  "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
@@ -102,7 +112,7 @@ void create_tensor_map(CUtensorMap *tma_map, bf16 *gmem_ptr, int blocks_height, 
 
 template <int BM, int BN, int BK, int WGMMA_M, int WGMMA_N, int WGMMA_K, int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
-    matmul_e01_tc4_basic(const CUtensorMap *tensorMapA, const CUtensorMap *tensorMapB, bf16 *C, int M, int N, int K) {
+matmul_e01_tc4_basic(const CUtensorMap *tensorMapA, const CUtensorMap *tensorMapB, bf16 *C, int M, int N, int K) {
     // 128B-aligned smem
     __shared__ alignas(128) bf16 sA[BM * BK];
     __shared__ alignas(128) bf16 sB[BK * BN];
@@ -121,8 +131,8 @@ __global__ void __launch_bounds__(NUM_THREADS)
     const int num_block_n = blockIdx.x % (N / BN);
     const int num_block_m = blockIdx.x / (N / BN);
 
-// SMEM barriers for A & B
-#pragma nv_diag_suppress static_var_with_dynamic_init
+    // SMEM barriers for A & B
+    #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ barrier barA;
     __shared__ barrier barB;
 
@@ -228,18 +238,20 @@ __host__ static inline CUtensorMap *allocate_and_create_tensor_map(bf16 *src, in
     return tma_map_d;
 }
 
+} // namespace e01
+
 CUtensorMap *e01_d_tma_map_A = 0;
 CUtensorMap *e01_d_tma_map_B = 0;
 
 void runMatmulE01Tc4Basic(MatmulBuffers &buffers) {
     if (!e01_d_tma_map_A) {
-        e01_d_tma_map_A = allocate_and_create_tensor_map<E01_BM, E01_BK>(buffers.dA_bf16, buffers.M / E01_BM, buffers.K / E01_BK);
-        e01_d_tma_map_B = allocate_and_create_tensor_map<E01_BN, E01_BK>(buffers.dB_bf16_t, buffers.N / E01_BN, buffers.K / E01_BK);
+        e01_d_tma_map_A = e01::allocate_and_create_tensor_map<E01_BM, E01_BK>(buffers.dA_bf16, buffers.M / E01_BM, buffers.K / E01_BK);
+        e01_d_tma_map_B = e01::allocate_and_create_tensor_map<E01_BN, E01_BK>(buffers.dB_bf16_t, buffers.N / E01_BN, buffers.K / E01_BK);
     }
     dim3 blockDim = dim3(E01_BLOCK_SIZE, 1);
     dim3 gridDim = dim3((buffers.M / E01_BM) * (buffers.N / E01_BN), 1);
 
-    matmul_e01_tc4_basic<E01_BM, E01_BN, E01_BK, E01_WGMMA_M, E01_WGMMA_N, E01_WGMMA_K, E01_BLOCK_SIZE>
+    e01::matmul_e01_tc4_basic<E01_BM, E01_BN, E01_BK, E01_WGMMA_M, E01_WGMMA_N, E01_WGMMA_K, E01_BLOCK_SIZE>
         <<<gridDim, blockDim>>>(e01_d_tma_map_A, e01_d_tma_map_B, buffers.dC_bf16, buffers.M, buffers.N, buffers.K);
     // checkCuda(cudaGetLastError(), "launch matmul_e01_tc4_basic");
     buffers.num_iters += 1;

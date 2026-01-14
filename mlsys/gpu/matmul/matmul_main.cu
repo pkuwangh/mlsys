@@ -17,6 +17,7 @@
 #include "matmul_kernel_d03_tc3_wmma_async.cuh"
 #ifdef HAS_GEN4_TENSOR_CORE
 #include "matmul_kernel_e01_tc4_basic.cuh"
+#include "matmul_kernel_e02_tc4_wg_tiling.cuh"
 #endif
 #include "matmul_utils.cuh"
 
@@ -130,13 +131,15 @@ int main() {
     sanityTests({MatmulRunner("a01-basic", runMatmulA01Basic)});
 
     std::vector<MatmulRunner> all_runners = {
-        MatmulRunner("a01-basic", runMatmulA01Basic), MatmulRunner("a02-shmem", runMatmulA02Shmem),
+        MatmulRunner("a01-basic", runMatmulA01Basic),
+        MatmulRunner("a02-shmem", runMatmulA02Shmem),
         MatmulRunner("a03-thread-tile-1d", runMatmulA03ThreadTile1D),
         MatmulRunner("a04-thread-tile-2d", runMatmulA04ThreadTile2D),
         MatmulRunner("a05-thread-tile-2d-cache", runMatmulA05ThreadTile2DCache),
         MatmulRunner("a06-thread-tile-float4", runMatmulA06ThreadTileFloat4),
         MatmulRunner("a07-double-buffering", runMatmulA07DoubleBuffering),
-        MatmulRunner("a08-tuning", runMatmulA08Tuning), MatmulRunner("b01-warp-tile", runMatmulB01WarpTile),
+        MatmulRunner("a08-tuning", runMatmulA08Tuning),
+        MatmulRunner("b01-warp-tile", runMatmulB01WarpTile),
         MatmulRunner("c01-warp-tile-bf16", runMatmulC01WarpTileBf16, true),
         MatmulRunner("d01-tc3-wmma-minimal", runMatmulD01Tc3WmmaMinimal),
         MatmulRunner("d02-tc3-wmma-shmem", runMatmulD02Tc3WmmaShmem),
@@ -145,6 +148,7 @@ int main() {
 
 #ifdef HAS_GEN4_TENSOR_CORE
     all_runners.push_back(MatmulRunner("e01-tc4-basic", runMatmulE01Tc4Basic, true, true));
+    all_runners.push_back(MatmulRunner("e02-tc4-wg-tiling", runMatmulE02Tc4WgTiling, true, true));
 #endif
 
 // verify correctness against a01-basic kernel

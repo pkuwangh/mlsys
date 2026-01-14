@@ -3,9 +3,13 @@ cmake_minimum_required(VERSION 3.20)
 project(cuda_demos
     LANGUAGES CUDA CXX)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 90a-real;90a-virtual)
+if(NOT DEFINED MLSYS_CUDA_ARCHITECTURES)
+    set(MLSYS_CUDA_ARCHITECTURES "90a-real;90a-virtual")
 endif()
+
+set(CMAKE_CUDA_ARCHITECTURES "${MLSYS_CUDA_ARCHITECTURES}")
+
+message(STATUS "CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
 
 # Check if we're building for SM_90+ (Hopper) - enables WGMMA/TMA kernels
 foreach(ARCH ${CMAKE_CUDA_ARCHITECTURES})

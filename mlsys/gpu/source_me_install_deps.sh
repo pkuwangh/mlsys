@@ -16,7 +16,7 @@ micromamba install -y \
     -c nvidia/label/cuda-12.9.0 \
     cuda cuda-nvcc cuda-toolkit cuda-runtime \
     -c conda-forge \
-    gcc=12.4 libboost-devel=1.88.0 openmpi-mpicxx=5.0.8
+    gcc=12.4 libboost-devel=1.88.0 openmpi-mpicxx=5.0.8 \
     --strict-channel-priority
 
 pip install cmake==4.1.0 ninja==1.13.0

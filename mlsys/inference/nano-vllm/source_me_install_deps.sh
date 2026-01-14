@@ -23,7 +23,7 @@ micromamba install -n "${MY_VENV}" -y \
     cuda cuda-nvcc cuda-toolkit cuda-runtime cuda-nvtx-dev \
     -c conda-forge \
     cmake=4.1.0 gcc=12.4 ninja=1.13.1 \
-    nvtx=0.2.13
+    nvtx=0.2.13 \
     --strict-channel-priority
 
 pip install black loguru ruff "huggingface_hub[cli]"
