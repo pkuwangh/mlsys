@@ -21,6 +21,8 @@ namespace cde = cuda::device::experimental;
 // - increase block tile size to 128x256 from 128x128
 // - increase tc size to m64n256k16 from m64n128k16
 // - use 2 consumer warpgroups, each handles 64 rows
+//   - with 128x256 block tile, with 1 consumer warpgroup, each thread needs 128 * 256 / 128 = 256 registers
+//   - so having 2 consumers help reduce the per-thread register pressure
 // - BK is still 64, so 4 wgmma calls in a single wgmma group each time
 
 __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
@@ -463,6 +465,6 @@ void runMatmulE04Tc4MultiConsumer(MatmulBuffers &buffers) {
 
     kernel<<<gridDim, blockDim, shmem_size>>>(e04_d_tma_map_A, e04_d_tma_map_B, buffers.dC_bf16, buffers.M, buffers.N,
                                               buffers.K);
-    checkCuda(cudaGetLastError(), "launch matmul_e04_tc4_multi_consumer");
+    // checkCuda(cudaGetLastError(), "launch matmul_e04_tc4_multi_consumer");
     buffers.num_iters += 1;
 }

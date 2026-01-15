@@ -211,6 +211,7 @@ matmul_e01_tc4_basic(const CUtensorMap *tensorMapA, const CUtensorMap *tensorMap
                     int col = 16 * w + 2 * (tid % 4);
 #define IDX(i, j) ((j + n_it * WGMMA_N) * M + ((i) + m_it * WGMMA_M))
 
+                    // so each thread writes 2 consecutive elements in each 8 x 8 chunk of C
                     block_C[IDX(row, col)] = d[w][0];
                     block_C[IDX(row, col + 1)] = d[w][1];
                     block_C[IDX(row + 8, col)] = d[w][2];
