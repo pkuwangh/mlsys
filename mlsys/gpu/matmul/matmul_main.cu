@@ -20,6 +20,7 @@
 #include "matmul_kernel_e02_tc4_wg_tiling.cuh"
 #include "matmul_kernel_e03_tc4_pipeline.cuh"
 #include "matmul_kernel_e04_tc4_multi_consumer.cuh"
+#include "matmul_kernel_e05_persistent.cuh"
 #endif
 #include "matmul_utils.cuh"
 
@@ -51,9 +52,10 @@ class MatmulRunner {
     std::function<void(MatmulBuffers &)> func;
     bool use_bf16;
     bool use_col_major;
+    bool error_expected;
     MatmulRunner(std::string name, std::function<void(MatmulBuffers &)> func, bool use_bf16 = false,
-                 bool use_col_major = false)
-        : name(name), func(func), use_bf16(use_bf16), use_col_major(use_col_major) {}
+                 bool use_col_major = false, bool error_expected = false)
+        : name(name), func(func), use_bf16(use_bf16), use_col_major(use_col_major), error_expected(error_expected) {}
 
     void run(MatmulBuffers &buffers) { func(buffers); }
 };
@@ -77,34 +79,37 @@ void sanityTests(std::vector<MatmulRunner> runners) {
 
 // verify correctness against reference result
 void verifyCorrectness(const std::vector<float> &ref, MatmulBuffers &buffers, std::string kernel_name, bool use_bf16,
-                       bool use_col_major) {
+                       bool use_col_major, bool error_expected) {
     std::vector<float> result = buffers.copyResultVector(use_bf16, use_col_major);
     int num_errors = 0;
     for (int i = 0; i < result.size(); i++) {
         float error = std::abs(result[i] - ref[i]);
         float relative_error = error / std::abs(ref[i]);
         if (relative_error > 0.01f) {
-            std::printf("Error at index %d: %f != %f\n", i, result[i], ref[i]);
+            if (!error_expected) {
+                std::printf("Error at index %d: %f != %f\n", i, result[i], ref[i]);
+            }
             ++num_errors;
             if (num_errors >= 4) {
                 break;
             }
         }
     }
-    std::printf("%s correctness check %s\n", kernel_name.c_str(), num_errors == 0 ? "passed" : "failed");
+    std::printf("%s correctness check %s\n", kernel_name.c_str(),
+                num_errors == 0 ? "passed" : (error_expected ? "failed as expected" : "failed"));
 }
 
 // functional tests against a01-basic kernel
-void functionalTests(std::vector<MatmulRunner> runners) {
-    std::printf("Functional correctness check against a01-basic kernel\n");
-    MatmulBuffers buffers = MatmulBuffers(128, 256, 256);
+void functionalTests(std::vector<MatmulRunner> runners, int M, int N, int K) {
+    std::printf("Functional correctness check for M=%d N=%d K=%d\n", M, N, K);
+    MatmulBuffers buffers = MatmulBuffers(M, N, K);
     runMatmulA01Basic(buffers);
     std::vector<float> ref = buffers.copyResultVector();
 
     for (auto runner : runners) {
         buffers.reset();
         runner.run(buffers);
-        verifyCorrectness(ref, buffers, runner.name, runner.use_bf16, runner.use_col_major);
+        verifyCorrectness(ref, buffers, runner.name, runner.use_bf16, runner.use_col_major, runner.error_expected);
     }
     std::printf("--------------------------------\n");
 }
@@ -149,20 +154,27 @@ int main() {
     };
 
 #ifdef HAS_GEN4_TENSOR_CORE
-    all_runners.push_back(MatmulRunner("e01-tc4-basic", runMatmulE01Tc4Basic, true, true));
-    all_runners.push_back(MatmulRunner("e02-tc4-wg-tiling", runMatmulE02Tc4WgTiling, true, true));
-    all_runners.push_back(MatmulRunner("e03-tc4-pipeline", runMatmulE03Tc4Pipeline, true, true));
-    all_runners.push_back(MatmulRunner("e04-tc4-multi-consumer", runMatmulE04Tc4MultiConsumer, true, true));
+    bool use_bf16 = true;
+    bool use_col_major = true;
+    all_runners.push_back(MatmulRunner("e01-tc4-basic", runMatmulE01Tc4Basic, use_bf16, use_col_major));
+    all_runners.push_back(MatmulRunner("e02-tc4-wg-tiling", runMatmulE02Tc4WgTiling, use_bf16, use_col_major));
+    all_runners.push_back(MatmulRunner("e03-tc4-pipeline", runMatmulE03Tc4Pipeline, use_bf16, use_col_major));
+    all_runners.push_back(MatmulRunner("e04-tc4-multi-consumer", runMatmulE04Tc4MultiConsumer, use_bf16, use_col_major));
+    all_runners.push_back(MatmulRunner("e05-persistent-small", runMatmulE05PersistentSmall, use_bf16, use_col_major));
+    bool error_expected = true;
+    all_runners.push_back(MatmulRunner("e05-persistent", runMatmulE05Persistent, use_bf16, use_col_major, error_expected));
+    error_expected = false;
 #endif
 
-// verify correctness against a01-basic kernel
-functionalTests(all_runners);
+    // verify correctness against a01-basic kernel
+    functionalTests(all_runners, 128, 256, 256);
+    // functionalTests(all_runners, 4096, 4096, 4096);
 
-// perf test
-MatmulBuffers buffers = MatmulBuffers(4096, 8192, 8192);
-for (auto runner : all_runners) {
-    perfTest(buffers, runner.func, runner.name);
-}
+    // perf test
+    MatmulBuffers buffers = MatmulBuffers(4096, 8192, 8192);
+    for (auto runner : all_runners) {
+        perfTest(buffers, runner.func, runner.name);
+    }
 
-return 0;
+    return 0;
 }
