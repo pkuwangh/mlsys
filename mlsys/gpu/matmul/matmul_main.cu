@@ -23,6 +23,7 @@
 #include "matmul_kernel_e05_persistent.cuh"
 #include "matmul_kernel_e06_fast_barrier.cuh"
 #include "matmul_kernel_e07_cta_cluster.cuh"
+#include "matmul_kernel_e08_store_opt.cuh"
 #endif
 #include "matmul_utils.cuh"
 
@@ -167,6 +168,7 @@ int main() {
     all_runners.push_back(MatmulRunner("e05-persistent", runMatmulE05Persistent, bf16, col_major, error_exp));
     all_runners.push_back(MatmulRunner("e06-fast-barrier", runMatmulE06FastBarrier, bf16, col_major, error_exp));
     all_runners.push_back(MatmulRunner("e07-cta-cluster", runMatmulE07CtaCluster, bf16, col_major, error_exp));
+    all_runners.push_back(MatmulRunner("e08-store-opt", runMatmulE08StoreOpt, bf16, col_major, error_exp));
     error_exp = false;
 #endif
 
