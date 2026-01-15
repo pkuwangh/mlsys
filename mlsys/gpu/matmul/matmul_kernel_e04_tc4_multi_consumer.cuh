@@ -6,27 +6,22 @@
 
 #include "matmul_utils.cuh"
 
-#define E03_BM 128
-#define E03_BN 128
-#define E03_BK 64
-#define E03_BLOCK_SIZE 128*2
-#define E03_QSIZE 5
+#define E04_BM 128
+#define E04_BN 256
+#define E04_BK 64
+#define E04_BLOCK_SIZE 128*3
+#define E04_QSIZE 3
 
-namespace e03 {
+namespace e04 {
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
-// setup a pipeline with 5 slots, controlled by empty / full barriers for each slot
-// split the CTA into producer warpgroup and consumer warpgroup
-// - producer
-//   - waits for empty barrier
-//   - loads the next tile on K dimention into SMEM
-//   - mark full barrier for this slot
-// - consumer
-//   - waits for full barrier
-//   - read SMEM and run wgmma.mma_async
-//   - mark empty barrier for this slot
+// compared e03 version
+// - increase block tile size to 128x256 from 128x128
+// - increase tc size to m64n256k16 from m64n128k16
+// - use 2 consumer warpgroups, each handles 64 rows
+// - BK is still 64, so 4 wgmma calls in a single wgmma group each time
 
 __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
 
@@ -290,11 +285,25 @@ struct SMem {
     alignas(128) bf16 B[BK*BN*QSIZE];
 };
 
+template <uint32_t RegCount>
+__device__ void warpgroup_reg_alloc() {
+    // warpgroup-scoped instruction to raise the max # registers current warpgroup can use
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+template <uint32_t RegCount>
+__device__ void warpgroup_reg_dealloc() {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
 template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE>
 __global__ void __launch_bounds__(NUM_THREADS)
-matmul_e03_tc4_pipeline(const CUtensorMap *tensorMapA, const CUtensorMap *tensorMapB, bf16 *C, int M, int N, int K) {
+matmul_e04_tc4_multi_consumer(const CUtensorMap *tensorMapA, const CUtensorMap *tensorMapB, bf16 *C, int M, int N, int K) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
     constexpr int NUM_CONSUMERS = (NUM_THREADS / 128) - 1;
+    // each consumer warpgroup covers B_WG_M rows total
+    // that's 64 rows which wgmma can handle in one iteration
+    constexpr int B_WG_M = BM / NUM_CONSUMERS;
     // shared memory for A & B
     extern __shared__ __align__(128) uint8_t smem[];
     SMem<BM, BN, BK, QSIZE> &s = *reinterpret_cast<SMem<BM, BN, BK, QSIZE>*>(smem);
@@ -312,7 +321,7 @@ matmul_e03_tc4_pipeline(const CUtensorMap *tensorMapA, const CUtensorMap *tensor
     const int num_block_m = blockIdx.x / (N / BN);
 
     // warpgroup index and thread index within my warpgroup
-    const int wg_idx = threadIdx.x / 128;
+    const int cta_scope_wg_idx = threadIdx.x / 128;
     const int tid = threadIdx.x % 128;
 
     if (threadIdx.x == 0) {
@@ -329,7 +338,10 @@ matmul_e03_tc4_pipeline(const CUtensorMap *tensorMapA, const CUtensorMap *tensor
     // make sure barriers are visible to all threads
     __syncthreads();
 
-    if (wg_idx == 0) {
+    if (cta_scope_wg_idx == 0) {
+        constexpr int num_regs = (NUM_CONSUMERS <= 2 ? 24 : 32);
+        // producer does NOT need so many registers
+        warpgroup_reg_dealloc<num_regs>();
         // producer
         if (tid == 0) {
             // only have one thread issues TMA commands
@@ -352,11 +364,16 @@ matmul_e03_tc4_pipeline(const CUtensorMap *tensorMapA, const CUtensorMap *tensor
         }
     } else {
         // consumers
+        constexpr int num_regs = (NUM_CONSUMERS == 1 ? 256 : (NUM_CONSUMERS == 2 ? 240 : 160));
+        warpgroup_reg_alloc<num_regs>();
+        // make the consumer wg_idx 0-based
+        const int wg_idx = cta_scope_wg_idx - 1;
         // first, mark all slots empty
         for (int i = 0; i < QSIZE; ++i) {
             barrier::arrival_token _ = empty[i].arrive();
         }
-        float d[BM / WGMMA_M][WGMMA_N / 16][8];
+        // each consumer warpgroup handles B_WG_M rows instead of BM rows
+        float d[B_WG_M / WGMMA_M][WGMMA_N / 16][8];
         memset(d, 0, sizeof(d));
         int q_idx = 0;
         for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++q_idx) {
@@ -366,12 +383,12 @@ matmul_e03_tc4_pipeline(const CUtensorMap *tensorMapA, const CUtensorMap *tensor
             // wgmma calls
             warpgroup_arrive();
             #pragma unroll
-            for (int m_it = 0; m_it < BM / WGMMA_M; ++m_it) {
+            for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
                 // shift by
                 // 1. q_idx in the smem block, which is now larger to include all QSIZE block tiles
                 // 2. interaction index when each warpgroup handles multiple warpgroup tiles
-                // note wg_idx is not here and things do not really work with multiple consumers
-                bf16* wgmma_sA = sA + BK * (q_idx * BM + m_it * WGMMA_M);
+                // 3. consumer warpgroup index that handles B_WG_M rows
+                bf16* wgmma_sA = sA + BK * (q_idx * BM + m_it * WGMMA_M + wg_idx * B_WG_M);
                 bf16* wgmma_sB = sB + BK * (q_idx * BN);
                 #pragma unroll
                 for (int k_it = 0; k_it < BK / WGMMA_K; ++k_it) {
@@ -391,8 +408,8 @@ matmul_e03_tc4_pipeline(const CUtensorMap *tensorMapA, const CUtensorMap *tensor
         bf16 *block_C = C + num_block_n * BN * M + num_block_m * BM;
 
         #pragma unroll
-        for (int m_it = 0; m_it < BM/WGMMA_M; ++m_it) {
-            int yo = m_it*WGMMA_M;
+        for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+            int yo = m_it*WGMMA_M + wg_idx*B_WG_M;
             #pragma unroll
             for (int w = 0; w < WGMMA_N/16; ++w) {
                 int col = 16*w + 2*(tid % 4);
@@ -424,28 +441,28 @@ __host__ static inline CUtensorMap *allocate_and_create_tensor_map(bf16 *src, in
     return tma_map_d;
 }
 
-} // namespace e03
+} // namespace e04
 
-CUtensorMap *e03_d_tma_map_A = 0;
-CUtensorMap *e03_d_tma_map_B = 0;
+CUtensorMap *e04_d_tma_map_A = 0;
+CUtensorMap *e04_d_tma_map_B = 0;
 
-void runMatmulE03Tc4Pipeline(MatmulBuffers &buffers) {
-    if (!e03_d_tma_map_A) {
-        e03_d_tma_map_A = e03::allocate_and_create_tensor_map<E03_BM, E03_BK>(buffers.dA_bf16, buffers.M / E03_BM,
-                                                                              buffers.K / E03_BK);
-        e03_d_tma_map_B = e03::allocate_and_create_tensor_map<E03_BN, E03_BK>(buffers.dB_bf16_t, buffers.N / E03_BN,
-                                                                              buffers.K / E03_BK);
+void runMatmulE04Tc4MultiConsumer(MatmulBuffers &buffers) {
+    if (!e04_d_tma_map_A) {
+        e04_d_tma_map_A = e04::allocate_and_create_tensor_map<E04_BM, E04_BK>(buffers.dA_bf16, buffers.M / E04_BM,
+                                                                              buffers.K / E04_BK);
+        e04_d_tma_map_B = e04::allocate_and_create_tensor_map<E04_BN, E04_BK>(buffers.dB_bf16_t, buffers.N / E04_BN,
+                                                                              buffers.K / E04_BK);
     }
-    dim3 blockDim = dim3(E03_BLOCK_SIZE, 1);
-    dim3 gridDim = dim3((buffers.M / E03_BM) * (buffers.N / E03_BN), 1);
+    dim3 blockDim = dim3(E04_BLOCK_SIZE, 1);
+    dim3 gridDim = dim3((buffers.M / E04_BM) * (buffers.N / E04_BN), 1);
 
-    auto* kernel = e03::matmul_e03_tc4_pipeline<E03_BM, E03_BN, E03_BK, E03_BLOCK_SIZE, E03_QSIZE>;
-    size_t shmem_size = sizeof(e03::SMem<E03_BM, E03_BN, E03_BK, E03_QSIZE>);
+    auto* kernel = e04::matmul_e04_tc4_multi_consumer<E04_BM, E04_BN, E04_BK, E04_BLOCK_SIZE, E04_QSIZE>;
+    size_t shmem_size = sizeof(e04::SMem<E04_BM, E04_BN, E04_BK, E04_QSIZE>);
     checkCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size),
               "cudaFuncSetAttribute");
 
-    kernel<<<gridDim, blockDim, shmem_size>>>(e03_d_tma_map_A, e03_d_tma_map_B, buffers.dC_bf16, buffers.M, buffers.N,
+    kernel<<<gridDim, blockDim, shmem_size>>>(e04_d_tma_map_A, e04_d_tma_map_B, buffers.dC_bf16, buffers.M, buffers.N,
                                               buffers.K);
-    // checkCuda(cudaGetLastError(), "launch matmul_e03_tc4_pipeline");
+    checkCuda(cudaGetLastError(), "launch matmul_e04_tc4_multi_consumer");
     buffers.num_iters += 1;
 }
