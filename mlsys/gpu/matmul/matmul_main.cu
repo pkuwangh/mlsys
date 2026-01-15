@@ -154,21 +154,21 @@ int main() {
     };
 
 #ifdef HAS_GEN4_TENSOR_CORE
-    bool use_bf16 = true;
-    bool use_col_major = true;
-    all_runners.push_back(MatmulRunner("e01-tc4-basic", runMatmulE01Tc4Basic, use_bf16, use_col_major));
-    all_runners.push_back(MatmulRunner("e02-tc4-wg-tiling", runMatmulE02Tc4WgTiling, use_bf16, use_col_major));
-    all_runners.push_back(MatmulRunner("e03-tc4-pipeline", runMatmulE03Tc4Pipeline, use_bf16, use_col_major));
-    all_runners.push_back(MatmulRunner("e04-tc4-multi-consumer", runMatmulE04Tc4MultiConsumer, use_bf16, use_col_major));
-    all_runners.push_back(MatmulRunner("e05-persistent-small", runMatmulE05PersistentSmall, use_bf16, use_col_major));
-    bool error_expected = true;
-    all_runners.push_back(MatmulRunner("e05-persistent", runMatmulE05Persistent, use_bf16, use_col_major, error_expected));
-    error_expected = false;
+    bool bf16 = true;
+    bool col_major = true;
+    all_runners.push_back(MatmulRunner("e01-tc4-basic", runMatmulE01Tc4Basic, bf16, col_major));
+    all_runners.push_back(MatmulRunner("e02-tc4-wg-tiling", runMatmulE02Tc4WgTiling, bf16, col_major));
+    all_runners.push_back(MatmulRunner("e03-tc4-pipeline", runMatmulE03Tc4Pipeline, bf16, col_major));
+    all_runners.push_back(MatmulRunner("e04-tc4-multi-consumer", runMatmulE04Tc4MultiConsumer, bf16, col_major));
+    all_runners.push_back(MatmulRunner("e05-persistent", runMatmulE05Persistent, bf16, col_major));
+    bool error_exp = true;
+    all_runners.push_back(MatmulRunner("e05-persistent-l2", runMatmulE05PersistentL2, bf16, col_major, error_exp));
+    error_exp = false;
 #endif
 
     // verify correctness against a01-basic kernel
     functionalTests(all_runners, 128, 256, 256);
-    // functionalTests(all_runners, 4096, 4096, 4096);
+    functionalTests(all_runners, 4096, 4096, 4096);
 
     // perf test
     MatmulBuffers buffers = MatmulBuffers(4096, 8192, 8192);

@@ -449,12 +449,10 @@ CUtensorMap *e04_d_tma_map_A = 0;
 CUtensorMap *e04_d_tma_map_B = 0;
 
 void runMatmulE04Tc4MultiConsumer(MatmulBuffers &buffers) {
-    if (!e04_d_tma_map_A) {
-        e04_d_tma_map_A = e04::allocate_and_create_tensor_map<E04_BM, E04_BK>(buffers.dA_bf16, buffers.M / E04_BM,
-                                                                              buffers.K / E04_BK);
-        e04_d_tma_map_B = e04::allocate_and_create_tensor_map<E04_BN, E04_BK>(buffers.dB_bf16_t, buffers.N / E04_BN,
-                                                                              buffers.K / E04_BK);
-    }
+    e04_d_tma_map_A = e04::allocate_and_create_tensor_map<E04_BM, E04_BK>(buffers.dA_bf16, buffers.M / E04_BM,
+                                                                          buffers.K / E04_BK);
+    e04_d_tma_map_B = e04::allocate_and_create_tensor_map<E04_BN, E04_BK>(buffers.dB_bf16_t, buffers.N / E04_BN,
+                                                                          buffers.K / E04_BK);
     dim3 blockDim = dim3(E04_BLOCK_SIZE, 1);
     dim3 gridDim = dim3((buffers.M / E04_BM) * (buffers.N / E04_BN), 1);
 
