@@ -6,25 +6,21 @@
 
 #include "matmul_utils.cuh"
 
-#define E06_BM 128
-#define E06_BN 256
-#define E06_BK 64
-#define E06_BLOCK_SIZE 128*3
-#define E06_QSIZE 3
-#define E06_NUM_SM 128
+#define E07_BM 128
+#define E07_BN 256
+#define E07_BK 64
+#define E07_BLOCK_SIZE 128*3
+#define E07_QSIZE 3
+#define E07_CLUSTER_M 2
+#define E07_CLUSTER_N 1
+#define E07_NUM_SM 128
 
-namespace e06 {
+namespace e07 {
 
 // using barrier = cuda::barrier<cuda::thread_scope_block>;
 // namespace cde = cuda::device::experimental;
 
-// no longer use the cuda::barrier
-// because
-// - on the consumer side,
-//   - it does not need to signal arrival at full barrier, it only cares all-bytes arrived 
-//   - when signal empty, first thread doing it is enough since the .aligned operation in in lockstep
-// - on the producer side,
-//   - similarly, once empty is signaled by tid=0 of consumer warpgroup, it can begin filling
+// thread block cluster!
 
 __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
 
@@ -273,13 +269,13 @@ __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_
     // form a tensor map
     // encode all the metadata needed to transfer chunks of GMEM to SMEM
     // dtype: bf16
-    // rank: 5 (strided)
+    // rank: 3 (strided)
     // pointer: gemm_address/gmem_ptr
     // shape: fastest stride dimension first, (64, height, width/64)
     // stride: (width * sizeof(bf16), 64 * sizeof(bf16), 0)
     // smem shape: (64, BlockMajorSize, BlockMinorSize/64)
     // swizzle: 128B pattern
-    CUresult result = cuTensorMapEncodeTiled(&tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, gmem_address,
+    CUresult result = cuTensorMapEncodeTiled(&tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address,
                                              gmem_prob_shape, gmem_prob_stride, smem_box_shape, smem_box_stride,
                                              CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                                              CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -355,7 +351,9 @@ __device__ static __forceinline__ void init_barrier(uint64_t *bar, int thread_co
 
 __device__ static __forceinline__ void expect_bytes(uint64_t *bar, uint32_t bytes) {
     uint32_t bar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
-    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar_ptr), "r"(bytes));
+    // removed .release.cta
+    // no longer enforcing release-ordering semantics
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar_ptr), "r"(bytes));
 }
 
 __device__ static inline void load_async(bf16 *dst, void const *const src_tma_map, uint64_t *bar, int global_col_idx,
@@ -364,8 +362,8 @@ __device__ static inline void load_async(bf16 *dst, void const *const src_tma_ma
     uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
     uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
 
-    asm volatile("cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
-                 " [%0], [%1, {%3, %4, %5, 0, 0}], [%2];"
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+                 " [%0], [%1, {%3, %4, %5}], [%2];"
                  :
                  : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx / 64)
                  : "memory");
@@ -394,14 +392,56 @@ __device__ static __forceinline__ void arrive(uint64_t* bar, uint32_t count=1) {
     );
 }
 
-template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int TM, int TN>
-__global__ void __launch_bounds__(NUM_THREADS)
-matmul_e06_fast_barrier(const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, bf16 *C, int M, int N, int K) {
+// thread-block cluster orchestration
+__device__ static __forceinline__ void wait_cluster(uint64_t *bar, int kPhaseBit) {
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("{\n"
+                 ".reg .pred                P1;\n"
+                 "LAB_WAIT:\n"
+                 "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1;\n"
+                 "@P1                       bra.uni DONE;\n"
+                 "bra.uni                   LAB_WAIT;\n"
+                 "DONE:\n"
+                 "}\n" ::"r"(mbar_ptr),
+                 "r"(kPhaseBit));
+}
+
+__device__ static inline void load_async_multicast(bf16 *dst, void const *const src_tma_map, uint64_t *bar,
+                                                   int global_col_idx, int global_row_idx, uint16_t cluster_mask) {
+    uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+    asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
+                 " [%0], [%1, {%3, %4, %5}], [%2], %6;"
+                 :
+                 : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx / 64),
+                   "h"(cluster_mask)
+                 : "memory");
+}
+
+__device__ void arrive_cluster(uint64_t *bar, uint32_t cta_id, uint32_t count = 1) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile("{\n\t"
+                 ".reg .b32 remAddr32;\n\t"
+                 "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+                 "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n\t"
+                 "}"
+                 :
+                 : "r"(smem_addr), "r"(cta_id), "r"(count));
+}
+
+template <int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int TM, int TN, int CLUSTER_M, int CLUSTER_N>
+__global__ void __launch_bounds__(NUM_THREADS) __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1)
+matmul_e07_cta_cluster(const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, bf16 *C, int M, int N, int K) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N = BN;
     constexpr int NUM_CONSUMERS = (NUM_THREADS / 128) - 1;
     // each consumer warpgroup covers B_WG_M rows total
     // that's 64 rows which wgmma can handle in one iteration
     constexpr int B_WG_M = BM / NUM_CONSUMERS;
+    // thread-block cluster
+    constexpr int CTAS_PER_CLUSTER = CLUSTER_M * CLUSTER_N;
+    assert((M / BM) % CLUSTER_M == 0 && (N / BN) % CLUSTER_N == 0);
     // shared memory for A & B
     extern __shared__ __align__(128) uint8_t smem[];
     SMem<BM, BN, BK, QSIZE> &s = *reinterpret_cast<SMem<BM, BN, BK, QSIZE>*>(smem);
@@ -410,6 +450,9 @@ matmul_e06_fast_barrier(const __grid_constant__ CUtensorMap tensorMapA, const __
 
     // full/empty barriers for the pipeline
     __shared__ __align__(8) uint64_t full[QSIZE], empty[QSIZE];
+    // get this CTA's cluster ID
+    uint32_t cluster_id;
+    asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(cluster_id) :);
 
     // the number of sliding blocks in the K dimension
     const int num_blocks_k = K / BK;
@@ -421,14 +464,24 @@ matmul_e06_fast_barrier(const __grid_constant__ CUtensorMap tensorMapA, const __
     if (threadIdx.x == 0) {
         for (int i = 0 ; i < QSIZE; ++i) {
             // thread_count, transaction_count
-            init_barrier(&full[i], 1, 0);
-            init_barrier(&empty[i], NUM_CONSUMERS, 0);
+            init_barrier(&full[i], 0, 1);
+            // scope expand to the cluster
+            init_barrier(&empty[i], 0, NUM_CONSUMERS * CTAS_PER_CLUSTER);
         }
     }
-    // make sure barriers are visible to all threads
-    __syncthreads();
+    // need the cluster-wide barrier to sync; __syncthreads() is not enough
+    asm volatile("barrier.cluster.arrive;\n" : :);
+    asm volatile("barrier.cluster.wait;\n" : :);
 
-    Schedule<1, NUM_SM, BM, BN, TM, TN> schedule(M, N, blockIdx.x);
+    // now cluster is the unit to pick up work
+    Schedule<1, NUM_SM / CTAS_PER_CLUSTER, BM * CLUSTER_M, BN * CLUSTER_N, TM / CLUSTER_M, TN / CLUSTER_N> schedule(
+        M, N, cluster_id);
+
+    // get the CTA's rank within the cluster
+    uint32_t rank;
+    asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(rank) :);
+    uint32_t rank_m = rank / CLUSTER_N;
+    uint32_t rank_n = rank % CLUSTER_N;
 
     if (cta_scope_wg_idx == 0) {
         constexpr int num_regs = (NUM_CONSUMERS <= 2 ? 24 : 32);
@@ -439,8 +492,16 @@ matmul_e06_fast_barrier(const __grid_constant__ CUtensorMap tensorMapA, const __
             // only have one thread issues TMA commands
             int phase = 0;
             int q_idx = 0;
+            uint32_t col_mask = 0;
+            for (int i = 0; i < CLUSTER_M; ++i) {
+                col_mask |= (1 << (i * CLUSTER_N));
+            }
             int num_block_m = 0, num_block_n = 0;
             while (schedule.next(num_block_m, num_block_n)) {
+                // now a block is shared across the cluster, so get my subblock
+                num_block_n = num_block_n * CLUSTER_N + rank_n;
+                num_block_m = num_block_m * CLUSTER_M + rank_m;
+
                 for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++q_idx) {
                     if (q_idx == QSIZE) {
                         q_idx = 0;
@@ -450,8 +511,26 @@ matmul_e06_fast_barrier(const __grid_constant__ CUtensorMap tensorMapA, const __
                     }
                     wait(&empty[q_idx], phase);
                     expect_bytes(&full[q_idx], (BK * BN + BK * BM) * sizeof(bf16));
-                    load_async(&sA[q_idx * BK * BM], &tensorMapA, &full[q_idx], block_k_iter * BK, num_block_m * BM);
-                    load_async(&sB[q_idx * BK * BN], &tensorMapB, &full[q_idx], block_k_iter * BK, num_block_n * BN);
+                    // load A
+                    if constexpr (CLUSTER_N > 1) {
+                        uint32_t mask = ((1 << CLUSTER_N) - 1) << (rank_m * CLUSTER_N);
+                        if (rank_n == 0) {
+                            // only the first CTA in the cluster loads A and multicast
+                            load_async_multicast(&sA[q_idx * BK * BM], &tensorMapA, &full[q_idx], block_k_iter * BK,
+                                                 num_block_m * BM, mask);
+                        }
+                    } else {
+                        load_async(&sA[q_idx * BK * BM], &tensorMapA, &full[q_idx], block_k_iter * BK, num_block_m * BM);
+                    }
+                    // load B
+                    if constexpr (CLUSTER_M > 1) {
+                        if (rank_m == 0) {
+                            load_async_multicast(&sB[q_idx * BK * BN], &tensorMapB, &full[q_idx], block_k_iter * BK,
+                                                 num_block_n * BN, col_mask << rank_n);
+                        }
+                    } else {
+                        load_async(&sB[q_idx * BK * BN], &tensorMapB, &full[q_idx], block_k_iter * BK, num_block_n * BN);
+                    }
                 }
             }
         }
@@ -465,15 +544,20 @@ matmul_e06_fast_barrier(const __grid_constant__ CUtensorMap tensorMapA, const __
         const int wg_idx = cta_scope_wg_idx - 1;
         // first, mark all slots empty
         for (int i = 0; i < QSIZE; ++i) {
-            if (tid == 0) {
-                // with our own barrier, also first thread the warpgroup to manipulate the barrier
-                arrive(&empty[i], 1);
+            if (tid < CTAS_PER_CLUSTER) {
+                // pass tid as cta_id to arrive_cluster
+                // the cluster-wide barrier is stored in each CTA's shared memory
+                // so wach warpgroup will write each CTA's shared memory
+                arrive_cluster(&empty[i], tid);
             }
         }
         int phase = 0;
         int q_idx = 0;
+        int lane = tid % 32, warp = tid / 32, row = warp * 16 + lane / 4;
         int num_block_m = 0, num_block_n = 0;
         while (schedule.next(num_block_m, num_block_n)) {
+            num_block_n = num_block_n * CLUSTER_N + rank_n;
+            num_block_m = num_block_m * CLUSTER_M + rank_m;
             memset(d, 0, sizeof(d));
             for (int block_k_iter = 0; block_k_iter < num_blocks_k; ++block_k_iter, ++q_idx) {
                 if (q_idx == QSIZE) {
@@ -500,18 +584,17 @@ matmul_e06_fast_barrier(const __grid_constant__ CUtensorMap tensorMapA, const __
                 }
                 warpgroup_commit_batch();
                 warpgroup_wait<0>();
-                if (tid == 0) {
-                    arrive(&empty[q_idx], 1);
+                if (tid < CTAS_PER_CLUSTER) {
+                    arrive_cluster(&empty[q_idx], tid);
                 }
             }
 
-            int lane = tid % 32, warp = tid / 32, row = warp * 16 + lane / 4;
             bf16 *block_C = C + num_block_n * BN * M + num_block_m * BM;
 
             #pragma unroll
             for (int m_it = 0; m_it < B_WG_M / WGMMA_M; ++m_it) {
                 int yo = m_it * WGMMA_M + wg_idx * B_WG_M;
-                if (row + yo + num_block_m * BM >= M)
+                if (row + 8 + yo + num_block_m * BM >= M)
                     continue;
                 #pragma unroll
                 for (int w = 0; w < WGMMA_N; w += 16) {
@@ -539,36 +622,29 @@ matmul_e06_fast_barrier(const __grid_constant__ CUtensorMap tensorMapA, const __
 }
 
 template <typename Kernel> void _run_kernel(MatmulBuffers &buffers, Kernel kernel, bool check_error) {
-    CUtensorMap tma_map_A = create_tensor_map<E06_BM, E06_BK>(buffers.dA_bf16, buffers.M, buffers.K);
-    CUtensorMap tma_map_B = create_tensor_map<E06_BN, E06_BK>(buffers.dB_bf16_t, buffers.N, buffers.K);
+    CUtensorMap tma_map_A = create_tensor_map<E07_BM, E07_BK>(buffers.dA_bf16, buffers.M, buffers.K);
+    CUtensorMap tma_map_B = create_tensor_map<E07_BN, E07_BK>(buffers.dB_bf16_t, buffers.N, buffers.K);
 
-    size_t shmem_size = sizeof(SMem<E06_BM, E06_BN, E06_BK, E06_QSIZE>);
+    size_t shmem_size = sizeof(SMem<E07_BM, E07_BN, E07_BK, E07_QSIZE>);
     checkCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size),
               "cudaFuncSetAttribute");
 
     // NUM_SM does not have to match exactly the physical SMs on GPU
-    kernel<<<E06_NUM_SM, E06_BLOCK_SIZE, shmem_size>>>(tma_map_A, tma_map_B, buffers.dC_bf16, buffers.M, buffers.N,
+    kernel<<<E07_NUM_SM, E07_BLOCK_SIZE, shmem_size>>>(tma_map_A, tma_map_B, buffers.dC_bf16, buffers.M, buffers.N,
                                                    buffers.K);
     if (check_error) {
-        checkCuda(cudaGetLastError(), "launch matmul_e06_fast_barrier");
+        checkCuda(cudaGetLastError(), "launch matmul_e07_cta_cluster");
     }
     buffers.num_iters += 1;
 }
 
-} // namespace e06
+} // namespace e07
 
-void runMatmulE06FastBarrier(MatmulBuffers &buffers) {
+void runMatmulE07CtaCluster(MatmulBuffers &buffers) {
     constexpr int TM = 16;
     constexpr int TN = 8;
 
-    auto *kernel = e06::matmul_e06_fast_barrier<E06_BM, E06_BN, E06_BK, E06_BLOCK_SIZE, E06_QSIZE, E06_NUM_SM, TM, TN>;
-    e06::_run_kernel(buffers, kernel, false);
-}
-
-void runMatmulE06FastBarrierSmall(MatmulBuffers &buffers) {
-    constexpr int TM = 1;
-    constexpr int TN = 1;
-
-    auto *kernel = e06::matmul_e06_fast_barrier<E06_BM, E06_BN, E06_BK, E06_BLOCK_SIZE, E06_QSIZE, E06_NUM_SM, TM, TN>;
-    e06::_run_kernel(buffers, kernel, true);
+    auto *kernel = e07::matmul_e07_cta_cluster<E07_BM, E07_BN, E07_BK, E07_BLOCK_SIZE, E07_QSIZE, E07_NUM_SM, TM, TN,
+                                               E07_CLUSTER_M, E07_CLUSTER_N>;
+    e07::_run_kernel(buffers, kernel, true);
 }

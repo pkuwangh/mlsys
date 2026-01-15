@@ -520,7 +520,7 @@ template <typename Kernel> void _run_kernel(MatmulBuffers &buffers, Kernel kerne
 
 } // namespace e05
 
-void runMatmulE05PersistentL2(MatmulBuffers &buffers) {
+void runMatmulE05Persistent(MatmulBuffers &buffers) {
     // this implies a minimum size of the input matrix to be (16x128) x (8x256)
     constexpr int TM = 16;
     constexpr int TN = 8;
@@ -529,7 +529,7 @@ void runMatmulE05PersistentL2(MatmulBuffers &buffers) {
     e05::_run_kernel(buffers, kernel, false);
 }
 
-void runMatmulE05Persistent(MatmulBuffers &buffers) {
+void runMatmulE05PersistentSmall(MatmulBuffers &buffers) {
     constexpr int TM = 1;
     constexpr int TN = 1;
 

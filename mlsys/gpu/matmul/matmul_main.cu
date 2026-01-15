@@ -22,6 +22,7 @@
 #include "matmul_kernel_e04_tc4_multi_consumer.cuh"
 #include "matmul_kernel_e05_persistent.cuh"
 #include "matmul_kernel_e06_fast_barrier.cuh"
+#include "matmul_kernel_e07_cta_cluster.cuh"
 #endif
 #include "matmul_utils.cuh"
 
@@ -161,11 +162,11 @@ int main() {
     all_runners.push_back(MatmulRunner("e02-tc4-wg-tiling", runMatmulE02Tc4WgTiling, bf16, col_major));
     all_runners.push_back(MatmulRunner("e03-tc4-pipeline", runMatmulE03Tc4Pipeline, bf16, col_major));
     all_runners.push_back(MatmulRunner("e04-tc4-multi-consumer", runMatmulE04Tc4MultiConsumer, bf16, col_major));
-    all_runners.push_back(MatmulRunner("e05-persistent", runMatmulE05Persistent, bf16, col_major));
-    all_runners.push_back(MatmulRunner("e06-fast-barrier", runMatmulE06FastBarrier, bf16, col_major));
+    all_runners.push_back(MatmulRunner("e05-persistent-small", runMatmulE05PersistentSmall, bf16, col_major));
     bool error_exp = true;
-    all_runners.push_back(MatmulRunner("e05-persistent-l2", runMatmulE05PersistentL2, bf16, col_major, error_exp));
-    all_runners.push_back(MatmulRunner("e06-fast-barrier-l2", runMatmulE06FastBarrierL2, bf16, col_major, error_exp));
+    all_runners.push_back(MatmulRunner("e05-persistent", runMatmulE05Persistent, bf16, col_major, error_exp));
+    all_runners.push_back(MatmulRunner("e06-fast-barrier", runMatmulE06FastBarrier, bf16, col_major, error_exp));
+    all_runners.push_back(MatmulRunner("e07-cta-cluster", runMatmulE07CtaCluster, bf16, col_major, error_exp));
     error_exp = false;
 #endif
 
