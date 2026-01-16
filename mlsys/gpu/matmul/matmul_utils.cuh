@@ -159,7 +159,7 @@ class MatmulBuffers {
     void printTFLOPS(float elapsed_ms, std::string kernel_name) {
         double n_flop_per_iter = (static_cast<double>(M) * K * N) * 2;
         double tflops = num_iters * n_flop_per_iter / (elapsed_ms / 1000.0f) / 1e12;
-        std::printf("M=%d K=%d N=%d (%s): %.3f TFLOPS\n", M, K, N, kernel_name.c_str(), tflops);
+        std::printf("M=%d K=%d N=%d (%s): %.1f TFLOPS\n", M, K, N, kernel_name.c_str(), tflops);
     }
 
     ~MatmulBuffers() {

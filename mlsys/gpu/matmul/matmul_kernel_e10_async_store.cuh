@@ -20,7 +20,7 @@ namespace e10 {
 // using barrier = cuda::barrier<cuda::thread_scope_block>;
 // namespace cde = cuda::device::experimental;
 
-// avoid calling memset by calling wgmma with ScaleD=0 for the first iteration of each block tile
+// write accumulation regs first, then issue async copy from SMEM to GMEM
 
 __device__ static inline uint64_t matrix_descriptor_encode(uint64_t x) { return (((x) & 0x3FFFF) >> 0x4); }
 
