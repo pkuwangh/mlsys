@@ -14,7 +14,7 @@ message(STATUS "CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}")
 # Check if we're building for SM_90+ (Hopper) - enables WGMMA/TMA kernels
 foreach(ARCH ${CMAKE_CUDA_ARCHITECTURES})
     string(REGEX MATCH "^([0-9]+)" ARCH_NUM "${ARCH}")
-    if(ARCH_NUM AND ARCH_NUM GREATER_EQUAL 90)
+    if(ARCH_NUM AND ARCH_NUM EQUAL 90)
         set(HAS_GEN4_TENSOR_CORE TRUE)
         break()
     endif()
