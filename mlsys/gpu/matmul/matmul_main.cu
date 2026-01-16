@@ -25,6 +25,7 @@
 #include "matmul_kernel_e07_cta_cluster.cuh"
 #include "matmul_kernel_e08_store_opt.cuh"
 #include "matmul_kernel_e09_no_memset.cuh"
+#include "matmul_kernel_e10_async_store.cuh"
 #endif
 #include "matmul_utils.cuh"
 
@@ -171,6 +172,7 @@ int main() {
     all_runners.push_back(MatmulRunner("e07-cta-cluster", runMatmulE07CtaCluster, bf16, col_major, error_exp));
     all_runners.push_back(MatmulRunner("e08-store-opt", runMatmulE08StoreOpt, bf16, col_major, error_exp));
     all_runners.push_back(MatmulRunner("e09-no-memset", runMatmulE09NoMemset, bf16, col_major, error_exp));
+    all_runners.push_back(MatmulRunner("e10-async-store", runMatmulE10AsyncStore, bf16, col_major, error_exp));
     error_exp = false;
 #endif
 

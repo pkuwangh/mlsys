@@ -646,5 +646,5 @@ void runMatmulE07CtaCluster(MatmulBuffers &buffers) {
 
     auto *kernel = e07::matmul_e07_cta_cluster<E07_BM, E07_BN, E07_BK, E07_BLOCK_SIZE, E07_QSIZE, E07_NUM_SM, TM, TN,
                                                E07_CLUSTER_M, E07_CLUSTER_N>;
-    e07::_run_kernel(buffers, kernel, true);
+    e07::_run_kernel(buffers, kernel, false);
 }

@@ -682,7 +682,7 @@ template <typename Kernel> void _run_kernel(MatmulBuffers &buffers, Kernel kerne
     kernel<<<E09_NUM_SM, E09_BLOCK_SIZE, shmem_size>>>(tma_map_A, tma_map_B, buffers.dC_bf16, buffers.M, buffers.N,
                                                    buffers.K);
     if (check_error) {
-        checkCuda(cudaGetLastError(), "launch matmul_e07_cta_cluster");
+        checkCuda(cudaGetLastError(), "launch matmul_e09_no_memset");
     }
     buffers.num_iters += 1;
 }
@@ -693,7 +693,11 @@ void runMatmulE09NoMemset(MatmulBuffers &buffers) {
     constexpr int TM = 16;
     constexpr int TN = 8;
 
+    if (buffers.M % (E09_BM * TM) != 0 || buffers.N % (E09_BN * TN) != 0 || buffers.K % E09_BK != 0) {
+        return;
+    }
+
     auto *kernel = e09::matmul_e09_no_memset<E09_BM, E09_BN, E09_BK, E09_BLOCK_SIZE, E09_QSIZE, E09_NUM_SM, TM, TN,
                                              E09_CLUSTER_M, E09_CLUSTER_N>;
-    e09::_run_kernel(buffers, kernel, true);
+    e09::_run_kernel(buffers, kernel, false);
 }
