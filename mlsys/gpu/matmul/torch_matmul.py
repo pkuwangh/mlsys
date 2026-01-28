@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
-import torch
+import os
 import time
+
+import torch
 
 
 def test_matmul(
@@ -46,7 +48,8 @@ def test_matmul(
 
 # initialize cuda
 torch.cuda.init()
-torch.cuda.set_device(0)
+torch.cuda.set_device(int(os.getenv("RANK", 0)))
+
 
 # test
 test_configs = {
@@ -63,11 +66,23 @@ test_configs = {
         "dtypes": [torch.float32, torch.float16, torch.bfloat16],
     },
 }
-for name, config in test_configs.items():
-    print(f"Matrix multiplication using torch.matmul {name}", flush=True)
-    torch.backends.cuda.matmul.allow_tf32 = config["allow_tf32"]
-    torch.set_float32_matmul_precision(config["fp32_precision"])
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = config["allow_fp16_reduced_precision"]
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = config["allow_fp16_reduced_precision"]
-    for dtype in config["dtypes"]:
-        test_matmul(4096, 8192, 8192, dtype, 100)
+
+def main() -> None:
+    for name, config in test_configs.items():
+        print(f"Matrix multiplication using torch.matmul {name}", flush=True)
+        torch.backends.cuda.matmul.allow_tf32 = config["allow_tf32"]
+        torch.set_float32_matmul_precision(config["fp32_precision"])
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = config["allow_fp16_reduced_precision"]
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = config["allow_fp16_reduced_precision"]
+        for dtype in config["dtypes"]:
+            test_matmul(4096, 8192, 8192, dtype, 100)
+
+
+if __name__ == "__main__":
+    main()
+
+    if os.getenv("RANK", None) is not None:
+        while True:
+            time.sleep(0.1)
+            main()
+
