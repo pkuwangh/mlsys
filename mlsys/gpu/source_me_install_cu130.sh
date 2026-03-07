@@ -14,7 +14,7 @@ fi
 cleanupCondaBackEnvs
 micromamba install -y \
     -c nvidia \
-    "nvidia::cuda-toolkit==13.0.0" \
+    "nvidia::cuda-toolkit==13.0.2" \
     -c conda-forge \
     gcc libboost-devel openmpi-mpicxx \
     --strict-channel-priority

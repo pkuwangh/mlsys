@@ -12,32 +12,37 @@ alias tile_h='tmux select-layout even-vertical'
 alias tile_v='tmux select-layout even-horizontal'
 alias tile_4='tmux select-layout tiled'
 
-# install micromamba
-my_arch=$(uname -m)
-if [[ "$my_arch" == "x86_64" ]]; then
-    MAMBA_ARCH="linux-64"
-elif [[ "$my_arch" == "aarch64" ]]; then
-    MAMBA_ARCH="linux-aarch64"
-else
-    warnMsg "Unsupported architecture: $my_arch. Please install micromamba manually."
-    return
+if [ -z "${MAMBA_ROOT_PREFIX}" ]; then
+    checkMsg "No micromamba setup on this machine; setup locally"
+
+    # install micromamba
+    my_arch=$(uname -m)
+    if [[ "$my_arch" == "x86_64" ]]; then
+        MAMBA_ARCH="linux-64"
+    elif [[ "$my_arch" == "aarch64" ]]; then
+        MAMBA_ARCH="linux-aarch64"
+    else
+        warnMsg "Unsupported architecture: $my_arch. Please install micromamba manually."
+        return
+    fi
+
+    # check if micromamba is already installed locally
+    export MAMBA_ROOT_PREFIX="${ROOT_DIR}/micromamba"
+    export MAMBA_EXE="${MAMBA_ROOT_PREFIX}/bin/micromamba"
+    mkdir -p "${MAMBA_ROOT_PREFIX}"
+    pushd "${MAMBA_ROOT_PREFIX}" > /dev/null
+    echo "${MAMBA_EXE}"
+    if [ ! -f "${MAMBA_EXE}" ]; then
+        debugMsg "Downloading micromamba to ${MAMBA_EXE} ..."
+        curl -Ls "https://micro.mamba.pm/api/micromamba/${MAMBA_ARCH}/latest" | tar -xvj bin/micromamba
+    else
+        debugMsg "micromamba is already installed at ${MAMBA_EXE}"
+    fi
+    # set up micromamba environment for this shell
+    eval "$(./bin/micromamba shell hook -s posix)"
+    infoMsg "Micromamba is set up."
+    popd > /dev/null
 fi
-# check if micromamba is already installed
-export MAMBA_ROOT_PREFIX="${ROOT_DIR}/micromamba"
-export MAMBA_EXE="${MAMBA_ROOT_PREFIX}/bin/micromamba"
-mkdir -p "${MAMBA_ROOT_PREFIX}"
-pushd "${MAMBA_ROOT_PREFIX}" > /dev/null
-echo "${MAMBA_EXE}"
-if [ ! -f "${MAMBA_EXE}" ]; then
-    debugMsg "Downloading micromamba to ${MAMBA_EXE} ..."
-    curl -Ls "https://micro.mamba.pm/api/micromamba/${MAMBA_ARCH}/latest" | tar -xvj bin/micromamba
-else
-    debugMsg "micromamba is already installed at ${MAMBA_EXE}"
-fi
-# set up micromamba environment for this shell
-eval "$(./bin/micromamba shell hook -s posix)"
-infoMsg "Micromamba is set up."
-popd > /dev/null
 
 # let micromamba ignore ~/.local/
 export PYTHONNOUSERSITE=1

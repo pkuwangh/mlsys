@@ -75,7 +75,10 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = config["allow_fp16_reduced_precision"]
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = config["allow_fp16_reduced_precision"]
         for dtype in config["dtypes"]:
-            test_matmul(4096, 8192, 8192, dtype, 100)
+            try:
+                test_matmul(4096, 8192, 8192, dtype, 100)
+            except RuntimeError as e:
+                print(f"Encountered {e} with {config}")
 
 
 if __name__ == "__main__":
