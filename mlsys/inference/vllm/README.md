@@ -39,28 +39,36 @@ nsys profile --delay 45 \
 ### Offline throughput benchmark
 
 ```bash
-# LLM
-# nsys profile --delay 50 --duration 30 \
-vllm bench throughput \
-  --model=models/NousResearch/Hermes-3-Llama-3.1-8B \
-  --dataset-name=sonnet \
-  --dataset-path=vllm/benchmarks/sonnet.txt \
-  --num-prompts=1000
-
-# Speculative decoding
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_USE_V1=1 \
+nsys profile \
+  --delay=50 --duration=30 \
 vllm bench throughput \
-    --dataset-name=hf \
-    --dataset-path=likaixin/InstructCoder \
-    --model=models/meta-llama/Meta-Llama-3-8B-Instruct \
-    --input-len=1000 \
-    --output-len=100 \
-    --num-prompts=2048 \
-    --async-engine \
-    --speculative-config $'{"method": "ngram",
-    "num_speculative_tokens": 5, "prompt_lookup_max": 5,
-    "prompt_lookup_min": 2}'
+  --model models/NousResearch/Hermes-3-Llama-3.1-8B \
+  --dataset-name sonnet \
+  --dataset-path vllm/benchmarks/sonnet.txt \
+  --num-prompts 1000 \
+  --max-num-seqs 64
+```
+
+### Offline latency benchmark
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=stop \
+vllm bench latency \
+  --model openai/gpt-oss-120b \
+  --input-len=1 \
+  --output-len=128 \
+  --batch-size 1 \
+  --num-iters-warmup=2 \
+  --num-iters 1 \
+  --profile \
+  --profiler-config.profiler cuda
 ```
 
 ## Notes
