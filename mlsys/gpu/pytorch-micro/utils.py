@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
 
 import pprint
-import pycuda.driver as cuda
+
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
+
+
+def _check_cuda(result):
+    err = result[0]
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"CUDA driver call failed: {err}")
+    if len(result) == 2:
+        return result[1]
+    return result[1:]
+
+
+def _device_attribute(device, attr):
+    return _check_cuda(cuda.cuDeviceGetAttribute(attr, device))
+
+
+def _device_name(device) -> str:
+    name = _check_cuda(cuda.cuDeviceGetName(256, device))
+    return name.split(b"\0", 1)[0].decode("utf-8", errors="replace")
 
 
 def CompCap2Throughput(major, minor):
@@ -31,7 +53,7 @@ def CompCap2Throughput(major, minor):
         (8, 9): (128, 2, 64, 4, 2048),  # L40, Ada family
         # 4 mixed-precision Fourth-generation Tensor Cores supporting the new FP8 input type in either E4M3 or E5M2 for exponent (E) and mantissa (M), half-precision (fp16), __nv_bfloat16, tf32, INT8 and double precision (fp64) matrix arithmetic
         (9, 0): (128, 64, 64, 4, 4096), # H100
-        (10, 0): (128, 64, 128, 4, 8192),  # B200?
+        (10, 0): (128, 64, 128, 4, 8192),  # B200
     }
     # check if we know the mapping
     if (major, minor) in throughput_mapping:
@@ -46,28 +68,44 @@ def get_device_properties(verbose=0) -> dict[str, float | int | str]:
     # A100 https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf
     # H100 https://resources.nvidia.com/en-us-tensor-core
 
-    cuda.init()
-    device_count = cuda.Device.count()
+    _check_cuda(cuda.cuInit(0))
+    device_count = _check_cuda(cuda.cuDeviceGetCount())
     if device_count < 1:
         return {}
 
+    attrs = cuda.CUdevice_attribute
+    attr_names = {
+        "clock_rate": attrs.CU_DEVICE_ATTRIBUTE_CLOCK_RATE,
+        "multiprocessor_count": attrs.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+        "compute_capability_major": attrs.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        "compute_capability_minor": attrs.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        "single_to_double_precision_perf_ratio": (
+            attrs.CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO
+        ),
+        "memory_clock_rate": attrs.CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE,
+        "global_memory_bus_width": attrs.CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH,
+    }
+
     for i in range(device_count):
-        device = cuda.Device(i)
-        properties = device.get_attributes()
+        device = _check_cuda(cuda.cuDeviceGet(i))
+        properties = {
+            name: _device_attribute(device, attr) for name, attr in attr_names.items()
+        }
         if verbose >= 2:
-            print(f"Device {i} ({device.name()}) Properties:")
+            print(f"Device {i} ({_device_name(device)}) Properties:")
             pprint.pprint(properties)
 
-    properties = cuda.Device(0).get_attributes()
-    sm_clock = properties[cuda.device_attribute.CLOCK_RATE]
-    sm_count = properties[cuda.device_attribute.MULTIPROCESSOR_COUNT]
-    ver_major = properties[cuda.device_attribute.COMPUTE_CAPABILITY_MAJOR]
-    ver_minor = properties[cuda.device_attribute.COMPUTE_CAPABILITY_MINOR]
-    fp32_to_fp64_ratio = properties[cuda.device_attribute.SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO]
+    device = _check_cuda(cuda.cuDeviceGet(0))
+    properties = {name: _device_attribute(device, attr) for name, attr in attr_names.items()}
+    sm_clock = properties["clock_rate"]
+    sm_count = properties["multiprocessor_count"]
+    ver_major = properties["compute_capability_major"]
+    ver_minor = properties["compute_capability_minor"]
+    fp32_to_fp64_ratio = properties["single_to_double_precision_perf_ratio"]
 
     if verbose >= 1:
         print(
-            f"CUDA Device 0: {cuda.Device(0).name()}, "
+            f"CUDA Device 0: {_device_name(device)}, "
             f"Compute Capability: {ver_major}.{ver_minor}, "
             f"SM Clock: {sm_clock/1e6:.2f} GHz, "
             f"SMs: {sm_count}"
@@ -86,8 +124,8 @@ def get_device_properties(verbose=0) -> dict[str, float | int | str]:
     fp16_flops = fp32_flops * 2
     fp64_flops = fp32_flops / fp32_to_fp64_ratio
     fp16tc_flops = tc_flops_per_clk_per_sm * sm_count * sm_clock / 1e9
-    memory_clock = properties[cuda.device_attribute.MEMORY_CLOCK_RATE]
-    memory_bus_width = properties[cuda.device_attribute.GLOBAL_MEMORY_BUS_WIDTH]
+    memory_clock = properties["memory_clock_rate"]
+    memory_bus_width = properties["global_memory_bus_width"]
     memory_bandwidth = memory_clock * memory_bus_width * 2 / 8e9
     tc_flop_per_byte = fp16tc_flops / memory_bandwidth
     if verbose >= 1:

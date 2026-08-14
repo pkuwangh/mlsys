@@ -41,20 +41,20 @@ def test_matmul(
 
     print(f"m={m} n={n} p={p}")
     if device_props.get("tensor_core_count", 0) > 0:
-        print_flops(tflops_1st, "tc_fp16_flops", device_pros, prefix="1st run")
-        print_flops(tflops, "tc_fp16_flops", device_pros, prefix="rep run")
+        print_flops(tflops_1st, "tc_fp16_flops", device_props, prefix="1st run")
+        print_flops(tflops, "tc_fp16_flops", device_props, prefix="rep run")
     else:
-        print_flops(tflops_1st, "fp16_flops", device_pros, prefix="1st run")
-        print_flops(tflops, "fp16_flops", device_pros, prefix="rep run")
+        print_flops(tflops_1st, "fp16_flops", device_props, prefix="1st run")
+        print_flops(tflops, "fp16_flops", device_props, prefix="rep run")
 
 
-device_pros = get_device_properties(verbose=1)
+device_props = get_device_properties(verbose=1)
 
-test_matmul(8192, 8192, 8192, 10, device_pros, warmup=True)
+test_matmul(8192, 8192, 8192, 10, device_props, warmup=True)
 print("Matrix multiplication using torch.matmul", flush=True)
-test_matmul(512, 512, 512, 100000, device_pros)
-test_matmul(1024, 1024, 1024, 10000, device_pros)
-test_matmul(2048, 2048, 2048, 10000, device_pros)
-test_matmul(4096, 4096, 4096, 1000, device_pros)
-test_matmul(8192, 8192, 8192, 100, device_pros)
-test_matmul(16384, 16384, 16384, 10, device_pros)
+test_matmul(512, 512, 512, 100000, device_props)
+test_matmul(1024, 1024, 1024, 10000, device_props)
+test_matmul(2048, 2048, 2048, 10000, device_props)
+test_matmul(4096, 4096, 4096, 1000, device_props)
+test_matmul(8192, 8192, 8192, 100, device_props)
+test_matmul(16384, 16384, 16384, 10, device_props)
