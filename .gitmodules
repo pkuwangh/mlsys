@@ -1,24 +1,12 @@
 [submodule "model/nanoGPT"]
 	path = mlsys/model/nanoGPT
 	url = https://github.com/pkuwangh/nanoGPT.git
-[submodule "mlsys/environments/packages/nccl"]
-	path = mlsys/environments/nccl
-	url = https://github.com/pkuwangh/nccl.git
-[submodule "mlsys/environments/packages/pytorch-fork"]
-	path = mlsys/environments/pytorch
-	url = https://github.com/pkuwangh/pytorch.git
 [submodule "mlsys/services/redis/redis"]
 	path = mlsys/services/redis/redis
 	url = https://github.com/redis/redis.git
 [submodule "mlsys/services/telemetry/fluent-bit"]
 	path = mlsys/services/telemetry/fluent-bit
 	url = https://github.com/fluent/fluent-bit
-[submodule "mlsys/apps/video-upscaling/RealBasicVSR"]
-	path = mlsys/apps/video-upscaling/RealBasicVSR
-	url = https://github.com/ckkelvinchan/RealBasicVSR.git
-[submodule "mlsys/apps/video-upscaling/SUPIR"]
-	path = mlsys/apps/video-upscaling/SUPIR
-	url = https://github.com/pkuwangh/SUPIR.git
 [submodule "mlsys/inference/vllm/vllm"]
 	path = mlsys/inference/vllm/vllm
 	url = https://github.com/pkuwangh/vllm.git
@@ -31,6 +19,6 @@
 [submodule "mlsys/inference/sglang/sglang"]
 	path = mlsys/inference/sglang/sglang
 	url = https://github.com/pkuwangh/sglang.git
-[submodule "mlsys/inference/oss-models/cosmos-predict2.5"]
-	path = mlsys/inference/oss-models/cosmos-predict2.5
-	url = https://github.com/nvidia-cosmos/cosmos-predict2.5.git
+[submodule "mlsys/inference/vllm/vllm-omni"]
+	path = mlsys/inference/vllm/vllm-omni
+	url = https://github.com/vllm-project/vllm-omni.git
