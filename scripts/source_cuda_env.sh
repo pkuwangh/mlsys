@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # get current directory
-CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_CUDA_ENV_CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-source "${CURR_DIR}/common.sh" || return 1
+source "${_CUDA_ENV_CURR_DIR}/common.sh" || return 1
 
 if [ -z "${CONDA_PREFIX:-}" ]; then
     warnMsg "CONDA_PREFIX is not set. Please activate your conda/micromamba environment first."

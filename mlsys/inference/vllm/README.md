@@ -1,58 +1,83 @@
 # vLLM
 
-## Install vLLM
+- [vLLM](#vllm)
+  - [Install vLLM and vLLM-Omni](#install-vllm-and-vllm-omni)
+  - [Download Model](#download-model)
+  - [vLLM Instructions](#vllm-instructions)
+    - [LLM Quick Start](#llm-quick-start)
+    - [vLLM Benchmarks](#vllm-benchmarks)
+  - [vLLM-Notes](#vllm-notes)
+    - [Request lifecycle](#request-lifecycle)
+      - [Organization \& Concept](#organization--concept)
+      - [Generate call trace.](#generate-call-trace)
+      - [execute\_model](#execute_model)
+    - [Continuous batching \& paged attention](#continuous-batching--paged-attention)
+    - [Various Parallelism](#various-parallelism)
+      - [Tensor Parallel](#tensor-parallel)
+      - [Pipeline Parallel](#pipeline-parallel)
+
+## Install vLLM and vLLM-Omni
 
 ```bash
 # use virtualenv and install system deps
 source source_me_install_deps.sh
 
-# full build
-cd vllm
+# install vllm
+# python install
+VLLM_USE_PRECOMPILED=1 uv pip install -e '.[bench]' --torch-backend=auto
+
+# vllm full build
 uv pip install -r requirements/build.txt
-# build from source in editable mode
+# - build from source in editable mode
 uv pip install --no-build-isolation -e .[bench]
-# to make vscode/pylance happy and be able to find reference in source code
+# - to make vscode/pylance happy and be able to find reference in source code
 uv pip install --no-build-isolation -e .[bench] --config-settings editable_mode=compat
+
+
+# install vllm-omni
+micromamba install -y -c conda-forge "libgl"
+uv pip install "setuptools-scm==10.2.1"
+VLLM_OMNI_TARGET_DEVICE=cuda uv pip install -e '.[demo]' --no-build-isolation
 ```
 
-## Quick Start
+## Download Model
 
 ```bash
-cd quickstart
+hf download --local-dir ./models/NousResearch/Hermes-3-Llama-3.1-8B NousResearch/Hermes-3-Llama-3.1-8B
+
+hf download --local-dir ./models/nvidia/Cosmos3-Edge nvidia/Cosmos3-Edge
+hf download --local-dir ./models/nvidia/Cosmos3-Super nvidia/Cosmos3-Super
+```
+
+## vLLM Instructions
+
+### vLLM Quick Start
+
+```bash
+cd quickstart/
 
 # profile batch inference
 nsys profile --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=stop ./v01-offline-batch-inference.py
 nsys profile --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=stop --trace-fork-before-exec=true ./v02-tensor-parallel.py
-
-# benchmark
-wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
-nsys profile --delay 45 \
-    vllm bench throughput \
-    --model models/meta-llama/Llama-3.1-8B-Instruct/ \
-    --dataset-name sharegpt \
-    --dataset-path ./ShareGPT_V3_unfiltered_cleaned_split.json \
-    --num-prompts 200
 ```
 
-## Benchmarks
-
-### Offline throughput benchmark
+### vLLM Benchmarks
 
 ```bash
+cd vllm/
+
+# Offline throughput benchmark
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 nsys profile \
   --delay=50 --duration=30 \
 vllm bench throughput \
-  --model models/NousResearch/Hermes-3-Llama-3.1-8B \
+  --model ../models/NousResearch/Hermes-3-Llama-3.1-8B \
   --dataset-name sonnet \
-  --dataset-path vllm/benchmarks/sonnet.txt \
+  --dataset-path benchmarks/sonnet.txt \
   --num-prompts 1000 \
   --max-num-seqs 64
-```
 
-### Offline latency benchmark
-
-```bash
+# Offline latency benchmark
 VLLM_WORKER_MULTIPROC_METHOD=spawn \
 nsys profile \
   --trace=cuda,nvtx,osrt \
@@ -71,7 +96,7 @@ vllm bench latency \
   --profiler-config.profiler cuda
 ```
 
-## Notes
+## vLLM Notes
 
 ### Request lifecycle
 
@@ -190,3 +215,15 @@ In practice,
 - first rank: `embed_tokens: VocabParallelEmbedding`
 - middle ranks: a slice of all `DecoderLayer`s
 - last rank: `norm: RMSNorm` and `lm_head`
+
+
+## vLLM-Omni Instructions
+
+```bash
+# quickstart
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model ../models/nvidia/Cosmos3-Edge \
+    --prompt "A photorealistic red sports car at golden hour, cinematic lighting." \
+    --extra-body '{"guardrails": false}' \
+    --output cosmos3_edge_t2i.png
+```

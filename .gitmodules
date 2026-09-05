@@ -21,4 +21,4 @@
 	url = https://github.com/pkuwangh/sglang.git
 [submodule "mlsys/inference/vllm/vllm-omni"]
 	path = mlsys/inference/vllm/vllm-omni
-	url = https://github.com/vllm-project/vllm-omni.git
+	url = https://github.com/pkuwangh/vllm-omni.git
