@@ -3,9 +3,9 @@
 # get current directory
 CURR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-source "${CURR_DIR}/../../../scripts/common.sh"
+source "${CURR_DIR}/../../scripts/common.sh" || return 1
 
-MY_VENV="mlsys-vllm"
+MY_VENV="mlsys-gpu"
 
 micromamba deactivate
 if micromamba env list | grep -q "${MY_VENV}"; then
@@ -19,22 +19,23 @@ splitLine
 
 # system deps
 cleanupCondaBackEnvs
-# conda-forge only
+# Keep CUDA and build deps on conda-forge so the solver uses one consistent stack.
 micromamba install -n "${MY_VENV}" -y \
     -c conda-forge \
     "cuda-toolkit=13.2.2" \
-    "ccache=4.13.6" \
     "cmake=4.4.2" \
     "gcc=14.3.0" \
     "gxx=14.3.0" \
     "ninja=1.13.1" \
+    "libboost-devel" \
+    "openmpi-mpicxx" \
     || return 1
 
 # python deps
 uv pip install black loguru ruff "huggingface_hub[cli]" "cuda-python==13.2.0" || return 1
 
 # cuda env
-source "${CURR_DIR}/../../../scripts/source_cuda_env.sh" || return 1
+source "${CURR_DIR}/../../scripts/source_cuda_env.sh" || return 1
 
 splitLine
 infoMsg "Checking nvcc"
@@ -45,14 +46,17 @@ nvcc --version || return 1
 
 splitLine
 
-export CCACHE_NOHASHDIR="true"
-export CCACHE_DIR="${CURR_DIR}/.ccache"
-
 # torch
-# stable cu132 index https://download.pytorch.org/whl/cu132/torchaudio/ does not have 2.11.0 release
-# uv pip install "torch==2.13.0" "torchaudio==2.11.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
-# switch nightly cu132 index
-uv pip install --pre "torch==2.13.0" "torchaudio>2.11.0.dev0,<=2.11.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/nightly/cu132 || return 1
+uv pip install "torch==2.13.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
+
+# diffusers
+uv pip install "diffusers==0.40.0"
+
+# other deps
+uv pip install "accelerate==1.14.0"
+
+# cutlass-dsl
+uv pip install "nvidia-cutlass-dsl==4.7.1" "apache-tvm-ffi==0.1.12"
 
 python "${CURR_DIR}/check_cuda.py"
 
