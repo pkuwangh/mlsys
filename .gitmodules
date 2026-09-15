@@ -22,3 +22,6 @@
 [submodule "mlsys/inference/vllm/vllm-omni"]
 	path = mlsys/inference/vllm/vllm-omni
 	url = https://github.com/pkuwangh/vllm-omni.git
+[submodule "mlsys/training/nanorl"]
+	path = mlsys/training/nano-rl/nanorl
+	url = https://github.com/pkuwangh/nanorl.git

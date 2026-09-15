@@ -79,6 +79,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=640, help="Synthetic input video height.")
     parser.add_argument("--width", type=int, default=480, help="Synthetic input video width.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for synthetic video generation.")
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Enable the torch.compile encoder validation and benchmark path.",
+    )
     return parser.parse_args()
 
 
@@ -761,11 +766,14 @@ def main() -> None:
 
         compiled_error: Exception | None = None
         compiled_torch_encoder = None
-        try:
-            compiled_torch_encoder = TorchCompileChunkWanVaeEncoder(vae).eval()
-        except Exception as error:  # noqa: BLE001 - report compile failure after printing benchmark timings.
-            compiled_error = error
-            print(f"torch_compile_create_error: {type(error).__name__}: {error}")
+        if args.torch_compile:
+            try:
+                compiled_torch_encoder = TorchCompileChunkWanVaeEncoder(vae).eval()
+            except Exception as error:  # noqa: BLE001 - report compile failure after printing benchmark timings.
+                compiled_error = error
+                print(f"torch_compile_create_error: {type(error).__name__}: {error}")
+        else:
+            print("torch_compile: disabled (use --torch-compile to enable)")
 
         print("warmup:")
         _, warmup_reference_ms = timed(
@@ -778,19 +786,20 @@ def main() -> None:
         _, warmup_torch_ms = timed("warmup_torch_encode", device, lambda: torch_encoder(video))
         print(f"  torch_encode: {warmup_torch_ms:.3f} ms")
 
-        if compiled_torch_encoder is not None:
-            try:
-                _, warmup_compile_ms = timed(
-                    "warmup_torch_compile_encode",
-                    device,
-                    lambda: compiled_torch_encoder(video),
-                )
-                print(f"  torch_compile_encode: {warmup_compile_ms:.3f} ms")
-            except Exception as error:  # noqa: BLE001 - report compile failure after printing benchmark timings.
-                compiled_error = error
-                print(f"  torch_compile_encode_error: {type(error).__name__}: {error}")
-        else:
-            print("  torch_compile_encode: skipped because torch.compile creation failed.")
+        if args.torch_compile:
+            if compiled_torch_encoder is not None:
+                try:
+                    _, warmup_compile_ms = timed(
+                        "warmup_torch_compile_encode",
+                        device,
+                        lambda: compiled_torch_encoder(video),
+                    )
+                    print(f"  torch_compile_encode: {warmup_compile_ms:.3f} ms")
+                except Exception as error:  # noqa: BLE001 - report compile failure after printing benchmark timings.
+                    compiled_error = error
+                    print(f"  torch_compile_encode_error: {type(error).__name__}: {error}")
+            else:
+                print("  torch_compile_encode: skipped because torch.compile creation failed.")
 
         benchmark_timings: dict[str, float] = {}
         reference_posterior = None
@@ -838,10 +847,11 @@ def main() -> None:
 
         print("validation:")
         print(f"  raw_vs_reference: fatal atol={COMPARE_ATOL:g} rtol={COMPARE_RTOL:g}")
-        print(
-            f"  torch_compile_vs_reference: production_gate atol={COMPILE_COMPARE_ATOL:g} "
-            f"rtol={COMPILE_COMPARE_RTOL:g}; rejected compiled chunks fall back to eager"
-        )
+        if args.torch_compile:
+            print(
+                f"  torch_compile_vs_reference: production_gate atol={COMPILE_COMPARE_ATOL:g} "
+                f"rtol={COMPILE_COMPARE_RTOL:g}; rejected compiled chunks fall back to eager"
+            )
         raw_matches = [
             compare_tensors(
                 "torch_encoded_params",
@@ -859,46 +869,47 @@ def main() -> None:
             ),
         ]
         compiled_matches: list[bool] = []
-        if compiled_error is None:
-            assert compiled_params is not None
-            assert compiled_latents is not None
-            compiled_matches.extend(
-                [
-                    compare_tensors(
-                        "torch_compile_encoded_params",
-                        compiled_params,
-                        reference_params,
-                        atol=COMPILE_COMPARE_ATOL,
-                        rtol=COMPILE_COMPARE_RTOL,
-                    ),
-                    compare_tensors(
-                        "torch_compile_latents_mode",
-                        compiled_latents,
-                        reference_latents,
-                        atol=COMPILE_COMPARE_ATOL,
-                        rtol=COMPILE_COMPARE_RTOL,
-                    ),
-                ]
-            )
-            compiled_chunks_match = debug_compiled_chunk_mismatch(
-                torch_encoder,
-                compiled_torch_encoder,
-                video,
-                atol=COMPILE_COMPARE_ATOL,
-                rtol=COMPILE_COMPARE_RTOL,
-            )
-            if all(compiled_matches) and compiled_chunks_match:
-                print("torch_compile_status: accepted")
+        if args.torch_compile:
+            if compiled_error is None:
+                assert compiled_params is not None
+                assert compiled_latents is not None
+                compiled_matches.extend(
+                    [
+                        compare_tensors(
+                            "torch_compile_encoded_params",
+                            compiled_params,
+                            reference_params,
+                            atol=COMPILE_COMPARE_ATOL,
+                            rtol=COMPILE_COMPARE_RTOL,
+                        ),
+                        compare_tensors(
+                            "torch_compile_latents_mode",
+                            compiled_latents,
+                            reference_latents,
+                            atol=COMPILE_COMPARE_ATOL,
+                            rtol=COMPILE_COMPARE_RTOL,
+                        ),
+                    ]
+                )
+                compiled_chunks_match = debug_compiled_chunk_mismatch(
+                    torch_encoder,
+                    compiled_torch_encoder,
+                    video,
+                    atol=COMPILE_COMPARE_ATOL,
+                    rtol=COMPILE_COMPARE_RTOL,
+                )
+                if all(compiled_matches) and compiled_chunks_match:
+                    print("torch_compile_status: accepted")
+                else:
+                    print(
+                        "torch_compile_status: rejected_expected "
+                        "(production-style behavior would fall back to eager for this chunk shape)"
+                    )
             else:
                 print(
-                    "torch_compile_status: rejected_expected "
-                    "(production-style behavior would fall back to eager for this chunk shape)"
+                    "torch_compile_status: unavailable "
+                    "(production-style behavior would fall back to eager because compilation failed)"
                 )
-        else:
-            print(
-                "torch_compile_status: unavailable "
-                "(production-style behavior would fall back to eager because compilation failed)"
-            )
 
         print_performance(benchmark_timings)
         if compiled_error is not None:
