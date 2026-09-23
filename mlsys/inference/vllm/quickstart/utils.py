@@ -8,5 +8,10 @@ def _get_current_path():
 
 
 def get_model_path(model_name: str) -> str:
-    model_path = _get_current_path() / "models" / model_name
+    model_path = _get_current_path().parent / "models" / model_name
     return str(model_path)
+
+
+if __name__ == "__main__":
+    print(get_model_path("nvidia/Cosmos3-Super"))
+

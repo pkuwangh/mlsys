@@ -286,7 +286,6 @@ def _load_model(args):
 
     load_kwargs = {
         "dtype": "auto",
-        "device_map": "auto",
         "local_files_only": True,
     }
     if args.trust_remote_code:

@@ -43,7 +43,7 @@ VLLM_OMNI_TARGET_DEVICE=cuda uv pip install -e '.[demo]' --no-build-isolation
 ## Download Model
 
 ```bash
-hf download --local-dir ./models/NousResearch/Hermes-3-Llama-3.1-8B NousResearch/Hermes-3-Llama-3.1-8B
+hf download --local-dir ./models/Qwen/Qwen3.8-27B Qwen/Qwen3.8-27B
 
 hf download --local-dir ./models/nvidia/Cosmos3-Edge nvidia/Cosmos3-Edge
 hf download --local-dir ./models/nvidia/Cosmos3-Super nvidia/Cosmos3-Super
@@ -71,7 +71,7 @@ VLLM_WORKER_MULTIPROC_METHOD=spawn \
 nsys profile \
   --delay=50 --duration=30 \
 vllm bench throughput \
-  --model ../models/NousResearch/Hermes-3-Llama-3.1-8B \
+  --model ../models/Qwen/Qwen3.8-27B \
   --dataset-name sonnet \
   --dataset-path benchmarks/sonnet.txt \
   --num-prompts 1000 \
@@ -108,7 +108,7 @@ engine_core: EngineCoreClient   # separate process from the client; own schedule
         driver_worker: WorkerWrapperBase
             worker: gpu_worker.Worker   # separate process that owns CUDA context
                 model_runner: GPUModelRunner
-                    model: LlamaForCausalLM
+                    model: Qwen3_5ForCausalLM
                     kv_caches: list[Tensor]
         collective_rpc: to execute a RPC call on the worker
         constructor:

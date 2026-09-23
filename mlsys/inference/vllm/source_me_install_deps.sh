@@ -49,10 +49,10 @@ export CCACHE_NOHASHDIR="true"
 export CCACHE_DIR="${CURR_DIR}/.ccache"
 
 # torch
-# stable cu132 index https://download.pytorch.org/whl/cu132/torchaudio/ does not have 2.11.0 release
-# uv pip install "torch==2.13.0" "torchaudio==2.11.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
-# switch nightly cu132 index
+# Note: stable cu132 index https://download.pytorch.org/whl/cu132/torchaudio/ does not have 2.11.0 release
+# Installing from pypi does not guarantee the correct CUDA version is used.
+# So use the nightly-build index
 uv pip install --pre "torch==2.13.0" "torchaudio>2.11.0.dev0,<=2.11.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/nightly/cu132 || return 1
+# uv pip install "torch==2.13.0" "torchaudio==2.11.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
 
 python "${CURR_DIR}/check_cuda.py"
-

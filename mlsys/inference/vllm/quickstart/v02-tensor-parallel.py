@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+
 import nvtx
 import torch
 from loguru import logger
@@ -12,7 +13,7 @@ from vllm.outputs import RequestOutput
 
 @nvtx.annotate("setup")
 def setup() -> LLM:
-    model_path = get_model_path("NousResearch/Hermes-3-Llama-3.1-8B/")
+    model_path = get_model_path("Qwen/Qwen3.8-27B")
     logger.warning(f"[pid={os.getpid()}] Loading model from: {model_path}")
     return LLM(
         model=model_path,
@@ -44,7 +45,6 @@ if __name__ == "__main__":
         "The capital of France is",
         "The future of AI is",
     ]
-    prompts = prompts
     logger.info(f"Prepared {len(prompts)} prompts for generation.")
 
     cudart().cudaProfilerStart()
