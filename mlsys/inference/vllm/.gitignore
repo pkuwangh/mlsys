@@ -1,2 +1,5 @@
 /*.nsys-rep
+/output*
+/run-*.sh
+/*/*.log
 

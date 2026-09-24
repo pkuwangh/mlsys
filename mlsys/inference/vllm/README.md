@@ -44,6 +44,7 @@ VLLM_OMNI_TARGET_DEVICE=cuda uv pip install -e '.[demo]' --no-build-isolation
 
 ```bash
 hf download --local-dir ./models/Qwen/Qwen3.8-27B Qwen/Qwen3.8-27B
+hf download --local-dir ./models/z-lab/Qwen3.8-27B-DFlash2 z-lab/Qwen3.8-27B-DFlash2
 
 hf download --local-dir ./models/nvidia/Cosmos3-Edge nvidia/Cosmos3-Edge
 hf download --local-dir ./models/nvidia/Cosmos3-Super nvidia/Cosmos3-Super
