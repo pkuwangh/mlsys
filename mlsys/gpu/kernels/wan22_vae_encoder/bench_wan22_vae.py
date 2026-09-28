@@ -181,7 +181,7 @@ def parse_args() -> argparse.Namespace:
             "outside the CUDA profiler range."
         ),
     )
-    parser.add_argument("--benchmark-repeats", type=int, default=5)
+    parser.add_argument("--benchmark-repeats", type=int, default=5, help="benchmark iters")
     args = parser.parse_args()
     if args.benchmark_repeats < 1:
         parser.error("--benchmark-repeats must be positive")

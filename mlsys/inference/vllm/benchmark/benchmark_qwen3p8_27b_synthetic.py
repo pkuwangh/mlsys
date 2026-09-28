@@ -249,7 +249,7 @@ def main() -> None:
         ignore_eos=True,
     )
     # warmup
-    _ = llm.generate(requests, params, use_tqdm=True)
+    _ = llm.generate(requests, params, use_tqdm=False)
 
     metrics_before = (
         read_spec_decode_metrics(llm, num_speculative_tokens)

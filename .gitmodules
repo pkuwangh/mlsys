@@ -25,3 +25,6 @@
 [submodule "mlsys/training/nanorl"]
 	path = mlsys/training/nano-rl/nanorl
 	url = https://github.com/pkuwangh/nanorl.git
+[submodule "mlsys/gpu/backends/cudnn-frontend"]
+	path = mlsys/gpu/backends/cudnn-frontend
+	url = https://github.com/NVIDIA/cudnn-frontend.git

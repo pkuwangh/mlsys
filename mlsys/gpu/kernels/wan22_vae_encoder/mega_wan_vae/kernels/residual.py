@@ -1,3 +1,7 @@
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false
+# pyright: reportIndexIssue=false, reportMissingImports=false
+# pyright: reportOperatorIssue=false
+
 """Wan bias/residual additions and grouped stage shortcuts.
 
 All activations are contiguous BF16 NTHWC. Bias, each residual branch, and
@@ -7,14 +11,13 @@ residual preparation writes the bottom/right zero border in the same pass.
 
 import argparse
 from collections.abc import Callable
-from functools import lru_cache
+from functools import cache, partial
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
 import torch
+from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
-
 
 if __package__:
     from ._utils import measure, print_benchmark_table
@@ -140,7 +143,7 @@ def bias_residual_host(
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def compile_bias_residual(
     channels: int = 160,
     has_bias: bool = True,
@@ -445,7 +448,7 @@ def stage_add_host(
         )
 
 
-@lru_cache(maxsize=None)
+@cache
 def compile_stage(
     spec: tuple[int, int, int, int, int, int, int, bool, bool],
 ) -> Callable:
@@ -570,7 +573,7 @@ def verify() -> None:
             )
             for pad in (False, True):
                 for rb in (None, bias):
-                    kwargs = dict(residual_bias=rb, pad_spatial=pad)
+                    kwargs = {"residual_bias": rb, "pad_spatial": pad}
                     torch.testing.assert_close(
                         bias_residual(x, skip, bias, **kwargs),
                         torch_bias_residual(x, skip, bias, **kwargs),
@@ -683,11 +686,10 @@ def benchmark_production() -> None:
             # Spatial padding is the separate reference for fused downsample convs.
             for pad in (False, True) if h >= 60 else (False,):
 
-                def reference() -> torch.Tensor:
-                    return torch_bias_residual(x, skip, bias, pad_spatial=pad)
-
-                def custom() -> torch.Tensor:
-                    return bias_residual(x, skip, bias, pad_spatial=pad)
+                reference = partial(
+                    torch_bias_residual, x, skip, bias, pad_spatial=pad
+                )
+                custom = partial(bias_residual, x, skip, bias, pad_spatial=pad)
 
                 torch.testing.assert_close(custom(), reference(), atol=0, rtol=0)
                 label = "bias + residual" + (" + spatial pad" if pad else "")
@@ -723,11 +725,8 @@ def benchmark_production() -> None:
                 flush=True,
             )
 
-            def reference() -> torch.Tensor:
-                return torch_stage_add(x, skip, ft, fs, bias, residual)
-
-            def custom() -> torch.Tensor:
-                return stage_add(x, skip, ft, fs, bias, residual)
+            reference = partial(torch_stage_add, x, skip, ft, fs, bias, residual)
+            custom = partial(stage_add, x, skip, ft, fs, bias, residual)
 
             _verify_stage_ordered(x, skip, ft, fs, bias, residual)
             label = "shortcut mean + add"

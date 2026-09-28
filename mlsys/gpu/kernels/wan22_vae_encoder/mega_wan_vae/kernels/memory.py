@@ -1,3 +1,7 @@
+# pyright: reportAttributeAccessIssue=false, reportIndexIssue=false
+# pyright: reportMissingImports=false, reportOperatorIssue=false
+# pyright: reportOptionalMemberAccess=false
+
 """Direct causal padding/history/cache assembly for BF16 Wan activations.
 
 Output and history are NTHWC. The input may be NTHWC or the initial NCTHW
@@ -15,12 +19,12 @@ its cache remains C12 and every extra output channel is zero.
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
 import torch
+from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 if __package__:
@@ -147,7 +151,7 @@ def initial_pack_host(
         )
 
 
-@lru_cache(maxsize=None)
+@cache
 def compile_initial_pack(spec: tuple) -> Callable:
     """Compile initial-chunk specializations without allocating device tensors."""
     x = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2)
@@ -253,7 +257,8 @@ def causal_pack_host(
     if cutlass.const_expr(
         SPEC[9] and SPEC[3] == 12 and not SPEC[10] and SPEC[5:8] == (2, 1, 1)
     ):
-        t, h, w, c, p, pt, ph, pw, ct, ncthw, has_bias = SPEC[:11]
+        t, h, w, c, p = SPEC[:5]
+        ct = SPEC[8]
         strides = SPEC[11] if len(SPEC) > 11 else None
         if cutlass.const_expr(strides is None):
             strides = (c * t * h * w, t * h * w, h * w, w, 1)
@@ -287,7 +292,7 @@ def causal_pack_host(
         )
 
 
-@lru_cache(maxsize=None)
+@cache
 def compile_pack(spec: tuple) -> Callable:
     """Compile only immutable geometry/layout metadata; never cache tensors."""
     tensors = [
@@ -610,7 +615,16 @@ def benchmark_production() -> None:
         )
         bias = None if ncthw else torch.randn(c, device="cuda", dtype=x.dtype)
 
-        def reference() -> PackedHistory:
+        def reference(
+            x=x,
+            ncthw=ncthw,
+            bias=bias,
+            previous=previous,
+            pad=pad,
+            c=c,
+            p=p,
+            cache_frames=cache_frames,
+        ) -> PackedHistory:
             current = x.permute(0, 2, 3, 4, 1) if ncthw else x + bias
             joined = (
                 current if previous is None else torch.cat((previous, current), dim=1)
@@ -624,7 +638,14 @@ def benchmark_production() -> None:
             )
             return PackedHistory(padded, joined[:, -cache_frames:].contiguous())
 
-        def custom() -> PackedHistory:
+        def custom(
+            x=x,
+            previous=previous,
+            bias=bias,
+            pad=pad,
+            cache_frames=cache_frames,
+            ncthw=ncthw,
+        ) -> PackedHistory:
             return pack_history(
                 x,
                 previous,

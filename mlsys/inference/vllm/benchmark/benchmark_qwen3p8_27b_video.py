@@ -361,7 +361,7 @@ def main() -> None:
             "prompt": prompt,
             "multi_modal_data": {"video": (video, video_metadata)},
         }
-        for _ in range(config["MAX_NUM_SEQS"] * 4)
+        for _ in range(config["MAX_NUM_SEQS"] * 3)
     ]
 
     params = SamplingParams(
@@ -374,7 +374,7 @@ def main() -> None:
         max_tokens=output_tokens,
     )
     # warmup
-    _ = llm.generate(requests, params, use_tqdm=True)
+    _ = llm.generate(requests[:config["MAX_NUM_SEQS"]], params, use_tqdm=False)
 
     metrics_before = (
         read_spec_decode_metrics(llm, num_speculative_tokens)

@@ -1,5 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false
+# pyright: reportCallIssue=false, reportGeneralTypeIssues=false
+# pyright: reportIndexIssue=false, reportMissingImports=false
+# pyright: reportOptionalMemberAccess=false, reportOptionalSubscript=false
+# pyright: reportPossiblyUnboundVariable=false, reportReturnType=false
 
 """Pipelined BF16 Wan convolution using the public CUTLASS DSL runtime.
 
@@ -51,26 +56,27 @@ The deprecated scheduler is intentionally the installed 4.7.1 wheel API.
 """
 
 import argparse
-from dataclasses import dataclass
-from collections.abc import Callable
-from functools import lru_cache
 import math
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import torch
 
 os.environ.setdefault("CUTE_DSL_DUMP_DIR", str(Path(__file__).resolve().parent))
 
-import cutlass
 import ctypes
 from collections.abc import Sequence
-from cutlass._mlir import ir
-from cutlass.experimental import primitives as prims
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor
-import cutlass.experimental.cuda as cuda
+
+import cutlass
 from cuda.bindings import driver
+from cutlass import cute
+from cutlass._mlir import ir
+from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor
+from cutlass.experimental import cuda
+from cutlass.experimental import primitives as prims
 from cutlass.utils import PersistentTileSchedulerParams, StaticPersistentTileScheduler
 
 if __package__:
@@ -113,9 +119,7 @@ class _HostTensorMap:
         self.box_dims = box_dims
         self.swizzle = swizzle
         self._owner = owner
-        self._storage = ctypes.create_string_buffer(
-            _DESCRIPTOR_BYTES + _DESCRIPTOR_ALIGNMENT - 1
-        )
+        self._storage = ctypes.create_string_buffer(_DESCRIPTOR_BYTES + _DESCRIPTOR_ALIGNMENT - 1)
         self._address = (ctypes.addressof(self._storage) + 63) & ~63
         self._pointer = ctypes.c_void_p(self._address)
         self._encoded = False
@@ -127,10 +131,7 @@ class _HostTensorMap:
 
     def __repr__(self) -> str:
         # Exclude address, owner and fake/real state from compilation identity.
-        return (
-            f"_HostTensorMap({self.dtype.__name__},"
-            f"box_dims={self.box_dims},swizzle={self.swizzle.name})"
-        )
+        return f"_HostTensorMap({self.dtype.__name__},box_dims={self.box_dims},swizzle={self.swizzle.name})"
 
     def __c_pointers__(self) -> list[int]:
         """Marshal one retained pointer slot for the default JIT executor."""
@@ -146,9 +147,7 @@ class _HostTensorMap:
         """Reconstruct the public device handle, retaining static box metadata."""
         if len(values) != 1:
             raise ValueError("A tensor map requires exactly one MLIR value")
-        return cuda.TensorMap(
-            values[0], dtype=self.dtype, box_dims=self.box_dims, swizzle=self.swizzle
-        )
+        return cuda.TensorMap(values[0], dtype=self.dtype, box_dims=self.box_dims, swizzle=self.swizzle)
 
 
 def _contiguous_tma_layout(
@@ -173,9 +172,7 @@ def _contiguous_tma_layout(
     return dims, tuple(strides)
 
 
-def _integers(
-    values: Sequence[int], name: str, lower: int, upper: int
-) -> tuple[int, ...]:
+def _integers(values: Sequence[int], name: str, lower: int, upper: int) -> tuple[int, ...]:
     result = tuple(values)
     if any(type(x) is not int or not lower <= x <= upper for x in result):
         raise ValueError(f"{name} must contain integers in [{lower}, {upper}]")
@@ -197,13 +194,10 @@ def _validate_layout(
         raise ValueError("Expected rank 1..5 and rank-1 global byte strides")
     if any(s % 16 for s in strides):
         raise ValueError("Global byte strides must be multiples of 16")
-    if not (fake and global_address is None):
-        if (
-            type(global_address) is not int
-            or not 0 < global_address < 2**64
-            or global_address % 16
-        ):
-            raise ValueError("global_address must be a nonzero 16-byte-aligned pointer")
+    if not (fake and global_address is None) and (
+        type(global_address) is not int or not 0 < global_address < 2**64 or global_address % 16
+    ):
+        raise ValueError("global_address must be a nonzero 16-byte-aligned pointer")
     return dims, strides
 
 
@@ -227,9 +221,7 @@ def _driver_library() -> ctypes.CDLL:
     try:
         library = ctypes.CDLL("libcuda.so.1")
     except OSError as exc:
-        raise RuntimeError(
-            "Tensor-map encoding requires the NVIDIA libcuda.so.1 driver"
-        ) from exc
+        raise RuntimeError("Tensor-map encoding requires the NVIDIA libcuda.so.1 driver") from exc
     u32p = ctypes.POINTER(ctypes.c_uint32)
     u64p = ctypes.POINTER(ctypes.c_uint64)
     i32p = ctypes.POINTER(ctypes.c_int32)
@@ -244,16 +236,12 @@ def _driver_library() -> ctypes.CDLL:
     suffix = [u32p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
     library.cuTensorMapEncodeTiled.argtypes = prefix + [u32p] + suffix
     library.cuTensorMapEncodeTiled.restype = ctypes.c_int
-    library.cuTensorMapEncodeIm2col.argtypes = (
-        prefix + [i32p, i32p, ctypes.c_uint32, ctypes.c_uint32] + suffix
-    )
+    library.cuTensorMapEncodeIm2col.argtypes = prefix + [i32p, i32p, ctypes.c_uint32, ctypes.c_uint32] + suffix
     library.cuTensorMapEncodeIm2col.restype = ctypes.c_int
     return library
 
 
-def _check_encoding(
-    result: int, name: str, descriptor: _HostTensorMap
-) -> _HostTensorMap:
+def _check_encoding(result: int, name: str, descriptor: _HostTensorMap) -> _HostTensorMap:
     if result != 0:
         raise RuntimeError(f"{name} failed with CUresult {result}")
     descriptor._encoded = True
@@ -284,9 +272,7 @@ def _create_tensor_map_im2col(
     describe an NZPQK IM2COL output store. Metadata box_dims=(channels,pixels)
     describes the shared-memory tile, not the rank of the global tensor.
     """
-    dims, strides = _validate_layout(
-        global_address, dtype, global_dims, global_strides, fake
-    )
+    dims, strides = _validate_layout(global_address, dtype, global_dims, global_strides, fake)
     rank = len(dims)
     if rank not in (3, 4, 5):
         raise ValueError("IM2COL requires tensor rank 3, 4 or 5")
@@ -308,9 +294,7 @@ def _create_tensor_map_im2col(
     if len(traversal) != rank:
         raise ValueError("Expected rank traversal strides")
     swizzle = _validate_swizzle(dtype, channels_per_pixel, swizzle)
-    descriptor = _HostTensorMap(
-        dtype, (channels_per_pixel, pixels_per_column), swizzle, owner
-    )
+    descriptor = _HostTensorMap(dtype, (channels_per_pixel, pixels_per_column), swizzle, owner)
     if fake:
         return descriptor
     result = _driver_library().cuTensorMapEncodeIm2col(
@@ -349,9 +333,7 @@ def _create_tensor_map_tiled(
     For KTRSC weights use dims=(C,S,R,T,K), box=(k_tile,1,1,1,n_per_cta).
     ``fake=True`` accepts global_address=None and performs no driver calls.
     """
-    dims, strides = _validate_layout(
-        global_address, dtype, global_dims, global_strides, fake
-    )
+    dims, strides = _validate_layout(global_address, dtype, global_dims, global_strides, fake)
     rank = len(dims)
     box = _integers(box_dims, "box_dims", 1, 256)
     if len(box) != rank:
@@ -451,55 +433,31 @@ def kernel(
             or stride_dhw != (1, 1, 1)
             or dilation_dhw != (1, 1, 1)
         ):
-            raise ValueError(
-                "Packed gather requires C12 input and unpadded unit-stride 3x3x3"
-            )
+            raise ValueError("Packed gather requires C12 input and unpadded unit-stride 3x3x3")
         if cutlass.const_expr(zpq != tuple(d - 2 for d in packed_shape[1:])):
-            raise ValueError(
-                "Packed gather output geometry must match the padded input"
-            )
+            raise ValueError("Packed gather output geometry must match the padded input")
     if cutlass.const_expr(FUSE_NORM):
         if cutlass.const_expr(mma_tiler[1] != 160):
             raise ValueError("Fused normalization requires tileN=160")
         if cutlass.const_expr(conv_bias is None or gamma is None):
             raise ValueError("Fused normalization requires conv_bias and gamma")
-        if cutlass.const_expr(
-            conv_bias.element_type != cutlass.BFloat16
-            or gamma.element_type != cutlass.BFloat16
-        ):
+        if cutlass.const_expr(conv_bias.element_type != cutlass.BFloat16 or gamma.element_type != cutlass.BFloat16):
             raise TypeError("Fused conv_bias and gamma must be BF16")
-        if cutlass.const_expr(
-            conv_bias.shape not in ((160,), (320,)) or gamma.shape != conv_bias.shape
-        ):
-            raise ValueError(
-                "Fused conv_bias and gamma must have shape (160,) or (320,)"
-            )
+        if cutlass.const_expr(conv_bias.shape not in ((160,), (320,)) or gamma.shape != conv_bias.shape):
+            raise ValueError("Fused conv_bias and gamma must have shape (160,) or (320,)")
     if cutlass.const_expr(PREP_SHAPE is not None):
         if cutlass.const_expr(not FUSE_NORM or packed_shape is not None):
             raise ValueError("Next-convolution preparation requires normalization")
-        if cutlass.const_expr(
-            prep_padded is None or prep_cache is None or prep_previous is None
-        ):
+        if cutlass.const_expr(prep_padded is None or prep_cache is None or prep_previous is None):
             raise ValueError("Preparation requires padded, cache and history tensors")
-    if cutlass.const_expr(residual is not None):
-        if cutlass.const_expr(
-            SPATIAL_SHAPE is None and (PREP_SHAPE is None or prep_residual is None)
-        ):
-            raise ValueError(
-                "Residual fusion requires preparation and a saved-sum output"
-            )
-    if cutlass.const_expr(SPATIAL_SHAPE is not None):
-        if cutlass.const_expr(
-            FUSE_NORM
-            or PREP_SHAPE is not None
-            or residual is None
-            or conv_bias is None
-            or prep_padded is None
-        ):
-            raise ValueError(
-                "Spatial residual output requires bias/residual "
-                "and output without norm/history"
-            )
+    if cutlass.const_expr(residual is not None):  # noqa: SIM102 - preserve DSL specialization guard
+        if cutlass.const_expr(SPATIAL_SHAPE is None and (PREP_SHAPE is None or prep_residual is None)):
+            raise ValueError("Residual fusion requires preparation and a saved-sum output")
+    if cutlass.const_expr(
+        SPATIAL_SHAPE is not None
+        and (FUSE_NORM or PREP_SHAPE is not None or residual is None or conv_bias is None or prep_padded is None)
+    ):
+        raise ValueError("Spatial residual output requires bias/residual and output without norm/history")
 
     norm_channels: cutlass.Constexpr = gamma.shape[0] if FUSE_NORM else 160
     paired_norm: cutlass.Constexpr = FUSE_NORM and norm_channels == 320
@@ -518,11 +476,7 @@ def kernel(
     # ranks {2G, 2G+1} with its leader at the even rank 2G. _cta_group is the
     # matching nvvm enum.
     _atom_thr = 2 if cutlass.const_expr(use_2cta_instrs) else 1
-    _cta_group = (
-        prims.CTAGroup.CTA_2
-        if cutlass.const_expr(use_2cta_instrs)
-        else prims.CTAGroup.CTA_1
-    )
+    _cta_group = prims.CTAGroup.CTA_2 if cutlass.const_expr(use_2cta_instrs) else prims.CTAGroup.CTA_1
     if cutlass.const_expr(use_2cta_instrs):
         # 2-CTA group leader = even cluster rank (covers multi-group clusters,
         # e.g. cluster_m > 2, where group 1's leader sits at rank 2).
@@ -540,9 +494,7 @@ def kernel(
         _commit_mask = None
 
     # Wide TMEM loads let four lanes share each fused-normalization row.
-    epilogue_warp_ids = tuple(
-        range((16 if residual is not None or paired_norm else 8) if FUSE_NORM else 4)
-    )
+    epilogue_warp_ids = tuple(range((16 if residual is not None or paired_norm else 8) if FUSE_NORM else 4))
     mma_warp_id = len(epilogue_warp_ids)
     tma_warp_id = mma_warp_id + 1
 
@@ -570,21 +522,11 @@ def kernel(
     # cutlass.Array offsets an element/byte view with
     # ``.subview(n)`` and hands out a raw Pointer with ``.data_ptr(n)`` (the
     # latter is masked for bit-24 CTA_2 routing).
-    ab_full_mbar_ptr = cutlass.Array(
-        cutlass.Int64, num_ab_stage, space=cutlass.AddressSpace.smem
-    )
-    ab_empty_mbar_ptr = cutlass.Array(
-        cutlass.Int64, num_ab_stage, space=cutlass.AddressSpace.smem
-    )
-    acc_full_mbar_ptr = cutlass.Array(
-        cutlass.Int64, num_acc_stage, space=cutlass.AddressSpace.smem
-    )
-    acc_empty_mbar_ptr = cutlass.Array(
-        cutlass.Int64, num_acc_stage, space=cutlass.AddressSpace.smem
-    )
-    tmem_dealloc_mbar_ptr = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem
-    )
+    ab_full_mbar_ptr = cutlass.Array(cutlass.Int64, num_ab_stage, space=cutlass.AddressSpace.smem)
+    ab_empty_mbar_ptr = cutlass.Array(cutlass.Int64, num_ab_stage, space=cutlass.AddressSpace.smem)
+    acc_full_mbar_ptr = cutlass.Array(cutlass.Int64, num_acc_stage, space=cutlass.AddressSpace.smem)
+    acc_empty_mbar_ptr = cutlass.Array(cutlass.Int64, num_acc_stage, space=cutlass.AddressSpace.smem)
+    tmem_dealloc_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem)
 
     # Per-CTA per-stage SMEM byte sizes; host descriptors must agree.
@@ -619,9 +561,7 @@ def kernel(
     )
 
     if cutlass.const_expr(paired_norm):
-        norm_params = cutlass.Array(
-            cutlass.BFloat16, 640, space=cutlass.AddressSpace.smem, alignment=16
-        )
+        norm_params = cutlass.Array(cutlass.BFloat16, 640, space=cutlass.AddressSpace.smem, alignment=16)
         if tidx < 160:
             norm_params.store(
                 (conv_bias.iterator.raw_ptr() + tidx * 2).load(count=2, alignment=4),
@@ -634,27 +574,23 @@ def kernel(
         # Publish ordinary SMEM loads independently of the async TMA barriers.
         prims.barrier_cta_sync(
             3,
-            thread_count=32
-            * (len(epilogue_warp_ids) + 2 + (4 if PREP_SHAPE is not None else 0)),
+            thread_count=32 * (len(epilogue_warp_ids) + 2 + (4 if PREP_SHAPE is not None else 0)),
         )
 
     # mbarrier_init: one warp / one lane initializes every barrier.
     # Each epilogue warp in each cooperating CTA releases the accumulator.
     num_acc_empty_arrives = len(epilogue_warp_ids) * (2 if use_2cta_instrs else 1)
-    if warp_idx == 0:
-        if prims.elect_sync():
-            prims.mbarrier_init(tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE)
-            for i in cutlass.range_constexpr(num_acc_stage):
-                prims.mbarrier_init(
-                    acc_empty_mbar_ptr.subview(i), num_acc_empty_arrives
-                )
-                prims.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
-            for i in cutlass.range_constexpr(num_ab_stage):
-                prims.mbarrier_init(
-                    ab_full_mbar_ptr.subview(i),
-                    128 if packed_shape is not None else 1,
-                )
-                prims.mbarrier_init(ab_empty_mbar_ptr.subview(i), 1)
+    if warp_idx == 0 and prims.elect_sync():
+        prims.mbarrier_init(tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE)
+        for i in cutlass.range_constexpr(num_acc_stage):
+            prims.mbarrier_init(acc_empty_mbar_ptr.subview(i), num_acc_empty_arrives)
+            prims.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
+        for i in cutlass.range_constexpr(num_ab_stage):
+            prims.mbarrier_init(
+                ab_full_mbar_ptr.subview(i),
+                128 if packed_shape is not None else 1,
+            )
+            prims.mbarrier_init(ab_empty_mbar_ptr.subview(i), 1)
 
     # Cluster sync sandwich: fence_mbarrier_init publishes the mbarrier_init
     # writes to the cluster; barrier_cluster_arrive_relaxed signals this CTA is
@@ -683,9 +619,7 @@ def kernel(
     mma_kind = prims.Tcgen05MMAKind.F16
 
     # Persistent tile scheduler.
-    tile_sched = StaticPersistentTileScheduler.create(
-        tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-    )
+    tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
     work_tile = tile_sched.initial_work_tile_info()
 
     # tcgen05 TMEM allocation knob (always 512 cols on Blackwell).
@@ -724,9 +658,7 @@ def kernel(
     # The filter coord (s, r, t) and C-element offset are loop-carried and
     # advanced by a colexicographic carry (add + compare + conditional reset),
     # so the loop body never divides the linear k by T*R*S.
-    producer_warp_end = (
-        9 if cutlass.const_expr(packed_shape is not None) else tma_warp_id + 1
-    )
+    producer_warp_end = 9 if cutlass.const_expr(packed_shape is not None) else tma_warp_id + 1
     auxiliary_threads = 64 if FUSE_NORM and not paired_norm else 128
     if warp_idx >= producer_warp_end:
         if cutlass.const_expr(SPATIAL_SHAPE is not None):
@@ -735,9 +667,7 @@ def kernel(
             border_rows = h + w + 1
             bx, by, bz = cute.arch.block_idx()
             gx, gy, gz = cute.arch.grid_dim()
-            linear_cta = cutlass.Int64(bx) + cutlass.Int64(gx) * (
-                cutlass.Int64(by) + cutlass.Int64(gy) * bz
-            )
+            linear_cta = cutlass.Int64(bx) + cutlass.Int64(gx) * (cutlass.Int64(by) + cutlass.Int64(gy) * bz)
             total_ctas = cutlass.Int64(gx) * gy * gz
             vector_idx = linear_cta * auxiliary_threads + tidx - producer_warp_end * 32
             while vector_idx < batches * z * border_rows * (channels // 8):
@@ -773,13 +703,9 @@ def kernel(
             # Row/vector coordinates fit in 32 bits for encoder shapes. Widen
             # only element offsets, which can exceed 2 Gi elements after padding.
             index_type: cutlass.Constexpr = (
-                cutlass.Int32
-                if batches * auxiliary_rows * (norm_channels // 8) < 2**31
-                else cutlass.Int64
+                cutlass.Int32 if batches * auxiliary_rows * (norm_channels // 8) < 2**31 else cutlass.Int64
             )
-            linear_cta = cutlass.Int64(bx) + cutlass.Int64(gx) * (
-                cutlass.Int64(by) + cutlass.Int64(gy) * bz
-            )
+            linear_cta = cutlass.Int64(bx) + cutlass.Int64(gx) * (cutlass.Int64(by) + cutlass.Int64(gy) * bz)
             total_ctas = cutlass.Int64(gx) * gy * gz
             vector_idx = linear_cta * auxiliary_threads + tidx - producer_warp_end * 32
             while vector_idx < batches * auxiliary_rows * (norm_channels // 8):
@@ -806,56 +732,27 @@ def kernel(
                         pw = (border - 2 * padded_w) % 2 * (Q_out + 1)
                 values = cutlass.vector.full((8,), 0, cutlass.BFloat16)
                 valid_spatial = ph > 0 and ph <= P_out and pw > 0 and pw <= Q_out
-                if cutlass.const_expr(previous_frames > 0):
+                if cutlass.const_expr(previous_frames > 0):  # noqa: SIM102 - preserve DSL specialization guard
                     if pt < 2 and pt >= 2 - previous_frames and valid_spatial:
                         source = (
-                            (
-                                (
-                                    cutlass.Int64(batch) * previous_frames
-                                    + pt
-                                    - 2
-                                    + previous_frames
-                                )
-                                * P_out
-                                + ph
-                                - 1
-                            )
+                            ((cutlass.Int64(batch) * previous_frames + pt - 2 + previous_frames) * P_out + ph - 1)
                             * Q_out
                             + pw
                             - 1
                         ) * norm_channels + channel
-                        values = (prep_previous.iterator.raw_ptr() + source).load(
-                            count=8, alignment=16
-                        )
+                        values = (prep_previous.iterator.raw_ptr() + source).load(count=8, alignment=16)
                         if pt - 2 >= Z_out - cache_frames:
                             cache_offset = (
-                                (
-                                    (
-                                        cutlass.Int64(batch) * cache_frames
-                                        + pt
-                                        - 2
-                                        - Z_out
-                                        + cache_frames
-                                    )
-                                    * P_out
-                                    + ph
-                                    - 1
-                                )
+                                ((cutlass.Int64(batch) * cache_frames + pt - 2 - Z_out + cache_frames) * P_out + ph - 1)
                                 * Q_out
                                 + pw
                                 - 1
                             ) * norm_channels + channel
-                            (prep_cache.iterator.raw_ptr() + cache_offset).store(
-                                values, alignment=16
-                            )
+                            (prep_cache.iterator.raw_ptr() + cache_offset).store(values, alignment=16)
                 destination = (
-                    ((cutlass.Int64(batch) * (Z_out + 2) + pt) * padded_h + ph)
-                    * padded_w
-                    + pw
+                    ((cutlass.Int64(batch) * (Z_out + 2) + pt) * padded_h + ph) * padded_w + pw
                 ) * norm_channels + channel
-                (prep_padded.iterator.raw_ptr() + destination).store(
-                    values, alignment=16
-                )
+                (prep_padded.iterator.raw_ptr() + destination).store(values, alignment=16)
                 vector_idx += total_ctas * auxiliary_threads
     elif warp_idx >= tma_warp_id:
         if cutlass.const_expr(packed_shape is not None):
@@ -873,9 +770,7 @@ def kernel(
                 for k in cutlass.range(7, unroll=1):
                     full = ab_full_mbar_ptr.subview(ab_stage_idx)
                     empty = ab_empty_mbar_ptr.subview(ab_stage_idx)
-                    while not prims.mbarrier_try_wait_parity(
-                        empty, ab_empty_phase_bit, time_limit=10000000
-                    ):
+                    while not prims.mbarrier_try_wait_parity(empty, ab_empty_phase_bit, time_limit=10000000):
                         pass
                     if producer_tid == 0:
                         prims.mbarrier_expect_tx(full, b_bytes_per_stage)
@@ -910,14 +805,7 @@ def kernel(
                         source_bytes = cutlass.Int32(0)
                         if row < total_rows and tap < 27:
                             offset = cutlass.Int64(
-                                (
-                                    ((batch * input_t + z + dt) * input_h + p + dh)
-                                    * input_w
-                                    + q
-                                    + dw
-                                )
-                                * 16
-                                + channel
+                                (((batch * input_t + z + dt) * input_h + p + dh) * input_w + q + dw) * 16 + channel
                             )
                             source_bytes = cutlass.Int32(16)
                         swizzled = local_row * 64 + (local_k ^ (local_row % 8 * 8))
@@ -955,8 +843,7 @@ def kernel(
                     # M index for this CTA's portion of the M-tile.
                     m_off_cta = (
                         mma_tile_coord_mnl[0] * mma_tiler[0]
-                        + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0)
-                        * mma_tiler_per_cta_m
+                        + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
                     )
                     # Output (n, z, p, q) from linear M (col-major Q-fastest).
                     n_idx = m_off_cta // (Q_out * P_out * Z_out)
@@ -972,8 +859,7 @@ def kernel(
                     # B side: per-CTA N offset (KTRSC tiled descriptor consumes this).
                     n_off_cta = (
                         mma_tile_coord_mnl[1] * mma_tiler[1]
-                        + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0)
-                        * n_per_cta
+                        + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * n_per_cta
                     )
 
                     # Filter coord (s, r, t) + C-chunk, carried across K-tiles and
@@ -992,9 +878,7 @@ def kernel(
                         # try_wait_parity issues a single non-blocking attempt that may
                         # hardware-suspend up to time_limit then return False;
                         # a blocking wait must retry in a loop.
-                        while not prims.mbarrier_try_wait_parity(
-                            mbar_empty, ab_empty_phase_bit, time_limit=10000000
-                        ):
+                        while not prims.mbarrier_try_wait_parity(mbar_empty, ab_empty_phase_bit, time_limit=10000000):
                             pass
 
                         # Filter/C offsets from the carried colex coord (no division).
@@ -1017,9 +901,7 @@ def kernel(
                             # is_leader_cta is constexpr-True, so every CTA counts its
                             # own (undoubled) bytes on its own mbar.
                             if is_leader_cta:
-                                prims.mbarrier_arrive_expect_tx(
-                                    mbar_full, num_tma_copy_bytes
-                                )
+                                prims.mbarrier_arrive_expect_tx(mbar_full, num_tma_copy_bytes)
                             # Per-CTA unicast load; _cta_group selects the 1-/2-CTA
                             # tcgen05 group (identical coords/box on both paths).
                             prims.cp_async_bulk_tensor_shared_cluster_global(
@@ -1144,12 +1026,8 @@ def kernel(
                     # int advances the raw column id directly, with no element/byte
                     # scaling. Each acc stage owns a full mma_tiler[1]-wide column
                     # band, so the per-stage stride is exactly mma_tiler[1] columns.
-                    tmem_ptr_for_mma = (
-                        tmem_ptr.data_ptr() + current_acc_stage * mma_tiler[1]
-                    )
-                    tmem_ptr_curr = cutlass.Array(
-                        tmem_ptr_for_mma, dtype=cutlass.Int32, addrspace=6
-                    )
+                    tmem_ptr_for_mma = tmem_ptr.data_ptr() + current_acc_stage * mma_tiler[1]
+                    tmem_ptr_curr = cutlass.Array(tmem_ptr_for_mma, dtype=cutlass.Int32, addrspace=6)
 
                     # scale_d=False (overwrite) only on the very first MMA of this
                     # C-tile's K-loop; True (accumulate) for every subsequent MMA.
@@ -1159,9 +1037,7 @@ def kernel(
                     # the partially-unrolled K-tile loop.
                     for k_idx in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         ab_full_mbar_ptr_stage = ab_full_mbar_ptr.subview(ab_stage_idx)
-                        ab_empty_mbar_ptr_stage = ab_empty_mbar_ptr.subview(
-                            ab_stage_idx
-                        )
+                        ab_empty_mbar_ptr_stage = ab_empty_mbar_ptr.subview(ab_stage_idx)
 
                         # Wait for producer (TMA warp) to fill this AB stage.
                         # try_wait_parity is one non-blocking attempt; loop until the
@@ -1246,9 +1122,7 @@ def kernel(
     # ---- Epilogue warps: raw 0-3, fused 0-7 ----
     elif warp_idx < mma_warp_id:
         # Per-CTA M tile size — 2cta cluster halves mma_tiler[0] across the pair.
-        mma_tiler_per_cta_m = (
-            mma_tiler[0] // 2 if cutlass.const_expr(use_2cta_instrs) else mma_tiler[0]
-        )
+        mma_tiler_per_cta_m = mma_tiler[0] // 2 if cutlass.const_expr(use_2cta_instrs) else mma_tiler[0]
         # Raw warps own 32 rows; fused warps own 16 channel-cooperative rows.
         subtile_n = _epi_subtile_n
         subtile_cnt = mma_tiler[1] // subtile_n
@@ -1301,12 +1175,8 @@ def kernel(
             if cutlass.const_expr(paired_norm):
                 # Both N160 halves belong to this M task. Keep BF16 N0 values
                 # and contiguous-channel FP32 partials live until N1 arrives.
-                retained = cutlass.Array(
-                    cutlass.Uint32, 40, space=cutlass.AddressSpace.rmem
-                )
-                partials = cutlass.Array(
-                    cutlass.Float32, 32, space=cutlass.AddressSpace.rmem
-                )
+                retained = cutlass.Array(cutlass.Uint32, 40, space=cutlass.AddressSpace.rmem)
+                partials = cutlass.Array(cutlass.Float32, 32, space=cutlass.AddressSpace.rmem)
             for channel_half in cutlass.range_constexpr(2 if paired_norm else 1):
                 current_acc_stage = acc_stage_idx
                 acc_full_mbar_ptr_stage = acc_full_mbar_ptr.subview(current_acc_stage)
@@ -1337,9 +1207,7 @@ def kernel(
 
                 # Per-stage TMEM column origin. Lower 16 bits of tmem_raw_addr is
                 # the column id; upper 16 bits is the row id (always 0 for warp 0).
-                base_col_id = (tmem_raw_addr & 0xFFFF) + (
-                    current_acc_stage * mma_tiler[1]
-                )
+                base_col_id = (tmem_raw_addr & 0xFFFF) + (current_acc_stage * mma_tiler[1])
 
                 # Per-tile output (im2col store) spatial coords. The 2CTA cluster
                 # splits M (the NZPQ pixel axis) across the pair, so the spatial
@@ -1348,8 +1216,7 @@ def kernel(
                 # over the full N columns.
                 m_off_cta = (
                     mma_tile_coord_mnl[0] * mma_tiler[0]
-                    + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0)
-                    * mma_tiler_per_cta_m
+                    + (cta_rank_in_cluster % _atom_thr if use_2cta_instrs else 0) * mma_tiler_per_cta_m
                 )
                 # Bare output pixels (col-major Q-fastest). No pad/stride: the C
                 # descriptor uses zero corners, so output has no halo concept.
@@ -1365,9 +1232,7 @@ def kernel(
                 if cutlass.const_expr(FUSE_NORM):
                     # Residual loads need more latency hiding: sixteen warps own
                     # one row/lane, versus eight warps and two rows for norm-only.
-                    rows_per_lane: cutlass.Constexpr = (
-                        1 if residual is not None or paired_norm else 2
-                    )
+                    rows_per_lane: cutlass.Constexpr = 1 if residual is not None or paired_norm else 2
                     lane = tidx % 32
                     lane_col = lane % 4
                     # Warp rank modulo four fixes the accessible 32-row TMEM band.
@@ -1384,34 +1249,24 @@ def kernel(
                         # Drain before global residual traffic. Reuse the same packed
                         # words for raw values, then overwrite them with summed values.
                         for drain_subtile in cutlass.range_constexpr(5):
-                            drain_addr = (((tmem_raw_addr >> 16) + row_base) << 16) | (
-                                base_col_id + drain_subtile * 32
-                            )
+                            drain_addr = (((tmem_raw_addr >> 16) + row_base) << 16) | (base_col_id + drain_subtile * 32)
                             drain_ptr = cutlass.inttoptr(drain_addr, 6, cutlass.Float32)
                             drain_values = prims.tcgen05_ld("16x256b", drain_ptr, num=4)
                             prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                            drain_selected = cutlass.Array(
-                                cutlass.BFloat16, 8, space=cutlass.AddressSpace.rmem
-                            )
+                            drain_selected = cutlass.Array(cutlass.BFloat16, 8, space=cutlass.AddressSpace.rmem)
                             if drain_half == 0:
                                 for j in cutlass.range_constexpr(8):
-                                    drain_selected[j] = drain_values[
-                                        (j // 2) * 4 + j % 2
-                                    ].to(cutlass.BFloat16)
+                                    drain_selected[j] = drain_values[(j // 2) * 4 + j % 2].to(cutlass.BFloat16)
                             else:
                                 for j in cutlass.range_constexpr(8):
-                                    drain_selected[j] = drain_values[
-                                        (j // 2) * 4 + j % 2 + 2
-                                    ].to(cutlass.BFloat16)
+                                    drain_selected[j] = drain_values[(j // 2) * 4 + j % 2 + 2].to(cutlass.BFloat16)
                             retained.store(
                                 drain_selected.load(0, 8).bitcast(cutlass.Uint32),
                                 (channel_half * 5 + drain_subtile) * 4,
                             )
                         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if prims.elect_sync():
-                            drain_leader = (
-                                cta_rank_in_cluster // _atom_thr
-                            ) * _atom_thr
+                            drain_leader = (cta_rank_in_cluster // _atom_thr) * _atom_thr
                             prims.mbarrier_arrive(
                                 prims.mapa(acc_empty_mbar_ptr_stage, drain_leader),
                                 count=1,
@@ -1433,36 +1288,26 @@ def kernel(
                             space=cutlass.AddressSpace.rmem,
                         )
                         if cutlass.const_expr(residual is None):
-                            norm_addr = (((tmem_raw_addr >> 16) + row_base) << 16) | (
-                                base_col_id + norm_subtile * 32
-                            )
+                            norm_addr = (((tmem_raw_addr >> 16) + row_base) << 16) | (base_col_id + norm_subtile * 32)
                             norm_ptr = cutlass.inttoptr(norm_addr, 6, cutlass.Float32)
                             norm_rmem = prims.tcgen05_ld("16x256b", norm_ptr, num=4)
                             prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
                             if cutlass.const_expr(paired_norm):
                                 if drain_half == 0:
                                     for j in cutlass.range_constexpr(8):
-                                        rounded[j] = norm_rmem[(j // 2) * 4 + j % 2].to(
-                                            cutlass.BFloat16
-                                        )
+                                        rounded[j] = norm_rmem[(j // 2) * 4 + j % 2].to(cutlass.BFloat16)
                                 else:
                                     for j in cutlass.range_constexpr(8):
-                                        rounded[j] = norm_rmem[
-                                            (j // 2) * 4 + j % 2 + 2
-                                        ].to(cutlass.BFloat16)
+                                        rounded[j] = norm_rmem[(j // 2) * 4 + j % 2 + 2].to(cutlass.BFloat16)
                             else:
                                 rounded.store(norm_rmem.to(cutlass.BFloat16), 0)
                         else:
                             rounded.store(
-                                retained.load(
-                                    (channel_half * 5 + norm_subtile) * 4, 4
-                                ).bitcast(cutlass.BFloat16),
+                                retained.load((channel_half * 5 + norm_subtile) * 4, 4).bitcast(cutlass.BFloat16),
                                 0,
                             )
                         math_width = 1 if paired_norm else 2
-                        for j in cutlass.range_constexpr(
-                            8 * rows_per_lane // math_width
-                        ):
+                        for j in cutlass.range_constexpr(8 * rows_per_lane // math_width):
                             scalar = j * math_width
                             channel = (
                                 channel_half * 160
@@ -1476,14 +1321,10 @@ def kernel(
                                     count=math_width, alignment=2 * math_width
                                 )
                             else:
-                                bias_pair = (
-                                    conv_bias.iterator.raw_ptr() + channel
-                                ).load(count=2, alignment=4)
+                                bias_pair = (conv_bias.iterator.raw_ptr() + channel).load(count=2, alignment=4)
                             value = rounded.load(scalar, math_width).to(cutlass.Float32)
                             rounded.store(
-                                (value + bias_pair.to(cutlass.Float32)).to(
-                                    cutlass.BFloat16
-                                ),
+                                (value + bias_pair.to(cutlass.Float32)).to(cutlass.BFloat16),
                                 scalar,
                             )
                         if cutlass.const_expr(residual is not None):
@@ -1491,35 +1332,22 @@ def kernel(
                                 skip_row = row_base + lane // 4 + drain_half * 8
                                 skip_pixel = cutlass.Int64(m_off_cta) + skip_row
                                 if skip_pixel < PREP_SHAPE[0] * Z_out * P_out * Q_out:
-                                    channel = (
-                                        channel_half * 160
-                                        + norm_subtile * 32
-                                        + pair * 8
-                                        + lane_col * 2
-                                    )
+                                    channel = channel_half * 160 + norm_subtile * 32 + pair * 8 + lane_col * 2
                                     offset = skip_pixel * norm_channels + channel
-                                    skip = (residual.iterator.raw_ptr() + offset).load(
-                                        count=2, alignment=4
-                                    )
+                                    skip = (residual.iterator.raw_ptr() + offset).load(count=2, alignment=4)
                                     if cutlass.const_expr(residual_bias is not None):
-                                        skip_bias = (
-                                            residual_bias.iterator.raw_ptr() + channel
-                                        ).load(count=2, alignment=4)
-                                        skip = (
-                                            skip.to(cutlass.Float32)
-                                            + skip_bias.to(cutlass.Float32)
-                                        ).to(cutlass.BFloat16)
+                                        skip_bias = (residual_bias.iterator.raw_ptr() + channel).load(
+                                            count=2, alignment=4
+                                        )
+                                        skip = (skip.to(cutlass.Float32) + skip_bias.to(cutlass.Float32)).to(
+                                            cutlass.BFloat16
+                                        )
                                     summed_pair = (
-                                        rounded.load(pair * 2, 2).to(cutlass.Float32)
-                                        + skip.to(cutlass.Float32)
+                                        rounded.load(pair * 2, 2).to(cutlass.Float32) + skip.to(cutlass.Float32)
                                     ).to(cutlass.BFloat16)
                                     rounded.store(summed_pair, pair * 2)
-                                    (prep_residual.iterator.raw_ptr() + offset).store(
-                                        summed_pair, alignment=4
-                                    )
-                        for j in cutlass.range_constexpr(
-                            8 * rows_per_lane // math_width
-                        ):
+                                    (prep_residual.iterator.raw_ptr() + offset).store(summed_pair, alignment=4)
+                        for j in cutlass.range_constexpr(8 * rows_per_lane // math_width):
                             scalar = j * math_width
                             value = rounded.load(scalar, math_width).to(cutlass.Float32)
                             # Torch accumulates c, c+128, c+256 independently
@@ -1527,22 +1355,10 @@ def kernel(
                             # Physical lanes retain two channels from each group
                             # of eight; neighboring pairs complete a virtual lane.
                             channel_group = (
-                                (
-                                    channel_half * 160
-                                    + norm_subtile * 32
-                                    + (scalar // (2 * rows_per_lane)) * 8
-                                )
-                                // 8
-                                % 16
+                                (channel_half * 160 + norm_subtile * 32 + (scalar // (2 * rows_per_lane)) * 8) // 8 % 16
                             )
-                            part = (
-                                ((scalar // 2) % rows_per_lane) * 32
-                                + channel_group * 2
-                                + scalar % 2
-                            )
-                            partials.store(
-                                partials.load(part, math_width) + value * value, part
-                            )
+                            part = ((scalar // 2) % rows_per_lane) * 32 + channel_group * 2 + scalar % 2
+                            partials.store(partials.load(part, math_width) + value * value, part)
                         retained.store(
                             rounded.load(0, 8 * rows_per_lane).bitcast(cutlass.Uint32),
                             (channel_half * 5 + norm_subtile) * 4 * rows_per_lane,
@@ -1553,25 +1369,15 @@ def kernel(
                     if cutlass.const_expr(residual is None):
                         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if prims.elect_sync():
-                            leader_cta_rank = (
-                                cta_rank_in_cluster // _atom_thr
-                            ) * _atom_thr
-                            mbar_cluster_ptr = prims.mapa(
-                                acc_empty_mbar_ptr_stage, leader_cta_rank
-                            )
-                            prims.mbarrier_arrive(
-                                mbar_cluster_ptr, count=1, scope=prims.MemScope.CLUSTER
-                            )
+                            leader_cta_rank = (cta_rank_in_cluster // _atom_thr) * _atom_thr
+                            mbar_cluster_ptr = prims.mapa(acc_empty_mbar_ptr_stage, leader_cta_rank)
+                            prims.mbarrier_arrive(mbar_cluster_ptr, count=1, scope=prims.MemScope.CLUSTER)
 
                     # Reconstruct Torch's contiguous-channel warp tree without
                     # changing the four-physical-lanes-per-row TMEM mapping.
-                    denominators = cutlass.Array(
-                        cutlass.Float32, rows_per_lane, space=cutlass.AddressSpace.rmem
-                    )
+                    denominators = cutlass.Array(cutlass.Float32, rows_per_lane, space=cutlass.AddressSpace.rmem)
                     for row_half in cutlass.range_constexpr(rows_per_lane):
-                        virtual_lanes = cutlass.Array(
-                            cutlass.Float32, 16, space=cutlass.AddressSpace.rmem
-                        )
+                        virtual_lanes = cutlass.Array(cutlass.Float32, 16, space=cutlass.AddressSpace.rmem)
                         for q in cutlass.range_constexpr(16):
                             lo = partials[row_half * 32 + q * 2]
                             hi = partials[row_half * 32 + q * 2 + 1]
@@ -1583,12 +1389,8 @@ def kernel(
                         for offset in cutlass.range_constexpr(4):
                             step = 8 >> offset
                             for q in cutlass.range_constexpr(step):
-                                virtual_lanes[q] = (
-                                    virtual_lanes[q] + virtual_lanes[q + step]
-                                )
-                        total = cute.arch.shuffle_sync(
-                            virtual_lanes[0], (lane // 4) * 4
-                        ) + cute.arch.shuffle_sync(
+                                virtual_lanes[q] = virtual_lanes[q] + virtual_lanes[q + step]
+                        total = cute.arch.shuffle_sync(virtual_lanes[0], (lane // 4) * 4) + cute.arch.shuffle_sync(
                             virtual_lanes[0], (lane // 4) * 4 + 2
                         )
                         denominator = cute.math.sqrt(total, fastmath=False)
@@ -1598,9 +1400,7 @@ def kernel(
 
                 if cutlass.const_expr(not paired_norm or channel_half == 1):
                     # Subtile loop on the N axis.
-                    for subtile_idx in cutlass.range(
-                        subtile_cnt * (2 if paired_norm else 1), unroll_full=FUSE_NORM
-                    ):
+                    for subtile_idx in cutlass.range(subtile_cnt * (2 if paired_norm else 1), unroll_full=FUSE_NORM):
                         # Rotate through C SMEM stages so the previous TMA store can
                         # drain in parallel with the next t2r/r2s.
                         epi_stage_idx = (epi_stage_idx + 1) % num_c_stage
@@ -1616,9 +1416,9 @@ def kernel(
                             prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
 
                         if cutlass.const_expr(FUSE_NORM):
-                            retained_values = retained.load(
-                                subtile_idx * 4 * rows_per_lane, 4 * rows_per_lane
-                            ).bitcast(cutlass.BFloat16)
+                            retained_values = retained.load(subtile_idx * 4 * rows_per_lane, 4 * rows_per_lane).bitcast(
+                                cutlass.BFloat16
+                            )
                             fused_rmem = cutlass.Array(
                                 c_dtype,
                                 8 * rows_per_lane,
@@ -1626,62 +1426,34 @@ def kernel(
                                 alignment=4,
                             )
                             math_width = 1 if paired_norm else 2
-                            for j in cutlass.range_constexpr(
-                                8 * rows_per_lane // math_width
-                            ):
+                            for j in cutlass.range_constexpr(8 * rows_per_lane // math_width):
                                 scalar = j * math_width
-                                col = (
-                                    subtile_idx * 32
-                                    + (scalar // (2 * rows_per_lane)) * 8
-                                    + lane_col * 2
-                                    + scalar % 2
-                                )
-                                value = retained_values[
-                                    scalar : scalar + math_width
-                                ].to(cutlass.Float32)
-                                normalized = (
-                                    value / denominators[(scalar // 2) % rows_per_lane]
-                                ).to(cutlass.BFloat16)
-                                scaled = (
-                                    normalized.to(cutlass.Float32)
-                                    * (norm_channels**0.5)
-                                ).to(cutlass.BFloat16)
+                                col = subtile_idx * 32 + (scalar // (2 * rows_per_lane)) * 8 + lane_col * 2 + scalar % 2
+                                value = retained_values[scalar : scalar + math_width].to(cutlass.Float32)
+                                normalized = (value / denominators[(scalar // 2) % rows_per_lane]).to(cutlass.BFloat16)
+                                scaled = (normalized.to(cutlass.Float32) * (norm_channels**0.5)).to(cutlass.BFloat16)
                                 if cutlass.const_expr(paired_norm):
-                                    gamma_pair = (
-                                        norm_params.data_ptr() + 320 + col
-                                    ).load(count=math_width, alignment=2 * math_width)
-                                else:
-                                    gamma_pair = (gamma.iterator.raw_ptr() + col).load(
-                                        count=2, alignment=4
+                                    gamma_pair = (norm_params.data_ptr() + 320 + col).load(
+                                        count=math_width, alignment=2 * math_width
                                     )
-                                affine = (
-                                    scaled.to(cutlass.Float32)
-                                    * gamma_pair.to(cutlass.Float32)
-                                ).to(cutlass.BFloat16)
+                                else:
+                                    gamma_pair = (gamma.iterator.raw_ptr() + col).load(count=2, alignment=4)
+                                affine = (scaled.to(cutlass.Float32) * gamma_pair.to(cutlass.Float32)).to(
+                                    cutlass.BFloat16
+                                )
                                 value = affine.to(cutlass.Float32)
-                                activated = (
-                                    value
-                                    / (1.0 + cute.math.exp(-value, fastmath=False))
-                                ).to(cutlass.BFloat16)
+                                activated = (value / (1.0 + cute.math.exp(-value, fastmath=False))).to(cutlass.BFloat16)
                                 fused_rmem.store(activated, scalar)
 
                         # Raw lanes store four 16B vectors. Fused lanes store eight
                         # adjacent BF16 pairs, distributed across four-lane row groups.
-                        smem_tile_base = sC.subview(
-                            epi_stage_idx * (_c_tile_rows * _epi_subtile_n)
-                        )
+                        smem_tile_base = sC.subview(epi_stage_idx * (_c_tile_rows * _epi_subtile_n))
                         if cutlass.const_expr(FUSE_NORM):
                             for pair in cutlass.range_constexpr(4 * rows_per_lane):
-                                row = (
-                                    row_base
-                                    + lane // 4
-                                    + (pair % rows_per_lane + drain_half) * 8
-                                )
+                                row = row_base + lane // 4 + (pair % rows_per_lane + drain_half) * 8
                                 col = (pair // rows_per_lane) * 8 + lane_col * 2
                                 vec_io = fused_rmem[pair * 2 : 2]
-                                smem_thr_ptr = smem_tile_base.subview(
-                                    row * subtile_n + col
-                                )
+                                smem_thr_ptr = smem_tile_base.subview(row * subtile_n + col)
                                 smem_thr_ptr.data_ptr().store_swizzled(
                                     vec_io,
                                     alignment=4,
@@ -1695,68 +1467,41 @@ def kernel(
                                     if batch < batches and time >= Z_out - cache_frames:
                                         cache_offset = (
                                             (
-                                                (
-                                                    batch * cache_frames
-                                                    + time
-                                                    - Z_out
-                                                    + cache_frames
-                                                )
-                                                * P_out
-                                                * Q_out
+                                                (batch * cache_frames + time - Z_out + cache_frames) * P_out * Q_out
                                                 + spatial
                                             )
                                             * norm_channels
                                             + subtile_idx * 32
                                             + col
                                         )
-                                        (
-                                            prep_cache.iterator.raw_ptr() + cache_offset
-                                        ).store(vec_io, alignment=4)
+                                        (prep_cache.iterator.raw_ptr() + cache_offset).store(vec_io, alignment=4)
                         else:
                             for j in cutlass.range_constexpr(32 // vsize):
-                                vec_io = t2r_rmem[j * vsize : j * vsize + vsize].to(
-                                    c_dtype
-                                )
+                                vec_io = t2r_rmem[j * vsize : j * vsize + vsize].to(c_dtype)
                                 if cutlass.const_expr(SPATIAL_SHAPE is not None):
                                     spatial_pixel = cutlass.Int64(m_off_cta) + tidx
-                                    spatial_channel = (
-                                        k_off_base + subtile_idx * subtile_n + j * vsize
-                                    )
-                                    if (
-                                        spatial_pixel
-                                        < SPATIAL_SHAPE[0] * Z_out * P_out * Q_out
-                                    ):
-                                        bias_vec = (
-                                            conv_bias.iterator.raw_ptr()
-                                            + spatial_channel
-                                        ).load(count=vsize, alignment=16)
-                                        vec_io = (
-                                            vec_io.to(cutlass.Float32)
-                                            + bias_vec.to(cutlass.Float32)
-                                        ).to(c_dtype)
+                                    spatial_channel = k_off_base + subtile_idx * subtile_n + j * vsize
+                                    if spatial_pixel < SPATIAL_SHAPE[0] * Z_out * P_out * Q_out:
+                                        bias_vec = (conv_bias.iterator.raw_ptr() + spatial_channel).load(
+                                            count=vsize, alignment=16
+                                        )
+                                        vec_io = (vec_io.to(cutlass.Float32) + bias_vec.to(cutlass.Float32)).to(c_dtype)
                                         spatial_skip = (
                                             residual.iterator.raw_ptr()
                                             + spatial_pixel * SPATIAL_SHAPE[1]
                                             + spatial_channel
                                         ).load(count=vsize, alignment=16)
-                                        if cutlass.const_expr(
-                                            residual_bias is not None
-                                        ):
+                                        if cutlass.const_expr(residual_bias is not None):
                                             spatial_skip_bias = (
-                                                residual_bias.iterator.raw_ptr()
-                                                + spatial_channel
+                                                residual_bias.iterator.raw_ptr() + spatial_channel
                                             ).load(count=vsize, alignment=16)
                                             spatial_skip = (
-                                                spatial_skip.to(cutlass.Float32)
-                                                + spatial_skip_bias.to(cutlass.Float32)
+                                                spatial_skip.to(cutlass.Float32) + spatial_skip_bias.to(cutlass.Float32)
                                             ).to(c_dtype)
-                                        vec_io = (
-                                            vec_io.to(cutlass.Float32)
-                                            + spatial_skip.to(cutlass.Float32)
-                                        ).to(c_dtype)
-                                smem_thr_ptr = smem_tile_base.subview(
-                                    tidx * subtile_n + j * vsize
-                                )
+                                        vec_io = (vec_io.to(cutlass.Float32) + spatial_skip.to(cutlass.Float32)).to(
+                                            c_dtype
+                                        )
+                                smem_thr_ptr = smem_tile_base.subview(tidx * subtile_n + j * vsize)
                                 smem_thr_ptr.data_ptr().store_swizzled(
                                     vec_io,
                                     alignment=16,
@@ -1765,31 +1510,22 @@ def kernel(
 
                         # Make swizzled SMEM stores visible to the TMA proxy.
                         cute.arch.fence_view_async_shared()
-                        prims.barrier_cta_sync(
-                            epilog_sync_bar_id, thread_count=threads_in_epilogue
-                        )
+                        prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
 
                         # One issuer owns the TMA store, commit, and wait sequence.
-                        if warp_idx == epilogue_warp_ids[0]:
-                            if store_issuer:
-                                k_off = (
-                                    0 if paired_norm else k_off_base
-                                ) + subtile_idx * subtile_n
-                                prims.cp_async_bulk_tensor_global_shared_cta(
-                                    tma_c_desc.get_ptr(),
-                                    smem_tile_base,
-                                    (k_off, q_out, p_out, z_out, n_out),
-                                    mode=prims.TMAStoreMode.IM2COL,
-                                )
-                                prims.cp_async_bulk_commit_group()
-                                # Bound outstanding reads before the next SMEM reuse.
-                                prims.cp_async_bulk_wait_group(
-                                    num_c_stage - 1, read=True
-                                )
+                        if warp_idx == epilogue_warp_ids[0] and store_issuer:
+                            k_off = (0 if paired_norm else k_off_base) + subtile_idx * subtile_n
+                            prims.cp_async_bulk_tensor_global_shared_cta(
+                                tma_c_desc.get_ptr(),
+                                smem_tile_base,
+                                (k_off, q_out, p_out, z_out, n_out),
+                                mode=prims.TMAStoreMode.IM2COL,
+                            )
+                            prims.cp_async_bulk_commit_group()
+                            # Bound outstanding reads before the next SMEM reuse.
+                            prims.cp_async_bulk_wait_group(num_c_stage - 1, read=True)
 
-                        prims.barrier_cta_sync(
-                            epilog_sync_bar_id, thread_count=threads_in_epilogue
-                        )
+                        prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
 
                 # All lanes must order completed TMEM loads before releasing it.
                 if cutlass.const_expr(not FUSE_NORM):
@@ -1803,9 +1539,7 @@ def kernel(
                 # CTA's own rank (count 4, own mbar).
                 if cutlass.const_expr(not FUSE_NORM) and prims.elect_sync():
                     leader_cta_rank = (cta_rank_in_cluster // _atom_thr) * _atom_thr
-                    mbar_cluster_ptr = prims.mapa(
-                        acc_empty_mbar_ptr_stage, leader_cta_rank
-                    )
+                    mbar_cluster_ptr = prims.mapa(acc_empty_mbar_ptr_stage, leader_cta_rank)
                     prims.mbarrier_arrive(
                         mbar_cluster_ptr,
                         count=1,
@@ -1816,9 +1550,8 @@ def kernel(
             work_tile = tile_sched.get_current_work()
 
         # The issuing lane drains global writes, not only SMEM reads.
-        if warp_idx == epilogue_warp_ids[0]:
-            if store_issuer:
-                prims.cp_async_bulk_wait_group(0, read=False)
+        if warp_idx == epilogue_warp_ids[0] and store_issuer:
+            prims.cp_async_bulk_wait_group(0, read=False)
 
         # All epilogue readers must finish before the allocator frees TMEM.
         prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
@@ -1845,9 +1578,7 @@ def kernel(
                 # Wait until peer also signalled, then physically free the TMEM.
                 # try_wait_parity is one non-blocking attempt; loop until the
                 # peer's arrive advances the phase.
-                while not prims.mbarrier_try_wait_parity(
-                    tmem_dealloc_mbar_ptr, 0, time_limit=10000000
-                ):
+                while not prims.mbarrier_try_wait_parity(tmem_dealloc_mbar_ptr, 0, time_limit=10000000):
                     pass
 
             prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=_cta_group)
@@ -1890,6 +1621,9 @@ class ConvConfig:
             raise ValueError("Unsupported Wan residual-convolution channel pair")
         if min(*self.output_shape, self.ctas) <= 0 or self.ctas % 2:
             raise ValueError("Expected nonempty output and complete 2CTA groups")
+
+
+_DEFAULT_CONV_CONFIG = ConvConfig()
 
 
 class _Launch:
@@ -1942,9 +1676,7 @@ class _Launch:
             1,
         )
         scheduler = PersistentTileSchedulerParams(tiles, (groups, 1, 1))
-        grid = StaticPersistentTileScheduler.get_grid_shape(
-            scheduler, cfg.ctas // groups
-        )
+        grid = StaticPersistentTileScheduler.get_grid_shape(scheduler, cfg.ctas // groups)
         ab_stages, c_stages = 8, 2
         if cutlass.const_expr(self.fuse_norm and cfg.co == 320 and cfg.ci == 320):
             # The longer K135 convolution benefits from a deeper output-store
@@ -1977,9 +1709,7 @@ class _Launch:
             prep_padded=prep_padded,
             prep_cache=prep_cache,
             prep_previous=prep_previous,
-            PREP_SHAPE=(cfg.n, self.previous_frames)
-            if self.previous_frames is not None
-            else None,
+            PREP_SHAPE=(cfg.n, self.previous_frames) if self.previous_frames is not None else None,
             residual=residual,
             residual_bias=residual_bias,
             prep_residual=prep_residual,
@@ -1993,9 +1723,7 @@ class _Launch:
                 1,
                 1,
             ),
-            min_blocks_per_mp=1
-            if self.previous_frames is not None or self.spatial_output
-            else 0,
+            min_blocks_per_mp=1 if self.previous_frames is not None or self.spatial_output else 0,
             cluster=(groups, 1, 1),
             stream=stream,
             smem_merge_branch_allocs=True,
@@ -2014,9 +1742,7 @@ def _descriptors(
     fake = x is None
     dtype = cutlass.BFloat16
     a_dims, a_strides = _contiguous_tma_layout(cfg.input_shape, dtype)
-    b_dims, b_strides = _contiguous_tma_layout(
-        cfg.packed_weight_shape if fake else tuple(weight.shape), dtype
-    )
+    b_dims, b_strides = _contiguous_tma_layout(cfg.packed_weight_shape if fake else tuple(weight.shape), dtype)
     c_dims, c_strides = _contiguous_tma_layout(cfg.output_shape, dtype)
     if prepared_output or spatial_output:
         # Logical T/H/W omit the halo, while physical pitches include it.
@@ -2071,7 +1797,7 @@ def _descriptors(
 
 
 @lru_cache(maxsize=32)
-def compile_conv(config: ConvConfig = ConvConfig()) -> Callable:
+def compile_conv(config: ConvConfig = _DEFAULT_CONV_CONFIG) -> Callable:
     """Compile without a GPU/context; artifact dumps require CUTE_DSL_KEEP."""
     config.validate()
     return cute.compile(
@@ -2083,7 +1809,7 @@ def compile_conv(config: ConvConfig = ConvConfig()) -> Callable:
 
 @lru_cache(maxsize=32)
 def compile_prepared(
-    config: ConvConfig = ConvConfig(),
+    config: ConvConfig = _DEFAULT_CONV_CONFIG,
     previous_frames: int = 0,
     has_residual: bool = False,
     has_residual_bias: bool = False,
@@ -2091,20 +1817,14 @@ def compile_prepared(
     """GPU-free compilation of convolution and next-input/cache production."""
     config.validate()
     if config.co not in (160, 320):
-        raise ValueError(
-            "The prepared epilogue requires Co in (160, 320) and tile_n=160"
-        )
+        raise ValueError("The prepared epilogue requires Co in (160, 320) and tile_n=160")
     if previous_frames not in (0, 1, 2):
         raise ValueError("History must contain zero, one or two frames")
     if has_residual_bias and not has_residual:
         raise ValueError("Residual bias requires a residual input")
-    parameter = make_fake_compact_tensor(
-        cutlass.BFloat16, (config.co,), assumed_align=16
-    )
+    parameter = make_fake_compact_tensor(cutlass.BFloat16, (config.co,), assumed_align=16)
     tensors = tuple(
-        make_fake_compact_tensor(
-            cutlass.BFloat16, (math.prod(shape),), assumed_align=16
-        )
+        make_fake_compact_tensor(cutlass.BFloat16, (math.prod(shape),), assumed_align=16)
         for shape in _prepared_shapes(config, previous_frames)
     )
     return cute.compile(
@@ -2119,15 +1839,11 @@ def compile_prepared(
         parameter,
         parameter,
         *tensors,
-        make_fake_compact_tensor(
-            cutlass.BFloat16, (math.prod(config.output_shape),), assumed_align=16
-        )
+        make_fake_compact_tensor(cutlass.BFloat16, (math.prod(config.output_shape),), assumed_align=16)
         if has_residual
         else None,
         parameter if has_residual_bias else None,
-        make_fake_compact_tensor(
-            cutlass.BFloat16, (math.prod(config.output_shape),), assumed_align=16
-        )
+        make_fake_compact_tensor(cutlass.BFloat16, (math.prod(config.output_shape),), assumed_align=16)
         if has_residual
         else None,
         options="--ptxas-options=--fmad=false",
@@ -2136,7 +1852,7 @@ def compile_prepared(
 
 @lru_cache(maxsize=32)
 def compile_spatial_residual(
-    config: ConvConfig = ConvConfig(),
+    config: ConvConfig = _DEFAULT_CONV_CONFIG,
     has_residual_bias: bool = False,
 ) -> Callable:
     """Compile conv/bias/residual plus bottom/right padding for spatial downsample."""
@@ -2147,9 +1863,7 @@ def compile_spatial_residual(
     parameter = make_fake_compact_tensor(cutlass.BFloat16, (c,), assumed_align=16)
 
     def flat(shape: tuple[int, ...]) -> cute.Tensor:
-        return make_fake_compact_tensor(
-            cutlass.BFloat16, (math.prod(shape),), assumed_align=16
-        )
+        return make_fake_compact_tensor(cutlass.BFloat16, (math.prod(shape),), assumed_align=16)
 
     return cute.compile(
         _Launch(
@@ -2227,9 +1941,7 @@ class PreparedConv:
                 residual_bias,
             )
         ):
-            raise ValueError(
-                "PreparedConv supports inference only; use no_grad or inference_mode"
-            )
+            raise ValueError("PreparedConv supports inference only; use no_grad or inference_mode")
         weight_shape = tuple(weight.shape)
         if weight_shape != config.packed_weight_shape:
             raise ValueError("Weight must have logical OTRSC or K64-padded OTRSC shape")
@@ -2239,25 +1951,13 @@ class PreparedConv:
         ):
             if tuple(tensor.shape) != shape or tensor.dtype != torch.bfloat16:
                 raise ValueError(f"{label} must be BF16 with shape {shape}")
-            if (
-                not tensor.is_cuda
-                or not tensor.is_contiguous()
-                or tensor.data_ptr() % 16
-            ):
-                raise ValueError(
-                    f"{label} must be CUDA, contiguous, and 16-byte aligned"
-                )
+            if not tensor.is_cuda or not tensor.is_contiguous() or tensor.data_ptr() % 16:
+                raise ValueError(f"{label} must be CUDA, contiguous, and 16-byte aligned")
         if x.device != weight.device:
             raise ValueError("Input and weight must be on the same device")
-        if spatial_output and (
-            prepare_next_input
-            or gamma is not None
-            or residual is None
-            or conv_bias is None
-        ):
+        if spatial_output and (prepare_next_input or gamma is not None or residual is None or conv_bias is None):
             raise ValueError(
-                "Spatial residual fusion requires bias/residual "
-                "without normalization or temporal preparation"
+                "Spatial residual fusion requires bias/residual without normalization or temporal preparation"
             )
         if not spatial_output and (conv_bias is None) != (gamma is None):
             raise ValueError("The fused epilogue requires both bias and gamma")
@@ -2282,18 +1982,13 @@ class PreparedConv:
                 or not tensor.is_contiguous()
                 or tensor.data_ptr() % 16
             ):
-                raise ValueError(
-                    f"{label} must be aligned contiguous BF16 "
-                    f"on the input device, shape {shape}"
-                )
+                raise ValueError(f"{label} must be aligned contiguous BF16 on the input device, shape {shape}")
         self.residual_owners = (residual, residual_bias)
         self.parameters = ()
         self.parameter_owners = (conv_bias, gamma)
         if conv_bias is not None:
             if not spatial_output and (config.co not in (160, 320)):
-                raise ValueError(
-                    "The fused epilogue requires Co in (160, 320) and tile_n=160"
-                )
+                raise ValueError("The fused epilogue requires Co in (160, 320) and tile_n=160")
             for parameter in (conv_bias, gamma):
                 if parameter is None:
                     continue
@@ -2304,28 +1999,20 @@ class PreparedConv:
                     or not parameter.is_contiguous()
                     or parameter.data_ptr() % 16
                 ):
-                    raise ValueError(
-                        f"Bias/gamma must be aligned CUDA BF16 vectors of {config.co}"
-                    )
+                    raise ValueError(f"Bias/gamma must be aligned CUDA BF16 vectors of {config.co}")
             self.parameters = tuple(
                 # Checkpoint Parameters keep requires_grad inside inference
                 # mode, but DLPack only accepts explicitly detached views.
-                from_dlpack(parameter.detach(), assumed_align=16)
-                if parameter is not None
-                else None
+                from_dlpack(parameter.detach(), assumed_align=16) if parameter is not None else None
                 for parameter in (conv_bias, gamma)
             )
         self.device = x.device
         self.previous = previous
         if prepare_next_input:
-            if previous is not None and (
-                previous.ndim != 5 or previous.shape[1] not in (1, 2)
-            ):
+            if previous is not None and (previous.ndim != 5 or previous.shape[1] not in (1, 2)):
                 raise ValueError("History must be NTHWC with one or two frames")
             previous_frames = 0 if previous is None else previous.shape[1]
-            padded_shape, cache_shape, previous_shape = _prepared_shapes(
-                config, previous_frames
-            )
+            padded_shape, cache_shape, previous_shape = _prepared_shapes(config, previous_frames)
             if previous is not None and (
                 tuple(previous.shape) != previous_shape
                 or previous.device != x.device
@@ -2333,16 +2020,10 @@ class PreparedConv:
                 or not previous.is_contiguous()
                 or previous.data_ptr() % 16
             ):
-                raise ValueError(
-                    "History must be aligned contiguous BF16 NTHWC on the input device"
-                )
+                raise ValueError("History must be aligned contiguous BF16 NTHWC on the input device")
             padded = torch.empty(padded_shape, device=x.device, dtype=x.dtype)
             cache = torch.empty(cache_shape, device=x.device, dtype=x.dtype)
-            summed = (
-                torch.empty(config.output_shape, device=x.device, dtype=x.dtype)
-                if residual is not None
-                else None
-            )
+            summed = torch.empty(config.output_shape, device=x.device, dtype=x.dtype) if residual is not None else None
             self.output = PreparedConvInput(padded, cache, summed)
             self.descriptors = _descriptors(
                 config,
@@ -2360,33 +2041,21 @@ class PreparedConv:
                 )
             )
             self.parameters += tuple(
-                from_dlpack(tensor.detach().view(-1), assumed_align=16)
-                if tensor is not None
-                else None
+                from_dlpack(tensor.detach().view(-1), assumed_align=16) if tensor is not None else None
                 for tensor in (residual, residual_bias, summed)
             )
-            self.compiled = compile_prepared(
-                config, previous_frames, residual is not None, residual_bias is not None
-            )
+            self.compiled = compile_prepared(config, previous_frames, residual is not None, residual_bias is not None)
         elif spatial_output:
             n, t, h, w, c = config.output_shape
-            self.output = torch.empty(
-                (n, t, h + 1, w + 1, c), device=x.device, dtype=x.dtype
-            )
-            self.descriptors = _descriptors(
-                config, x, weight, self.output, spatial_output=True
-            )
+            self.output = torch.empty((n, t, h + 1, w + 1, c), device=x.device, dtype=x.dtype)
+            self.descriptors = _descriptors(config, x, weight, self.output, spatial_output=True)
             self.parameters += tuple(
-                from_dlpack(tensor.detach().view(-1), assumed_align=16)
-                if tensor is not None
-                else None
+                from_dlpack(tensor.detach().view(-1), assumed_align=16) if tensor is not None else None
                 for tensor in (self.output, None, None, residual, residual_bias, None)
             )
             self.compiled = compile_spatial_residual(config, residual_bias is not None)
         else:
-            self.output = torch.empty(
-                config.output_shape, device=x.device, dtype=x.dtype
-            )
+            self.output = torch.empty(config.output_shape, device=x.device, dtype=x.dtype)
             self.descriptors = _descriptors(config, x, weight, self.output)
             self.compiled = compile_conv(config)
 
@@ -2482,8 +2151,7 @@ class WanConv3d(torch.nn.Module):
         if (
             weight.ndim != 5
             or tuple(weight.shape[2:]) != (3, 3, 3)
-            or (weight.shape[1], weight.shape[0])
-            not in ((160, 160), (160, 320), (320, 320), (320, 640), (640, 640))
+            or (weight.shape[1], weight.shape[0]) not in ((160, 160), (160, 320), (320, 320), (320, 640), (640, 640))
         ):
             raise ValueError("WanConv3d requires a supported Wan residual 3x3x3 weight")
         self.in_channels = weight.shape[1]
@@ -2497,9 +2165,7 @@ class WanConv3d(torch.nn.Module):
             ),
             persistent=False,
         )
-        multiprocessors = torch.cuda.get_device_properties(
-            weight.device
-        ).multi_processor_count
+        multiprocessors = torch.cuda.get_device_properties(weight.device).multi_processor_count
         self.ctas = multiprocessors // 2 * 2
 
     def _config(self, x: torch.Tensor) -> ConvConfig:
@@ -2584,9 +2250,7 @@ class WanConv3d(torch.nn.Module):
         """Produce the following spatial downsample's padded NHWC input directly."""
         config = self._config(x)
         with torch.cuda.device(x.device):
-            bound = prepare_spatial_residual(
-                x, self.weight, conv_bias, residual, config, residual_bias
-            )
+            bound = prepare_spatial_residual(x, self.weight, conv_bias, residual, config, residual_bias)
             out = bound()
             stream = torch.cuda.current_stream()
             for tensor in (x, self.weight, conv_bias, residual, residual_bias, out):
@@ -2619,6 +2283,9 @@ class InputConvConfig:
             raise ValueError("Input needs positive batch, T/H/W >= 3 and positive CTAs")
         if math.prod(self.input_shape) >= 2**31:
             raise ValueError("Packed gather requires input element offsets below 2**31")
+
+
+_DEFAULT_INPUT_CONV_CONFIG = InputConvConfig()
 
 
 def _input_descriptors(
@@ -2699,15 +2366,11 @@ class _InputLaunch:
 
 
 @lru_cache(maxsize=32)
-def compile_input(cfg: InputConvConfig = InputConvConfig()) -> Callable:
+def compile_input(cfg: InputConvConfig = _DEFAULT_INPUT_CONV_CONFIG) -> Callable:
     """Compile with fake descriptors and no CUDA tensors or context."""
     cfg.validate()
-    x = make_fake_compact_tensor(
-        cutlass.BFloat16, (math.prod(cfg.input_shape),), assumed_align=16
-    )
-    return cute.compile(
-        _InputLaunch(cfg), x, *_input_descriptors(cfg), driver.CUstream(0)
-    )
+    x = make_fake_compact_tensor(cutlass.BFloat16, (math.prod(cfg.input_shape),), assumed_align=16)
+    return cute.compile(_InputLaunch(cfg), x, *_input_descriptors(cfg), driver.CUstream(0))
 
 
 def pack_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -2715,9 +2378,7 @@ def pack_weight(weight: torch.Tensor) -> torch.Tensor:
     if weight.dtype != torch.bfloat16 or tuple(weight.shape) != (160, 12, 3, 3, 3):
         raise ValueError("Expected BF16 input-convolution weights [160,12,3,3,3]")
     packed = torch.zeros((160, 28, 16), dtype=weight.dtype, device=weight.device)
-    packed[:, :27, :12].copy_(
-        weight.detach().permute(0, 2, 3, 4, 1).reshape(160, 27, 12)
-    )
+    packed[:, :27, :12].copy_(weight.detach().permute(0, 2, 3, 4, 1).reshape(160, 27, 12))
     packed = packed.reshape(160, 448)
     return packed
 
@@ -2729,9 +2390,7 @@ class PreparedInputConv:
     supported. The module wrapper creates a fresh binding/output per forward.
     """
 
-    def __init__(
-        self, x: torch.Tensor, weight: torch.Tensor, cfg: InputConvConfig
-    ) -> None:
+    def __init__(self, x: torch.Tensor, weight: torch.Tensor, cfg: InputConvConfig) -> None:
         cfg.validate()
         for tensor, shape in ((x, cfg.input_shape), (weight, (160, 448))):
             if (
@@ -2742,9 +2401,7 @@ class PreparedInputConv:
                 or tensor.device != x.device
                 or tensor.data_ptr() % 16
             ):
-                raise ValueError(
-                    "Expected aligned contiguous BF16 CUDA operands matching config"
-                )
+                raise ValueError("Expected aligned contiguous BF16 CUDA operands matching config")
         self.x = x
         self.weight = weight
         self.output = torch.empty(cfg.output_shape, dtype=x.dtype, device=x.device)
@@ -2763,9 +2420,7 @@ class PreparedInputConv:
         return self.output
 
 
-def prepare_input(
-    x: torch.Tensor, weight: torch.Tensor, cfg: InputConvConfig
-) -> PreparedInputConv:
+def prepare_input(x: torch.Tensor, weight: torch.Tensor, cfg: InputConvConfig) -> PreparedInputConv:
     """Bind prepacked weights and the already padded activation."""
     return PreparedInputConv(x, weight, cfg)
 
@@ -2776,9 +2431,7 @@ class WanInputConv3d(torch.nn.Module):
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
         self.register_buffer("weight", pack_weight(weight), persistent=False)
-        self.ctas = torch.cuda.get_device_properties(
-            weight.device
-        ).multi_processor_count
+        self.ctas = torch.cuda.get_device_properties(weight.device).multi_processor_count
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training or (torch.is_grad_enabled() and x.requires_grad):
@@ -2799,9 +2452,7 @@ def compile() -> None:
         cfg = ConvConfig(ci=ci, co=co)
         compile_conv(cfg)
         if co <= 320:
-            compile_prepared(
-                cfg, previous_frames=2, has_residual=True, has_residual_bias=co == 320
-            )
+            compile_prepared(cfg, previous_frames=2, has_residual=True, has_residual_bias=co == 320)
         if ci == co:
             compile_spatial_residual(cfg)
 
@@ -2828,9 +2479,7 @@ def verify() -> None:
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     for ci, co in ((160, 160), (160, 320), (320, 320), (320, 640), (640, 640)):
         # These reduced batches are correctness checks, never performance results.
-        frames, height, width = (
-            (4, 320, 240) if co == 160 else (2, 160, 120) if co == 320 else (1, 80, 60)
-        )
+        frames, height, width = (4, 320, 240) if co == 160 else (2, 160, 120) if co == 320 else (1, 80, 60)
         cfg = ConvConfig(
             n=1,
             t=frames + 2,
@@ -2841,16 +2490,14 @@ def verify() -> None:
             ctas=sm_count // 2 * 2,
         )
         x = torch.randn(cfg.input_shape, device="cuda", dtype=torch.bfloat16) * 0.1
-        torch_weight = (
-            torch.randn(co, ci, 3, 3, 3, device="cuda", dtype=x.dtype) * 0.1
-        ).contiguous(memory_format=torch.channels_last_3d)
+        torch_weight = (torch.randn(co, ci, 3, 3, 3, device="cuda", dtype=x.dtype) * 0.1).contiguous(
+            memory_format=torch.channels_last_3d
+        )
         module = WanConv3d(torch_weight).eval()
         raw = prepare(x, module.weight, cfg)
         torch_x = x.permute(0, 4, 1, 2, 3)
 
-        fp32 = torch.nn.functional.conv3d(
-            torch_x.float(), torch_weight.float()
-        ).permute(0, 2, 3, 4, 1)
+        fp32 = torch.nn.functional.conv3d(torch_x.float(), torch_weight.float()).permute(0, 2, 3, 4, 1)
         torch.testing.assert_close(raw().float(), fp32, atol=0.02, rtol=0.02)
         bias = torch.randn(co, device="cuda", dtype=x.dtype) * 0.1
         gamma = torch.randn_like(bias)
@@ -2870,32 +2517,28 @@ def verify() -> None:
                     if history
                     else None
                 )
-                kwargs = dict(
-                    residual=residual if with_residual else None,
-                    residual_bias=bias if with_residual and co == 320 else None,
-                )
-                fused = prepare_next(
-                    x, module.weight, bias, gamma, cfg, previous, **kwargs
-                )
+                kwargs = {
+                    "residual": residual if with_residual else None,
+                    "residual_bias": bias if with_residual and co == 320 else None,
+                }
+                fused = prepare_next(x, module.weight, bias, gamma, cfg, previous, **kwargs)
 
-                def separate() -> PreparedConvInput:
-                    return rmsnorm_silu_conv_prep(
-                        raw(), gamma, previous=previous, input_bias=bias, **kwargs
-                    )
+                def separate(
+                    raw=raw,
+                    gamma=gamma,
+                    previous=previous,
+                    bias=bias,
+                    kwargs=kwargs,
+                ) -> PreparedConvInput:
+                    return rmsnorm_silu_conv_prep(raw(), gamma, previous=previous, input_bias=bias, **kwargs)
 
                 actual, expected = fused(), separate()
-                torch.testing.assert_close(
-                    actual.padded, expected.padded, atol=0, rtol=0
-                )
+                torch.testing.assert_close(actual.padded, expected.padded, atol=0, rtol=0)
                 torch.testing.assert_close(actual.cache, expected.cache, atol=0, rtol=0)
                 if with_residual:
-                    torch.testing.assert_close(
-                        actual.residual, expected.residual, atol=0, rtol=0
-                    )
+                    torch.testing.assert_close(actual.residual, expected.residual, atol=0, rtol=0)
         if ci == co:
-            fused_spatial = prepare_spatial_residual(
-                x, module.weight, bias, residual, cfg
-            )
+            fused_spatial = prepare_spatial_residual(x, module.weight, bias, residual, cfg)
             expected = torch_bias_residual(raw(), residual, bias, pad_spatial=True)
             torch.testing.assert_close(fused_spatial(), expected, atol=0, rtol=0)
         # A 35-pixel output leaves the entire second CTA inactive for stores.
@@ -2903,40 +2546,28 @@ def verify() -> None:
         tail_cfg = ConvConfig(t=3, h=7, w=9, ci=ci, co=co, ctas=cfg.ctas)
         tail_x = torch.randn(tail_cfg.input_shape, device="cuda", dtype=x.dtype) * 0.1
         tail_raw = prepare(tail_x, module.weight, tail_cfg)
-        tail_ref = torch.nn.functional.conv3d(
-            tail_x.permute(0, 4, 1, 2, 3).float(), torch_weight.float()
-        ).permute(0, 2, 3, 4, 1)
+        tail_ref = torch.nn.functional.conv3d(tail_x.permute(0, 4, 1, 2, 3).float(), torch_weight.float()).permute(
+            0, 2, 3, 4, 1
+        )
         torch.testing.assert_close(tail_raw().float(), tail_ref, atol=0.02, rtol=0.02)
         if co <= 320:
             history = torch.randn(1, 2, 5, 7, co, device="cuda", dtype=x.dtype)
             for with_residual in (False, True):
-                skip = (
-                    torch.randn(tail_cfg.output_shape, device="cuda", dtype=x.dtype)
-                    if with_residual
-                    else None
-                )
-                tail_fused = prepare_next(
-                    tail_x, module.weight, bias, gamma, tail_cfg, history, residual=skip
-                )
+                skip = torch.randn(tail_cfg.output_shape, device="cuda", dtype=x.dtype) if with_residual else None
+                tail_fused = prepare_next(tail_x, module.weight, bias, gamma, tail_cfg, history, residual=skip)
                 actual = tail_fused()
-                expected = rmsnorm_silu_conv_prep(
-                    tail_raw(), gamma, previous=history, input_bias=bias, residual=skip
-                )
-                torch.testing.assert_close(
-                    actual.padded, expected.padded, atol=0, rtol=0
-                )
+                expected = rmsnorm_silu_conv_prep(tail_raw(), gamma, previous=history, input_bias=bias, residual=skip)
+                torch.testing.assert_close(actual.padded, expected.padded, atol=0, rtol=0)
                 torch.testing.assert_close(actual.cache, expected.cache, atol=0, rtol=0)
                 if with_residual:
-                    torch.testing.assert_close(
-                        actual.residual, expected.residual, atol=0, rtol=0
-                    )
+                    torch.testing.assert_close(actual.residual, expected.residual, atol=0, rtol=0)
         print(f"C{ci}->{co}: correctness PASS (including partial CTA pair)", flush=True)
     cfg = InputConvConfig(n=1, t=6, h=322, w=242, ctas=sm_count)
     x = torch.randn(cfg.input_shape, device="cuda", dtype=torch.bfloat16) * 0.1
     x[..., 12:] = 0
-    weight = (
-        torch.randn(160, 12, 3, 3, 3, device="cuda", dtype=x.dtype) * 0.1
-    ).contiguous(memory_format=torch.channels_last_3d)
+    weight = (torch.randn(160, 12, 3, 3, 3, device="cuda", dtype=x.dtype) * 0.1).contiguous(
+        memory_format=torch.channels_last_3d
+    )
     raw = prepare_input(x, pack_weight(weight), cfg)
     torch_x = x[..., :12].contiguous().permute(0, 4, 1, 2, 3)
 
@@ -2962,9 +2593,9 @@ def _benchmark_conv(cfg: ConvConfig, history: int, spatial: bool) -> None:
         flush=True,
     )
     x = torch.randn(cfg.input_shape, device="cuda", dtype=torch.bfloat16) * 0.1
-    weight = (
-        torch.randn(cfg.co, cfg.ci, 3, 3, 3, device="cuda", dtype=x.dtype) * 0.1
-    ).contiguous(memory_format=torch.channels_last_3d)
+    weight = (torch.randn(cfg.co, cfg.ci, 3, 3, 3, device="cuda", dtype=x.dtype) * 0.1).contiguous(
+        memory_format=torch.channels_last_3d
+    )
     module = WanConv3d(weight).eval()
     raw = prepare(x, module.weight, cfg)
     torch_x = x.permute(0, 4, 1, 2, 3)
@@ -2993,40 +2624,26 @@ def _benchmark_conv(cfg: ConvConfig, history: int, spatial: bool) -> None:
         )
         # The channel-transition conv uses norm-only fusion in the model.
         for with_residual in (False, True) if cfg.ci == cfg.co else (False,):
-            residual = (
-                torch.randn(cfg.output_shape, device="cuda", dtype=x.dtype)
-                if with_residual
-                else None
-            )
-            kwargs = dict(
-                residual=residual,
-                residual_bias=bias if with_residual and cfg.co == 320 else None,
-            )
+            residual = torch.randn(cfg.output_shape, device="cuda", dtype=x.dtype) if with_residual else None
+            kwargs = {
+                "residual": residual,
+                "residual_bias": bias if with_residual and cfg.co == 320 else None,
+            }
             fused = prepare_next(x, module.weight, bias, gamma, cfg, previous, **kwargs)
 
-            def separate() -> PreparedConvInput:
-                return rmsnorm_silu_conv_prep(
-                    raw(), gamma, previous=previous, input_bias=bias, **kwargs
-                )
+            def separate(kwargs=kwargs) -> PreparedConvInput:
+                return rmsnorm_silu_conv_prep(raw(), gamma, previous=previous, input_bias=bias, **kwargs)
 
-            def reference() -> PreparedConvInput:
-                return torch_reference(
-                    torch_conv(), gamma, previous=previous, input_bias=bias, **kwargs
-                )
+            def reference(kwargs=kwargs) -> PreparedConvInput:
+                return torch_reference(torch_conv(), gamma, previous=previous, input_bias=bias, **kwargs)
 
             actual, expected = fused(), separate()
             torch.testing.assert_close(actual.padded, expected.padded, atol=0, rtol=0)
             torch.testing.assert_close(actual.cache, expected.cache, atol=0, rtol=0)
             if with_residual:
-                torch.testing.assert_close(
-                    actual.residual, expected.residual, atol=0, rtol=0
-                )
+                torch.testing.assert_close(actual.residual, expected.residual, atol=0, rtol=0)
             del actual, expected
-            operation = (
-                "conv + residual + norm/SiLU/prep"
-                if with_residual
-                else "conv + norm/SiLU/prep"
-            )
+            operation = "conv + residual + norm/SiLU/prep" if with_residual else "conv + norm/SiLU/prep"
             torch_results.append(measure(operation, reference, fused))
             fusion_results.append(measure(operation, separate, fused))
         del fused, previous, residual
@@ -3044,9 +2661,7 @@ def _benchmark_conv(cfg: ConvConfig, history: int, spatial: bool) -> None:
         torch_results.append(
             measure(
                 operation,
-                lambda: torch_bias_residual(
-                    torch_conv(), residual, bias, pad_spatial=True
-                ),
+                lambda: torch_bias_residual(torch_conv(), residual, bias, pad_spatial=True),
                 fused_spatial,
             )
         )
@@ -3074,9 +2689,9 @@ def _benchmark_input(cfg: InputConvConfig) -> None:
     print(f"\nC12->C160 input | output NTHWC={cfg.output_shape}", flush=True)
     x = torch.randn(cfg.input_shape, device="cuda", dtype=torch.bfloat16) * 0.1
     x[..., 12:] = 0
-    weight = (
-        torch.randn(160, 12, 3, 3, 3, device="cuda", dtype=x.dtype) * 0.1
-    ).contiguous(memory_format=torch.channels_last_3d)
+    weight = (torch.randn(160, 12, 3, 3, 3, device="cuda", dtype=x.dtype) * 0.1).contiguous(
+        memory_format=torch.channels_last_3d
+    )
     raw = prepare_input(x, pack_weight(weight), cfg)
     torch_x = x[..., :12].contiguous().permute(0, 4, 1, 2, 3)
 
@@ -3127,9 +2742,7 @@ def benchmark_production() -> None:
                 spatial=ci == co and height >= 80,
             )
     for frames in (1, 4):
-        _benchmark_input(
-            InputConvConfig(n=32, t=frames + 2, h=322, w=242, ctas=sm_count)
-        )
+        _benchmark_input(InputConvConfig(n=32, t=frames + 2, h=322, w=242, ctas=sm_count))
     print("\nProduction benchmark: PASS", flush=True)
 
 

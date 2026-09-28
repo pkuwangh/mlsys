@@ -1,3 +1,7 @@
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false
+# pyright: reportIndexIssue=false, reportMissingImports=false
+# pyright: reportOperatorIssue=false
+
 """Fuse Wan convolution bias, RMSNorm/SiLU, causal padding, and cache updates.
 
 All activation and cache tensors are contiguous BF16 [N,T,H,W,C]. The canonical
@@ -12,12 +16,12 @@ Uses only the installed public CUTLASS DSL 4.7.1 runtime.
 
 import argparse
 from collections.abc import Callable
-from functools import lru_cache
+from functools import cache, partial
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
 import torch
+from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 if __package__:
@@ -243,7 +247,7 @@ def rmsnorm_host(
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def compile_rmsnorm(
     channels: int = 160,
     has_bias: bool = False,
@@ -1178,7 +1182,7 @@ def conv_prep_host(
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def compile_conv_prep(
     channels: int = 160,
     has_bias: bool = False,
@@ -1410,12 +1414,12 @@ def verify() -> None:
                 if history
                 else None
             )
-            kwargs = dict(
-                input_bias=bias,
-                residual=torch.randn_like(x) if has_residual else None,
-                residual_bias=bias if has_residual and channels != 160 else None,
-                save_input=True,
-            )
+            kwargs = {
+                "input_bias": bias,
+                "residual": torch.randn_like(x) if has_residual else None,
+                "residual_bias": bias if has_residual and channels != 160 else None,
+                "save_input": True,
+            }
             actual = rmsnorm_silu_conv_prep(x, gamma, previous=previous, **kwargs)
             expected = torch_reference(x, gamma, previous=previous, **kwargs)
             torch.testing.assert_close(
@@ -1458,9 +1462,12 @@ def verify() -> None:
                 x.zero_()
                 residual.zero_()
                 bias.zero_()
-            kwargs = dict(
-                bias=bias, input_bias=bias, residual=residual, residual_bias=bias
-            )
+            kwargs = {
+                "bias": bias,
+                "input_bias": bias,
+                "residual": residual,
+                "residual_bias": bias,
+            }
             actual = rmsnorm_silu_conv_prep(x, gamma, previous=previous, **kwargs)
             expected = torch_reference(x, gamma, previous=previous, **kwargs)
             torch.testing.assert_close(
@@ -1515,25 +1522,25 @@ def benchmark_production() -> None:
             )
             results = []
             for has_residual in (False, True) if save_input else (False,):
-                kwargs = dict(
-                    input_bias=bias if save_input else None,
-                    residual=torch.randn_like(x) if has_residual else None,
-                    residual_bias=bias
+                kwargs = {
+                    "input_bias": bias if save_input else None,
+                    "residual": torch.randn_like(x) if has_residual else None,
+                    "residual_bias": bias
                     if has_residual and (c == 320 or frames == 2)
                     else None,
-                    save_input=save_input,
+                    "save_input": save_input,
+                }
+
+                reference = partial(
+                    torch_reference, x, gamma, previous=previous, **kwargs
                 )
-
-                def reference() -> PreparedConvInput:
-                    return torch_reference(x, gamma, previous=previous, **kwargs)
-
-                def custom() -> PreparedConvInput:
-                    return rmsnorm_silu_conv_prep(
-                        x,
-                        gamma,
-                        previous=previous,
-                        **kwargs,
-                    )
+                custom = partial(
+                    rmsnorm_silu_conv_prep,
+                    x,
+                    gamma,
+                    previous=previous,
+                    **kwargs,
+                )
 
                 actual = custom()
                 expected = reference()
