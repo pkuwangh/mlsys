@@ -28,6 +28,9 @@ TMPDIR="$PWD/tmp" nsys profile \
        --resolutions 480x832 --frames 17
 
 For a multi-case Nsight capture, use --capture-range-end=repeat instead of stop.
+Omit ``--model`` to instantiate the exact architecture with deterministic
+random weights. That mode measures performance and numerical agreement, not
+caption or reconstruction quality.
 """
 
 import argparse
@@ -40,13 +43,16 @@ from dataclasses import dataclass
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
-
 from mega_wan_vae import MegaWanVaeEncoder
 from mega_wan_vae._utils import (
     FeatCache,
-    canonicalize_cache as raw_canonicalize_cache,
-    patchify as raw_patchify,
     validate_frame_count,
+)
+from mega_wan_vae._utils import (
+    canonicalize_cache as raw_canonicalize_cache,
+)
+from mega_wan_vae._utils import (
+    patchify as raw_patchify,
 )
 from wan_vae_reference import TorchCompileChunkWanVaeEncoder, TorchWanVaeEncoder
 
@@ -56,6 +62,24 @@ COMPARE_RTOL = 1e-3
 REFERENCE_FRAMES = 17
 REFERENCE_HEIGHT = 720
 REFERENCE_WIDTH = 1280
+SYNTHETIC_WAN22_CONFIG = {
+    "base_dim": 160,
+    "decoder_base_dim": 256,
+    "z_dim": 48,
+    "dim_mult": [1, 2, 4, 4],
+    "num_res_blocks": 2,
+    "attn_scales": [],
+    "temperal_downsample": [False, True, True],
+    "dropout": 0.0,
+    "latents_mean": [0.0] * 48,
+    "latents_std": [1.0] * 48,
+    "is_residual": True,
+    "in_channels": 12,
+    "out_channels": 12,
+    "patch_size": 2,
+    "scale_factor_temporal": 4,
+    "scale_factor_spatial": 16,
+}
 
 
 @dataclass(frozen=True)
@@ -122,8 +146,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        required=True,
-        help="Path to Wan2.2 Diffusers model directory.",
+        help=(
+            "Local Wan2.2 Diffusers model directory. When omitted, instantiate "
+            "the production architecture with deterministic random weights."
+        ),
     )
     parser.add_argument(
         "--dtype",
@@ -181,7 +207,9 @@ def parse_args() -> argparse.Namespace:
             "outside the CUDA profiler range."
         ),
     )
-    parser.add_argument("--benchmark-repeats", type=int, default=5, help="benchmark iters")
+    parser.add_argument(
+        "--benchmark-repeats", type=int, default=5, help="benchmark iters"
+    )
     args = parser.parse_args()
     if args.benchmark_repeats < 1:
         parser.error("--benchmark-repeats must be positive")
@@ -426,13 +454,17 @@ def make_synthetic_video(
 def load_vae(
     args: argparse.Namespace, device: torch.device, dtype: torch.dtype
 ) -> AutoencoderKLWan:
-    vae = AutoencoderKLWan.from_pretrained(
-        args.model, subfolder="vae", torch_dtype=dtype
-    )
+    if args.model is None:
+        torch.manual_seed(args.seed)
+        vae = AutoencoderKLWan(**SYNTHETIC_WAN22_CONFIG)
+    else:
+        vae = AutoencoderKLWan.from_pretrained(
+            args.model, subfolder="vae", torch_dtype=dtype
+        )
     # Prepare the single reference in place; do not retain an alternate layout.
     torch.nn.utils.convert_conv3d_weight_memory_format(vae, torch.channels_last_3d)
     torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
-    return vae.to(device=device).eval()
+    return vae.to(device=device, dtype=dtype).eval()
 
 
 def median_timings(
@@ -625,7 +657,13 @@ def main() -> None:
         f"| BF16 | repeats={args.benchmark_repeats}",
         flush=True,
     )
-    print(f"Loading {args.model}", flush=True)
+    if args.model is None:
+        print(
+            "Instantiating WAN 2.2 architecture with deterministic random weights",
+            flush=True,
+        )
+    else:
+        print(f"Loading local checkpoint {args.model}", flush=True)
     vae = load_vae(args, device, resolve_dtype(args.dtype))
     if vae.use_tiling:
         raise ValueError("This benchmark requires spatial tiling to be disabled.")

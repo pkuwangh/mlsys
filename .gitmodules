@@ -27,4 +27,4 @@
 	url = https://github.com/pkuwangh/nanorl.git
 [submodule "mlsys/gpu/backends/cudnn-frontend"]
 	path = mlsys/gpu/backends/cudnn-frontend
-	url = https://github.com/NVIDIA/cudnn-frontend.git
+	url = https://github.com/pkuwangh/cudnn-frontend.git

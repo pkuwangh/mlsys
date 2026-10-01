@@ -47,34 +47,23 @@ drain them into 64B-swizzled SMEM for TMA stores. Halo/cache writers are
 disjoint from the epilogue's interior writers. A padded peer CTA must still
 participate in every paired-MMA handshake, including the final M tail.
 
-The private descriptor bridge below owns aligned CUDA driver tensor maps and
-their backing tensors. Descriptors travel as GridConstant arguments through
-the 4.7.1 default executor, not TVM FFI. Fake descriptors permit GPU-free
-compilation. Bound launches retain outputs and descriptor owners for graph
-replay; module forwards allocate fresh outputs and record their CUDA stream.
-The deprecated scheduler is intentionally the installed 4.7.1 wheel API.
+The CUTLASS host wrapper builds public tiled and im2col tensor maps directly
+from the bound tensor arguments. Descriptors travel as GridConstant arguments;
+module forwards retain their operands, allocate fresh outputs, and record the
+active CUDA stream.
 """
 
 import argparse
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
-
-import torch
-
-os.environ.setdefault("CUTE_DSL_DUMP_DIR", str(Path(__file__).resolve().parent))
-
-import ctypes
-from collections.abc import Sequence
 
 import cutlass
+import torch
 from cuda.bindings import driver
 from cutlass import cute
-from cutlass._mlir import ir
-from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.experimental import cuda
 from cutlass.experimental import primitives as prims
 from cutlass.utils import PersistentTileSchedulerParams, StaticPersistentTileScheduler
@@ -84,279 +73,25 @@ if __package__:
 else:
     from _utils import PreparedConvInput, measure, print_benchmark_table
 
-_DESCRIPTOR_BYTES = 128
-_DESCRIPTOR_ALIGNMENT = 64
-_DATA_TYPES = {
-    cutlass.Float16: driver.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
-    cutlass.BFloat16: driver.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-    cutlass.Float32: driver.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
-}
-_SWIZZLE_BYTES = {
-    cuda.TensorMapSwizzle.none: 0,
-    cuda.TensorMapSwizzle.s32b: 32,
-    cuda.TensorMapSwizzle.s64b: 64,
-    cuda.TensorMapSwizzle.s128b: 128,
-}
-
-
-class _HostTensorMap:
-    """Owned, aligned descriptor and JIT argument; use the builders below.
-
-    At the host ABI, !cuda.tensor_map lowers to a pointer. Consequently
-    __c_pointers__ returns the address of a pointer slot, NOT the descriptor
-    address. The generated launch shim copies all 128 bytes into a by-value,
-    64-byte-aligned grid-constant kernel parameter.
-    """
-
-    def __init__(
-        self,
-        dtype: type[cutlass.Numeric],
-        box_dims: tuple[int, ...],
-        swizzle: cuda.TensorMapSwizzle,
-        owner: object | None = None,
-    ) -> None:
-        self.dtype = dtype
-        self.box_dims = box_dims
-        self.swizzle = swizzle
-        self._owner = owner
-        self._storage = ctypes.create_string_buffer(_DESCRIPTOR_BYTES + _DESCRIPTOR_ALIGNMENT - 1)
-        self._address = (ctypes.addressof(self._storage) + 63) & ~63
-        self._pointer = ctypes.c_void_p(self._address)
-        self._encoded = False
-
-    @property
-    def address(self) -> int:
-        """Host descriptor address, suitable for a CUDA encoder output pointer."""
-        return self._address
-
-    def __repr__(self) -> str:
-        # Exclude address, owner and fake/real state from compilation identity.
-        return f"_HostTensorMap({self.dtype.__name__},box_dims={self.box_dims},swizzle={self.swizzle.name})"
-
-    def __c_pointers__(self) -> list[int]:
-        """Marshal one retained pointer slot for the default JIT executor."""
-        if not self._encoded:
-            return []
-        return [ctypes.addressof(self._pointer)]
-
-    def __get_mlir_types__(self) -> list[ir.Type]:
-        """Expose the same argument type for fake and real descriptors."""
-        return [ir.Type.parse("!cuda.tensor_map")]
-
-    def __new_from_mlir_values__(self, values: list[ir.Value]) -> cuda.TensorMap:
-        """Reconstruct the public device handle, retaining static box metadata."""
-        if len(values) != 1:
-            raise ValueError("A tensor map requires exactly one MLIR value")
-        return cuda.TensorMap(values[0], dtype=self.dtype, box_dims=self.box_dims, swizzle=self.swizzle)
-
 
 def _contiguous_tma_layout(
-    shape: Sequence[int], dtype: type[cutlass.Numeric]
+    shape: tuple[int, ...], dtype: type[cutlass.Numeric]
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Convert a C-contiguous shape to (TMA dimensions, byte strides).
+    """Convert a C-contiguous shape to TMA dimensions and 16-byte strides.
 
-    NDHWC becomes C,W,H,D,N; KTRSC becomes C,S,R,T,K. Noncontiguous tensors
-    must instead supply their actual dimensions and byte strides explicitly.
+    NDHWC becomes C,W,H,D,N; KTRSC becomes C,S,R,T,K.
     """
-    if dtype not in _DATA_TYPES:
-        raise ValueError("Only Float16, BFloat16 and Float32 are supported")
-    dims = _integers(shape, "shape", 1, 2**32)
-    if not 1 <= len(dims) <= 5:
+    if not 1 <= len(shape) <= 5 or any(type(extent) is not int or extent <= 0 for extent in shape):
         raise ValueError("Tensor rank must be between 1 and 5")
-    dims = dims[::-1]
-    stride = dtype.width // 8
+    dims = shape[::-1]
+    stride_bytes = dtype.width // 8
     strides = []
     for extent in dims[:-1]:
-        stride *= extent
-        strides.append(stride)
+        stride_bytes *= extent
+        if stride_bytes % 16:
+            raise ValueError("TMA inter-dimension strides must be multiples of 16 bytes")
+        strides.append(stride_bytes // 16)
     return dims, tuple(strides)
-
-
-def _integers(values: Sequence[int], name: str, lower: int, upper: int) -> tuple[int, ...]:
-    result = tuple(values)
-    if any(type(x) is not int or not lower <= x <= upper for x in result):
-        raise ValueError(f"{name} must contain integers in [{lower}, {upper}]")
-    return result
-
-
-def _validate_layout(
-    global_address: int | None,
-    dtype: type[cutlass.Numeric],
-    global_dims: Sequence[int],
-    global_strides: Sequence[int],
-    fake: bool,
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    if dtype not in _DATA_TYPES:
-        raise ValueError("Only Float16, BFloat16 and Float32 are supported")
-    dims = _integers(global_dims, "global_dims", 1, 2**32)
-    strides = _integers(global_strides, "global_strides", 16, 2**40 - 1)
-    if not 1 <= len(dims) <= 5 or len(strides) != len(dims) - 1:
-        raise ValueError("Expected rank 1..5 and rank-1 global byte strides")
-    if any(s % 16 for s in strides):
-        raise ValueError("Global byte strides must be multiples of 16")
-    if not (fake and global_address is None) and (
-        type(global_address) is not int or not 0 < global_address < 2**64 or global_address % 16
-    ):
-        raise ValueError("global_address must be a nonzero 16-byte-aligned pointer")
-    return dims, strides
-
-
-def _validate_swizzle(
-    dtype: type[cutlass.Numeric], inner: int, swizzle: cuda.TensorMapSwizzle
-) -> cuda.TensorMapSwizzle:
-    swizzle = cuda.TensorMapSwizzle(swizzle)
-    if swizzle not in _SWIZZLE_BYTES:
-        raise ValueError("Only none/32B/64B/128B ordinary swizzles are supported")
-    inner_bytes = inner * dtype.width // 8
-    if inner_bytes % 16:
-        raise ValueError("The inner box size must be a multiple of 16 bytes")
-    if _SWIZZLE_BYTES[swizzle] and inner_bytes > _SWIZZLE_BYTES[swizzle]:
-        raise ValueError("The inner box byte size exceeds the swizzle size")
-    return swizzle
-
-
-@lru_cache(maxsize=1)
-def _driver_library() -> ctypes.CDLL:
-    """Load only when encoding a real descriptor; never initialize CUDA."""
-    try:
-        library = ctypes.CDLL("libcuda.so.1")
-    except OSError as exc:
-        raise RuntimeError("Tensor-map encoding requires the NVIDIA libcuda.so.1 driver") from exc
-    u32p = ctypes.POINTER(ctypes.c_uint32)
-    u64p = ctypes.POINTER(ctypes.c_uint64)
-    i32p = ctypes.POINTER(ctypes.c_int32)
-    prefix = [
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_uint32,
-        ctypes.c_void_p,
-        u64p,
-        u64p,
-    ]
-    suffix = [u32p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-    library.cuTensorMapEncodeTiled.argtypes = prefix + [u32p] + suffix
-    library.cuTensorMapEncodeTiled.restype = ctypes.c_int
-    library.cuTensorMapEncodeIm2col.argtypes = prefix + [i32p, i32p, ctypes.c_uint32, ctypes.c_uint32] + suffix
-    library.cuTensorMapEncodeIm2col.restype = ctypes.c_int
-    return library
-
-
-def _check_encoding(result: int, name: str, descriptor: _HostTensorMap) -> _HostTensorMap:
-    if result != 0:
-        raise RuntimeError(f"{name} failed with CUresult {result}")
-    descriptor._encoded = True
-    return descriptor
-
-
-def _create_tensor_map_im2col(
-    global_address: int | None,
-    dtype: type[cutlass.Numeric],
-    global_dims: Sequence[int],
-    global_strides: Sequence[int],
-    *,
-    lower_corner: Sequence[int],
-    upper_corner: Sequence[int],
-    channels_per_pixel: int,
-    pixels_per_column: int,
-    traversal_strides: Sequence[int] | None = None,
-    swizzle: cuda.TensorMapSwizzle = cuda.TensorMapSwizzle.s128b,
-    owner: object | None = None,
-    fake: bool = False,
-) -> _HostTensorMap:
-    """Encode an activation IM2COL descriptor, or its compile-only counterpart.
-
-    For 3D fprop, spatial order is W,H,D; lower=-pad_lower and
-    upper=pad_upper-(filter-1)*dilation. Traversal is (1,sw,sh,sd,1), NOT
-    dilation. Defaults to unit traversal. Kernel anchors and filter offsets
-    must use the same convolution geometry. Zero corners/unit traversal also
-    describe an NZPQK IM2COL output store. Metadata box_dims=(channels,pixels)
-    describes the shared-memory tile, not the rank of the global tensor.
-    """
-    dims, strides = _validate_layout(global_address, dtype, global_dims, global_strides, fake)
-    rank = len(dims)
-    if rank not in (3, 4, 5):
-        raise ValueError("IM2COL requires tensor rank 3, 4 or 5")
-    limit = {3: 32768, 4: 128, 5: 16}[rank]
-    lower = _integers(lower_corner, "lower_corner", -limit, limit - 1)
-    upper = _integers(upper_corner, "upper_corner", -limit, limit - 1)
-    if len(lower) != rank - 2 or len(upper) != rank - 2:
-        raise ValueError("IM2COL requires rank-2 spatial corners")
-    if any(dims[i + 1] + upper[i] - lower[i] <= 0 for i in range(rank - 2)):
-        raise ValueError("IM2COL spatial bounding box must have positive extent")
-    _integers((channels_per_pixel,), "channels_per_pixel", 1, 256)
-    _integers((pixels_per_column,), "pixels_per_column", 1, 1024)
-    traversal = _integers(
-        (1,) * rank if traversal_strides is None else traversal_strides,
-        "traversal_strides",
-        1,
-        8,
-    )
-    if len(traversal) != rank:
-        raise ValueError("Expected rank traversal strides")
-    swizzle = _validate_swizzle(dtype, channels_per_pixel, swizzle)
-    descriptor = _HostTensorMap(dtype, (channels_per_pixel, pixels_per_column), swizzle, owner)
-    if fake:
-        return descriptor
-    result = _driver_library().cuTensorMapEncodeIm2col(
-        descriptor.address,
-        int(_DATA_TYPES[dtype]),
-        rank,
-        global_address,
-        (ctypes.c_uint64 * rank)(*dims),
-        (ctypes.c_uint64 * (rank - 1))(*strides),
-        (ctypes.c_int32 * (rank - 2))(*lower),
-        (ctypes.c_int32 * (rank - 2))(*upper),
-        channels_per_pixel,
-        pixels_per_column,
-        (ctypes.c_uint32 * rank)(*traversal),
-        int(driver.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE),
-        int(swizzle),
-        int(driver.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE),
-        int(driver.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-    )
-    return _check_encoding(result, "cuTensorMapEncodeIm2col", descriptor)
-
-
-def _create_tensor_map_tiled(
-    global_address: int | None,
-    dtype: type[cutlass.Numeric],
-    global_dims: Sequence[int],
-    global_strides: Sequence[int],
-    box_dims: Sequence[int],
-    *,
-    swizzle: cuda.TensorMapSwizzle = cuda.TensorMapSwizzle.s128b,
-    owner: object | None = None,
-    fake: bool = False,
-) -> _HostTensorMap:
-    """Encode unit-traversal tiled weights; all arrays are in TMA order.
-
-    For KTRSC weights use dims=(C,S,R,T,K), box=(k_tile,1,1,1,n_per_cta).
-    ``fake=True`` accepts global_address=None and performs no driver calls.
-    """
-    dims, strides = _validate_layout(global_address, dtype, global_dims, global_strides, fake)
-    rank = len(dims)
-    box = _integers(box_dims, "box_dims", 1, 256)
-    if len(box) != rank:
-        raise ValueError("Expected rank box dimensions")
-    swizzle = _validate_swizzle(dtype, box[0], swizzle)
-    descriptor = _HostTensorMap(dtype, box, swizzle, owner)
-    if fake:
-        return descriptor
-    result = _driver_library().cuTensorMapEncodeTiled(
-        descriptor.address,
-        int(_DATA_TYPES[dtype]),
-        rank,
-        global_address,
-        (ctypes.c_uint64 * rank)(*dims),
-        (ctypes.c_uint64 * (rank - 1))(*strides),
-        (ctypes.c_uint32 * rank)(*box),
-        (ctypes.c_uint32 * rank)(*((1,) * rank)),
-        int(driver.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE),
-        int(swizzle),
-        int(driver.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_NONE),
-        int(driver.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-    )
-    return _check_encoding(result, "cuTensorMapEncodeTiled", descriptor)
 
 
 @cute.kernel
@@ -1655,9 +1390,9 @@ class _Launch:
     @cute.jit
     def __call__(
         self,
-        a: _HostTensorMap,
-        b: _HostTensorMap,
-        c: _HostTensorMap,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
         stream: driver.CUstream,
         conv_bias: cute.Tensor = None,
         gamma: cute.Tensor = None,
@@ -1669,6 +1404,14 @@ class _Launch:
         prep_residual: cute.Tensor = None,
     ) -> None:
         cfg = self.config
+        tma_a_desc, tma_b_desc, tma_c_desc = _make_tensor_maps(
+            cfg,
+            a,
+            b,
+            c,
+            prepared_output=self.fuse_norm,
+            spatial_output=self.spatial_output,
+        )
         groups = 2
         tiles = (
             cute.ceil_div(math.prod(cfg.output_shape[:-1]), 128),
@@ -1701,9 +1444,9 @@ class _Launch:
             c_stages,
             True,
             cfg.output_shape[1:4],
-            a,
-            b,
-            c,
+            tma_a_desc,
+            tma_b_desc,
+            tma_c_desc,
             conv_bias,
             gamma,
             prep_padded=prep_padded,
@@ -1730,20 +1473,21 @@ class _Launch:
         )
 
 
-def _descriptors(
+def _make_tensor_maps(
     cfg: ConvConfig,
-    x: torch.Tensor | None = None,
-    weight: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
+    x: cute.Tensor,
+    weight: cute.Tensor,
+    output: cute.Tensor,
     *,
     prepared_output: bool = False,
     spatial_output: bool = False,
-) -> tuple[_HostTensorMap, _HostTensorMap, _HostTensorMap]:
-    fake = x is None
+) -> tuple[cuda.TensorMap, cuda.TensorMap, cuda.TensorMap]:
+    """Build public tensor maps inside the JIT host wrapper."""
     dtype = cutlass.BFloat16
     a_dims, a_strides = _contiguous_tma_layout(cfg.input_shape, dtype)
-    b_dims, b_strides = _contiguous_tma_layout(cfg.packed_weight_shape if fake else tuple(weight.shape), dtype)
+    b_dims, b_strides = _contiguous_tma_layout(cfg.packed_weight_shape, dtype)
     c_dims, c_strides = _contiguous_tma_layout(cfg.output_shape, dtype)
+    output_offset = 0
     if prepared_output or spatial_output:
         # Logical T/H/W omit the halo, while physical pitches include it.
         # An IM2COL store can therefore walk 128 logical pixels across rows,
@@ -1751,49 +1495,69 @@ def _descriptors(
         _, t, h, w, c = cfg.output_shape
         pad_hw = 2 if prepared_output else 1
         pad_t = 2 if prepared_output else 0
-        c_strides = (
-            c * 2,
-            (w + pad_hw) * c * 2,
-            (h + pad_hw) * (w + pad_hw) * c * 2,
-            (t + pad_t) * (h + pad_hw) * (w + pad_hw) * c * 2,
+        c_strides_bytes = (
+            c * dtype.width // 8,
+            (w + pad_hw) * c * dtype.width // 8,
+            (h + pad_hw) * (w + pad_hw) * c * dtype.width // 8,
+            (t + pad_t) * (h + pad_hw) * (w + pad_hw) * c * dtype.width // 8,
         )
-    a = _create_tensor_map_im2col(
-        None if fake else x.data_ptr(),
-        dtype,
-        a_dims,
-        a_strides,
+        if any(stride % 16 for stride in c_strides_bytes):
+            raise ValueError("Output TMA strides must be multiples of 16 bytes")
+        c_strides = tuple(stride // 16 for stride in c_strides_bytes)
+        if prepared_output:
+            output_offset = (2 * (h + 2) * (w + 2) + (w + 2) + 1) * c
+
+    tma_a_desc = cuda.create_tensor_map_im2col(
+        global_address=x.iterator.toint(),
+        dtype=dtype,
+        global_dims=a_dims,
+        global_strides=a_strides,
         lower_corner=(0, 0, 0),
         upper_corner=(-2, -2, -2),
         channels_per_pixel=64,
         pixels_per_column=128,
         swizzle=cuda.TensorMapSwizzle.s128b,
-        owner=x,
-        fake=fake,
     )
-    b = _create_tensor_map_tiled(
-        None if fake else weight.data_ptr(),
-        dtype,
-        b_dims,
-        b_strides,
+    tma_b_desc = cuda.create_tensor_map_tiled(
+        global_address=weight.iterator.toint(),
+        dtype=dtype,
+        global_dims=b_dims,
+        global_strides=b_strides,
         box_dims=(64, 1, 1, 1, 80),
         swizzle=cuda.TensorMapSwizzle.s128b,
-        owner=weight,
-        fake=fake,
     )
-    c = _create_tensor_map_im2col(
-        None if fake else output.data_ptr(),
-        dtype,
-        c_dims,
-        c_strides,
+    tma_c_desc = cuda.create_tensor_map_im2col(
+        global_address=(output.iterator + output_offset).toint(),
+        dtype=dtype,
+        global_dims=c_dims,
+        global_strides=c_strides,
         lower_corner=(0, 0, 0),
         upper_corner=(0, 0, 0),
         channels_per_pixel=32,
         pixels_per_column=128,
         swizzle=cuda.TensorMapSwizzle.s64b,
-        owner=output,
-        fake=fake,
     )
-    return a, b, c
+    return tma_a_desc, tma_b_desc, tma_c_desc
+
+
+def _fake_conv_operands(
+    cfg: ConvConfig,
+    *,
+    prepared_output: bool = False,
+    spatial_output: bool = False,
+) -> tuple[cute.Tensor, cute.Tensor, cute.Tensor]:
+    """Create flat fake buffers matching the three runtime tensor arguments."""
+    output_shape = cfg.output_shape
+    if prepared_output:
+        n, t, h, w, c = output_shape
+        output_shape = (n, t + 2, h + 2, w + 2, c)
+    elif spatial_output:
+        n, t, h, w, c = output_shape
+        output_shape = (n, t, h + 1, w + 1, c)
+    return tuple(
+        make_fake_compact_tensor(cutlass.BFloat16, (math.prod(shape),), assumed_align=16)
+        for shape in (cfg.input_shape, cfg.packed_weight_shape, output_shape)
+    )
 
 
 @lru_cache(maxsize=32)
@@ -1802,8 +1566,9 @@ def compile_conv(config: ConvConfig = _DEFAULT_CONV_CONFIG) -> Callable:
     config.validate()
     return cute.compile(
         _Launch(config),
-        *_descriptors(config),
-        driver.CUstream(0),
+        *_fake_conv_operands(config),
+        make_fake_stream(use_tvm_ffi_env_stream=False),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1834,8 +1599,8 @@ def compile_prepared(
             has_residual=has_residual,
             has_residual_bias=has_residual_bias,
         ),
-        *_descriptors(config, prepared_output=True),
-        driver.CUstream(0),
+        *_fake_conv_operands(config, prepared_output=True),
+        make_fake_stream(use_tvm_ffi_env_stream=False),
         parameter,
         parameter,
         *tensors,
@@ -1846,7 +1611,7 @@ def compile_prepared(
         make_fake_compact_tensor(cutlass.BFloat16, (math.prod(config.output_shape),), assumed_align=16)
         if has_residual
         else None,
-        options="--ptxas-options=--fmad=false",
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1872,8 +1637,8 @@ def compile_spatial_residual(
             has_residual_bias=has_residual_bias,
             spatial_output=True,
         ),
-        *_descriptors(config, spatial_output=True),
-        driver.CUstream(0),
+        *_fake_conv_operands(config, spatial_output=True),
+        make_fake_stream(use_tvm_ffi_env_stream=False),
         parameter,
         None,
         flat((n, t, h + 1, w + 1, c)),
@@ -1882,7 +1647,7 @@ def compile_spatial_residual(
         flat(config.output_shape),
         parameter if has_residual_bias else None,
         None,
-        options="--ptxas-options=--fmad=false",
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1900,15 +1665,15 @@ def _prepared_shapes(
 
 
 class PreparedConv:
-    """Bound buffers/descriptors and reusable output for graph-safe launches.
+    """Bound buffers and reusable output for graph-safe launches.
 
     The object retains all tensor allocations. Do not resize or replace their
     storage while this object or a captured graph is in use. Launches follow
-    the current Torch CUDA stream; host descriptor creation is outside capture.
-    Retain this object until asynchronous work completes, including captured
-    graph replay. Calls and output consumption must be serialized: output is
-    reused, and concurrent streams are not independently buffered. Autograd is
-    unsupported; grad-enabled operands are rejected before DLPack detachment.
+    the current Torch CUDA stream. Retain this object until asynchronous work
+    completes, including captured graph replay. Calls and output consumption
+    must be serialized: output is reused, and concurrent streams are not
+    independently buffered. Autograd is unsupported; grad-enabled operands are
+    rejected when the launch is bound.
     Weights may use logical OTRSC storage or zero-filled K64-padded channel
     rows. Descriptors use their actual shape and retain that storage, without
     hidden packing, so graph replay still sees in-place operand updates.
@@ -1983,9 +1748,7 @@ class PreparedConv:
                 or tensor.data_ptr() % 16
             ):
                 raise ValueError(f"{label} must be aligned contiguous BF16 on the input device, shape {shape}")
-        self.residual_owners = (residual, residual_bias)
         self.parameters = ()
-        self.parameter_owners = (conv_bias, gamma)
         if conv_bias is not None:
             if not spatial_output and (config.co not in (160, 320)):
                 raise ValueError("The fused epilogue requires Co in (160, 320) and tile_n=160")
@@ -2001,13 +1764,10 @@ class PreparedConv:
                 ):
                     raise ValueError(f"Bias/gamma must be aligned CUDA BF16 vectors of {config.co}")
             self.parameters = tuple(
-                # Checkpoint Parameters keep requires_grad inside inference
-                # mode, but DLPack only accepts explicitly detached views.
-                from_dlpack(parameter.detach(), assumed_align=16) if parameter is not None else None
+                parameter.detach() if parameter is not None else None
                 for parameter in (conv_bias, gamma)
             )
         self.device = x.device
-        self.previous = previous
         if prepare_next_input:
             if previous is not None and (previous.ndim != 5 or previous.shape[1] not in (1, 2)):
                 raise ValueError("History must be NTHWC with one or two frames")
@@ -2025,15 +1785,9 @@ class PreparedConv:
             cache = torch.empty(cache_shape, device=x.device, dtype=x.dtype)
             summed = torch.empty(config.output_shape, device=x.device, dtype=x.dtype) if residual is not None else None
             self.output = PreparedConvInput(padded, cache, summed)
-            self.descriptors = _descriptors(
-                config,
-                x,
-                weight,
-                padded[:, 2:, 1:-1, 1:-1, :],
-                prepared_output=True,
-            )
+            output_storage = padded
             self.parameters += tuple(
-                from_dlpack(tensor.detach().view(-1), assumed_align=16)
+                tensor.detach().view(-1)
                 for tensor in (
                     padded,
                     cache,
@@ -2041,29 +1795,32 @@ class PreparedConv:
                 )
             )
             self.parameters += tuple(
-                from_dlpack(tensor.detach().view(-1), assumed_align=16) if tensor is not None else None
+                tensor.detach().view(-1) if tensor is not None else None
                 for tensor in (residual, residual_bias, summed)
             )
             self.compiled = compile_prepared(config, previous_frames, residual is not None, residual_bias is not None)
         elif spatial_output:
             n, t, h, w, c = config.output_shape
             self.output = torch.empty((n, t, h + 1, w + 1, c), device=x.device, dtype=x.dtype)
-            self.descriptors = _descriptors(config, x, weight, self.output, spatial_output=True)
+            output_storage = self.output
             self.parameters += tuple(
-                from_dlpack(tensor.detach().view(-1), assumed_align=16) if tensor is not None else None
+                tensor.detach().view(-1) if tensor is not None else None
                 for tensor in (self.output, None, None, residual, residual_bias, None)
             )
             self.compiled = compile_spatial_residual(config, residual_bias is not None)
         else:
             self.output = torch.empty(config.output_shape, device=x.device, dtype=x.dtype)
-            self.descriptors = _descriptors(config, x, weight, self.output)
+            output_storage = self.output
             self.compiled = compile_conv(config)
+        self.operands = tuple(
+            tensor.detach().view(-1) for tensor in (x, weight, output_storage)
+        )
 
     def __call__(self) -> torch.Tensor | PreparedConvInput:
         """Enqueue convolution and return the reused output allocation."""
         with torch.cuda.device(self.device):
             stream = driver.CUstream(torch.cuda.current_stream().cuda_stream)
-            self.compiled(*self.descriptors, stream, *self.parameters)
+            self.compiled(*self.operands, stream, *self.parameters)
         return self.output
 
 
@@ -2288,38 +2045,34 @@ class InputConvConfig:
 _DEFAULT_INPUT_CONV_CONFIG = InputConvConfig()
 
 
-def _input_descriptors(
+def _make_input_tensor_maps(
     cfg: InputConvConfig,
-    weight: torch.Tensor | None = None,
-    output: torch.Tensor | None = None,
-) -> tuple[_HostTensorMap, _HostTensorMap]:
-    fake = weight is None
+    weight: cute.Tensor,
+    output: cute.Tensor,
+) -> tuple[cuda.TensorMap, cuda.TensorMap]:
+    """Build input-convolution tensor maps inside the JIT host wrapper."""
     dims, strides = _contiguous_tma_layout((160, 448), cutlass.BFloat16)
-    b = _create_tensor_map_tiled(
-        None if fake else weight.data_ptr(),
-        cutlass.BFloat16,
-        dims,
-        strides,
+    tma_b_desc = cuda.create_tensor_map_tiled(
+        global_address=weight.iterator.toint(),
+        dtype=cutlass.BFloat16,
+        global_dims=dims,
+        global_strides=strides,
         box_dims=(64, 160),
         swizzle=cuda.TensorMapSwizzle.s128b,
-        owner=weight,
-        fake=fake,
     )
     dims, strides = _contiguous_tma_layout(cfg.output_shape, cutlass.BFloat16)
-    c = _create_tensor_map_im2col(
-        None if fake else output.data_ptr(),
-        cutlass.BFloat16,
-        dims,
-        strides,
+    tma_c_desc = cuda.create_tensor_map_im2col(
+        global_address=output.iterator.toint(),
+        dtype=cutlass.BFloat16,
+        global_dims=dims,
+        global_strides=strides,
         lower_corner=(0, 0, 0),
         upper_corner=(0, 0, 0),
         channels_per_pixel=32,
         pixels_per_column=128,
         swizzle=cuda.TensorMapSwizzle.s64b,
-        owner=output,
-        fake=fake,
     )
-    return b, c
+    return tma_b_desc, tma_c_desc
 
 
 class _InputLaunch:
@@ -2333,11 +2086,12 @@ class _InputLaunch:
     def __call__(
         self,
         x: cute.Tensor,
-        b: _HostTensorMap,
-        c: _HostTensorMap,
+        weight: cute.Tensor,
+        output: cute.Tensor,
         stream: driver.CUstream,
     ) -> None:
         cfg = self.cfg
+        tma_b_desc, tma_c_desc = _make_input_tensor_maps(cfg, weight, output)
         tiles = ((math.prod(cfg.output_shape[:-1]) + 127) // 128, 1, 1)
         scheduler = PersistentTileSchedulerParams(tiles, (1, 1, 1))
         grid = StaticPersistentTileScheduler.get_grid_shape(scheduler, cfg.ctas)
@@ -2351,9 +2105,9 @@ class _InputLaunch:
             2,
             False,
             cfg.output_shape[1:4],
-            b,
-            b,
-            c,
+            tma_b_desc,
+            tma_b_desc,
+            tma_c_desc,
             packed_x=x,
             packed_shape=(cfg.n, cfg.t, cfg.h, cfg.w),
         ).launch(
@@ -2367,10 +2121,18 @@ class _InputLaunch:
 
 @lru_cache(maxsize=32)
 def compile_input(cfg: InputConvConfig = _DEFAULT_INPUT_CONV_CONFIG) -> Callable:
-    """Compile with fake descriptors and no CUDA tensors or context."""
+    """Compile with fake buffers and no CUDA tensors or context."""
     cfg.validate()
-    x = make_fake_compact_tensor(cutlass.BFloat16, (math.prod(cfg.input_shape),), assumed_align=16)
-    return cute.compile(_InputLaunch(cfg), x, *_input_descriptors(cfg), driver.CUstream(0))
+    operands = tuple(
+        make_fake_compact_tensor(cutlass.BFloat16, (math.prod(shape),), assumed_align=16)
+        for shape in (cfg.input_shape, (160, 448), cfg.output_shape)
+    )
+    return cute.compile(
+        _InputLaunch(cfg),
+        *operands,
+        make_fake_stream(use_tvm_ffi_env_stream=False),
+        options="--enable-tvm-ffi",
+    )
 
 
 def pack_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -2406,15 +2168,16 @@ class PreparedInputConv:
         self.weight = weight
         self.output = torch.empty(cfg.output_shape, dtype=x.dtype, device=x.device)
         with torch.cuda.device(x.device):
-            self.descriptors = _input_descriptors(cfg, weight, self.output)
-            self.x_dsl = from_dlpack(x.reshape(-1), assumed_align=16)
+            self.operands = tuple(
+                tensor.detach().view(-1)
+                for tensor in (x, weight, self.output)
+            )
             self.compiled = compile_input(cfg)
 
     def __call__(self) -> torch.Tensor:
         with torch.cuda.device(self.x.device):
             self.compiled(
-                self.x_dsl,
-                *self.descriptors,
+                *self.operands,
                 driver.CUstream(torch.cuda.current_stream().cuda_stream),
             )
         return self.output
