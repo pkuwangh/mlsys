@@ -29,8 +29,10 @@ into staged shared memory; no global im2col or tensor transpose is allocated.
 The persistent device pipeline has independent producer, MMA, and epilogue
 warps and two TMEM accumulator stages. Fused C320->C320 uses six operand stages
 and six SMEM output-store stages. ``prepare_next`` stores activated output
-directly into the next convolution's padded NTHWC input and emits its temporal
-cache in the same launch. With a residual branch it replaces v_c above by
+directly into the next convolution's padded NTHWC input and emits current
+cache frames in the same launch. Existing history is copied separately by the
+host wrapper; the convolution writes current frames and zero padding only.
+With a residual branch it replaces v_c above by
 B(FP32(v_c) + FP32(B(FP32(residual_c) + FP32(residual_bias_c)))), omitting
 the inner addition when residual_bias is absent. This summed value is also
 saved as the next block's skip input. No raw convolution output is materialized.
@@ -124,7 +126,6 @@ def kernel(
     packed_shape: cutlass.Constexpr = None,
     prep_padded: cute.Tensor = None,
     prep_cache: cute.Tensor = None,
-    prep_previous: cute.Tensor = None,
     PREP_SHAPE: cutlass.Constexpr = None,
     residual: cute.Tensor = None,
     residual_bias: cute.Tensor = None,
@@ -183,8 +184,8 @@ def kernel(
     if cutlass.const_expr(PREP_SHAPE is not None):
         if cutlass.const_expr(not FUSE_NORM or packed_shape is not None):
             raise ValueError("Next-convolution preparation requires normalization")
-        if cutlass.const_expr(prep_padded is None or prep_cache is None or prep_previous is None):
-            raise ValueError("Preparation requires padded, cache and history tensors")
+        if cutlass.const_expr(prep_padded is None or prep_cache is None):
+            raise ValueError("Preparation requires padded and cache tensors")
     if cutlass.const_expr(residual is not None):  # noqa: SIM102 - preserve DSL specialization guard
         if cutlass.const_expr(SPATIAL_SHAPE is None and (PREP_SHAPE is None or prep_residual is None)):
             raise ValueError("Residual fusion requires preparation and a saved-sum output")
@@ -421,17 +422,15 @@ def kernel(
                 vector_idx += total_ctas * auxiliary_threads
         if cutlass.const_expr(PREP_SHAPE is not None):
             # Auxiliary rows and the TMA interior are disjoint. Enumerate only
-            # the two history planes and current-frame spatial borders, not
-            # the full output. Eight BF16 elements per lane give aligned,
-            # coalesced stores across each 160-channel row.
+            # missing history planes and spatial borders. Existing history
+            # interiors are preserved for the caller's separate copy.
             Z_out, P_out, Q_out = zpq
             batches, previous_frames = PREP_SHAPE
-            cache_frames = min(2, Z_out + previous_frames)
             padded_h = P_out + 2
             padded_w = Q_out + 2
-            history_rows = 2 * padded_h * padded_w
+            history_rows = (2 - previous_frames) * padded_h * padded_w
             border_rows = 2 * padded_w + 2 * P_out
-            auxiliary_rows = history_rows + Z_out * border_rows
+            auxiliary_rows = history_rows + (Z_out + previous_frames) * border_rows
             bx, by, bz = cute.arch.block_idx()
             gx, gy, gz = cute.arch.grid_dim()
             # The persistent scheduler places clusters along grid Z, not X.
@@ -458,7 +457,7 @@ def kernel(
                     pw = local_row % padded_w
                 else:
                     border = (local_row - history_rows) % border_rows
-                    pt = (local_row - history_rows) // border_rows + 2
+                    pt = (local_row - history_rows) // border_rows + 2 - previous_frames
                     if border < 2 * padded_w:
                         ph = border // padded_w * (P_out + 1)
                         pw = border % padded_w
@@ -466,24 +465,6 @@ def kernel(
                         ph = (border - 2 * padded_w) // 2 + 1
                         pw = (border - 2 * padded_w) % 2 * (Q_out + 1)
                 values = cutlass.vector.full((8,), 0, cutlass.BFloat16)
-                valid_spatial = ph > 0 and ph <= P_out and pw > 0 and pw <= Q_out
-                if cutlass.const_expr(previous_frames > 0):  # noqa: SIM102 - preserve DSL specialization guard
-                    if pt < 2 and pt >= 2 - previous_frames and valid_spatial:
-                        source = (
-                            ((cutlass.Int64(batch) * previous_frames + pt - 2 + previous_frames) * P_out + ph - 1)
-                            * Q_out
-                            + pw
-                            - 1
-                        ) * norm_channels + channel
-                        values = (prep_previous.iterator.raw_ptr() + source).load(count=8, alignment=16)
-                        if pt - 2 >= Z_out - cache_frames:
-                            cache_offset = (
-                                ((cutlass.Int64(batch) * cache_frames + pt - 2 - Z_out + cache_frames) * P_out + ph - 1)
-                                * Q_out
-                                + pw
-                                - 1
-                            ) * norm_channels + channel
-                            (prep_cache.iterator.raw_ptr() + cache_offset).store(values, alignment=16)
                 destination = (
                     ((cutlass.Int64(batch) * (Z_out + 2) + pt) * padded_h + ph) * padded_w + pw
                 ) * norm_channels + channel
@@ -783,6 +764,8 @@ def kernel(
                             time_limit=10000000,
                         ):
                             pass
+                        if cutlass.const_expr(packed_shape is not None):
+                            cute.arch.fence_view_async_shared()
                         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
 
                         # Issue all K-blocks for this AB stage.
@@ -1398,7 +1381,6 @@ class _Launch:
         gamma: cute.Tensor = None,
         prep_padded: cute.Tensor = None,
         prep_cache: cute.Tensor = None,
-        prep_previous: cute.Tensor = None,
         residual: cute.Tensor = None,
         residual_bias: cute.Tensor = None,
         prep_residual: cute.Tensor = None,
@@ -1451,7 +1433,6 @@ class _Launch:
             gamma,
             prep_padded=prep_padded,
             prep_cache=prep_cache,
-            prep_previous=prep_previous,
             PREP_SHAPE=(cfg.n, self.previous_frames) if self.previous_frames is not None else None,
             residual=residual,
             residual_bias=residual_bias,
@@ -1590,7 +1571,7 @@ def compile_prepared(
     parameter = make_fake_compact_tensor(cutlass.BFloat16, (config.co,), assumed_align=16)
     tensors = tuple(
         make_fake_compact_tensor(cutlass.BFloat16, (math.prod(shape),), assumed_align=16)
-        for shape in _prepared_shapes(config, previous_frames)
+        for shape in _prepared_shapes(config, previous_frames)[:2]
     )
     return cute.compile(
         _Launch(
@@ -1643,7 +1624,6 @@ def compile_spatial_residual(
         None,
         flat((n, t, h + 1, w + 1, c)),
         None,
-        None,
         flat(config.output_shape),
         parameter if has_residual_bias else None,
         None,
@@ -1655,13 +1635,19 @@ def _prepared_shapes(
     config: ConvConfig,
     previous_frames: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    """Padded, new-cache and history argument shapes (one dummy row if absent)."""
+    """Padded, new-cache and history shapes."""
     n, t, h, w, c = config.output_shape
     return (
         (n, t + 2, h + 2, w + 2, c),
         (n, min(2, t + previous_frames), h, w, c),
-        (n, previous_frames, h, w, c) if previous_frames else (c,),
+        (n, previous_frames, h, w, c),
     )
+
+
+@torch.compile(fullgraph=True, dynamic=False, options={"triton.cudagraphs": False})
+def _copy_history(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy history into strided output regions with shape-specialized indexing."""
+    destination.copy_(source)
 
 
 class PreparedConv:
@@ -1768,6 +1754,7 @@ class PreparedConv:
                 for parameter in (conv_bias, gamma)
             )
         self.device = x.device
+        self.history_copies: tuple[tuple[torch.Tensor, torch.Tensor], ...] = ()
         if prepare_next_input:
             if previous is not None and (previous.ndim != 5 or previous.shape[1] not in (1, 2)):
                 raise ValueError("History must be NTHWC with one or two frames")
@@ -1788,12 +1775,14 @@ class PreparedConv:
             output_storage = padded
             self.parameters += tuple(
                 tensor.detach().view(-1)
-                for tensor in (
-                    padded,
-                    cache,
-                    conv_bias if previous is None else previous,
-                )
+                for tensor in (padded, cache)
             )
+            if previous is not None:
+                previous = previous.detach()
+                self.history_copies = ((padded[:, 2 - previous_frames : 2, 1:-1, 1:-1, :], previous),)
+                old_frames = cache_shape[1] - config.output_shape[1]
+                if old_frames > 0:
+                    self.history_copies += ((cache[:, :old_frames], previous[:, -old_frames:]),)
             self.parameters += tuple(
                 tensor.detach().view(-1) if tensor is not None else None
                 for tensor in (residual, residual_bias, summed)
@@ -1805,7 +1794,7 @@ class PreparedConv:
             output_storage = self.output
             self.parameters += tuple(
                 tensor.detach().view(-1) if tensor is not None else None
-                for tensor in (self.output, None, None, residual, residual_bias, None)
+                for tensor in (self.output, None, residual, residual_bias, None)
             )
             self.compiled = compile_spatial_residual(config, residual_bias is not None)
         else:
@@ -1817,10 +1806,12 @@ class PreparedConv:
         )
 
     def __call__(self) -> torch.Tensor | PreparedConvInput:
-        """Enqueue convolution and return the reused output allocation."""
+        """Enqueue convolution and history copies, returning reused output storage."""
         with torch.cuda.device(self.device):
             stream = driver.CUstream(torch.cuda.current_stream().cuda_stream)
             self.compiled(*self.operands, stream, *self.parameters)
+            for destination, source in self.history_copies:
+                _copy_history(destination, source)
         return self.output
 
 
@@ -2241,6 +2232,8 @@ def verify() -> None:
     torch.backends.cudnn.allow_tf32 = False
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     for ci, co in ((160, 160), (160, 320), (320, 320), (320, 640), (640, 640)):
+        # Each family is an independent set of compiled-copy specializations.
+        torch.compiler.reset()
         # These reduced batches are correctness checks, never performance results.
         frames, height, width = (4, 320, 240) if co == 160 else (2, 160, 120) if co == 320 else (1, 80, 60)
         cfg = ConvConfig(
@@ -2314,16 +2307,27 @@ def verify() -> None:
         )
         torch.testing.assert_close(tail_raw().float(), tail_ref, atol=0.02, rtol=0.02)
         if co <= 320:
-            history = torch.randn(1, 2, 5, 7, co, device="cuda", dtype=x.dtype)
-            for with_residual in (False, True):
-                skip = torch.randn(tail_cfg.output_shape, device="cuda", dtype=x.dtype) if with_residual else None
-                tail_fused = prepare_next(tail_x, module.weight, bias, gamma, tail_cfg, history, residual=skip)
-                actual = tail_fused()
-                expected = rmsnorm_silu_conv_prep(tail_raw(), gamma, previous=history, input_bias=bias, residual=skip)
-                torch.testing.assert_close(actual.padded, expected.padded, atol=0, rtol=0)
-                torch.testing.assert_close(actual.cache, expected.cache, atol=0, rtol=0)
-                if with_residual:
-                    torch.testing.assert_close(actual.residual, expected.residual, atol=0, rtol=0)
+            for history_frames in (0, 1, 2):
+                history = torch.randn(1, history_frames, 5, 7, co, device="cuda", dtype=x.dtype) if history_frames else None
+                for with_residual in (False, True):
+                    skip = torch.randn(tail_cfg.output_shape, device="cuda", dtype=x.dtype) if with_residual else None
+                    tail_fused = prepare_next(tail_x, module.weight, bias, gamma, tail_cfg, history, residual=skip)
+                    actual = tail_fused()
+                    if history_frames == 2:
+                        for _ in range(3):
+                            tail_fused()
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            tail_fused()
+                        history.normal_()
+                        actual.padded.fill_(float("nan"))
+                        actual.cache.fill_(float("nan"))
+                        graph.replay()
+                    expected = rmsnorm_silu_conv_prep(tail_raw(), gamma, previous=history, input_bias=bias, residual=skip)
+                    torch.testing.assert_close(actual.padded, expected.padded, atol=0, rtol=0)
+                    torch.testing.assert_close(actual.cache, expected.cache, atol=0, rtol=0)
+                    if with_residual:
+                        torch.testing.assert_close(actual.residual, expected.residual, atol=0, rtol=0)
         print(f"C{ci}->{co}: correctness PASS (including partial CTA pair)", flush=True)
     cfg = InputConvConfig(n=1, t=6, h=322, w=242, ctas=sm_count)
     x = torch.randn(cfg.input_shape, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -2338,12 +2342,26 @@ def verify() -> None:
         return torch.nn.functional.conv3d(torch_x, weight).permute(0, 2, 3, 4, 1)
 
     torch.testing.assert_close(raw(), reference(), atol=0.02, rtol=0.02)
+    # Exercise the C12 producer/MMA ordering across persistent reuse and replay.
+    for _ in range(3):
+        raw()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        raw()
+    for _ in range(3):
+        x.normal_(0, 0.1)
+        x[..., 12:] = 0
+        torch_x.copy_(x[..., :12].permute(0, 4, 1, 2, 3))
+        raw.output.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(raw.output, reference(), atol=0.02, rtol=0.02)
     print("Convolution family: PASS (raw, fused, history, residual, input)", flush=True)
 
 
 @torch.inference_mode()
 def _benchmark_conv(cfg: ConvConfig, history: int, spatial: bool) -> None:
     """Time one production callsite; release its large buffers before the next."""
+    torch.compiler.reset()
     if __package__:
         from .norm import rmsnorm_silu_conv_prep, torch_reference
         from .residual import bias_residual, torch_bias_residual
