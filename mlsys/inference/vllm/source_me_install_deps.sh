@@ -56,6 +56,6 @@ uv pip install --pre "torch==2.13.0" "torchaudio>2.11.0.dev0,<=2.11.0" "torchvis
 # uv pip install "torch==2.13.0" "torchaudio==2.11.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
 
 # other deps
-uv pip install "av==18.1.0"
+uv pip install "av==18.1.0" openai
 
 python "${CURR_DIR}/check_cuda.py"

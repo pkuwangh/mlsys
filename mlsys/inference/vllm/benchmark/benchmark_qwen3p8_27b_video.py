@@ -1,5 +1,10 @@
 """Profile Qwen3.5 captioning with frames sampled from sample1.mp4.
 
+Use --vllm-video-decode to pass a file URL through LLM.chat(), leaving video
+loading, decoding, and sampling to vLLM. This includes video loading/decoding in
+the measured time and uses the model's chat template with thinking disabled.
+The default samples frames once before timing using the manual PyAV sampler.
+
     nsys profile \
         --gpu-metrics-devices=0 \
         --trace=cuda,nvtx,osrt,cublas,cudnn \
@@ -15,7 +20,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -221,6 +228,23 @@ def main() -> None:
         "--video", default="data-samples/sample1.mp4", help="Path to the video file"
     )
     parser.add_argument(
+        "--vllm-video-decode",
+        action="store_true",
+        help="Let vLLM load and decode the local video via LLM.chat()",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        help="Maximum output tokens per request; config defaults: "
+        + ", ".join(f"{name}={cfg['OUTPUT_TOKENS']}" for name, cfg in CONFIGS.items()),
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        help="Maximum engine sequences and warmup requests; measured requests are 3x this value; config defaults: "
+        + ", ".join(f"{name}={cfg['MAX_NUM_SEQS']}" for name, cfg in CONFIGS.items()),
+    )
+    parser.add_argument(
         "--model",
         default=get_model_path(_TARGET_MODEL),
         help="Path to the target model",
@@ -263,7 +287,15 @@ def main() -> None:
     if args.num_speculative_tokens is not None and args.num_speculative_tokens <= 0:
         parser.error("--num-speculative-tokens must be positive")
 
-    config = CONFIGS[args.config]
+    config = CONFIGS[args.config].copy()
+    if args.max_tokens is not None:
+        if args.max_tokens <= 0:
+            parser.error("--max-tokens must be positive")
+        config["OUTPUT_TOKENS"] = args.max_tokens
+    if args.max_num_seqs is not None:
+        if args.max_num_seqs <= 0:
+            parser.error("--max-num-seqs must be positive")
+        config["MAX_NUM_SEQS"] = args.max_num_seqs
     model_path = str(Path(args.model).expanduser().resolve())
     if not Path(model_path).exists():
         parser.error(f"Target model not found at {model_path!r}")
@@ -319,10 +351,24 @@ def main() -> None:
         output_tokens * _PROFILE_DELAY_FRACTION / (num_speculative_tokens + 1)
     )
 
+    os.environ["QWEN_VIDEO_TEMPORAL_MODE"] = "framewise"
+
     import torch
     from vllm import LLM, SamplingParams
 
-    video, video_metadata = sample_frames(args.video)
+    video_io_kwargs = {}
+    if args.vllm_video_decode:
+        video_path = Path(args.video).expanduser().resolve()
+        if not video_path.is_file():
+            parser.error(f"Video not found at {video_path}")
+        video_io_kwargs = {
+            "allowed_local_media_path": str(video_path.parent),
+            "media_io_kwargs": {"video": {"num_frames": -1, "fps": -1}},
+        }
+        video_summary = "video_decode=vllm"
+    else:
+        video, video_metadata = sample_frames(args.video)
+        video_summary = f"frames={len(video)}"
 
     llm = LLM(
         model=model_path,
@@ -352,17 +398,32 @@ def main() -> None:
             "delay_iterations": delay_iterations,
             "max_iterations": _PROFILE_MAX_INTERATIONS,
         },
+        **video_io_kwargs,
     )
 
     caption_prompt = args.prompt.read_text().strip()
-    prompt = build_prompt(caption_prompt)
-    requests = [
-        {
-            "prompt": prompt,
-            "multi_modal_data": {"video": (video, video_metadata)},
-        }
-        for _ in range(config["MAX_NUM_SEQS"] * 3)
-    ]
+    if args.vllm_video_decode:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": video_path.as_uri()}},
+                    {"type": "text", "text": caption_prompt},
+                ],
+            }
+        ]
+        requests = [messages for _ in range(config["MAX_NUM_SEQS"] * 3)]
+        generate = partial(llm.chat, chat_template_kwargs={"enable_thinking": False})
+    else:
+        prompt = build_prompt(caption_prompt)
+        requests = [
+            {
+                "prompt": prompt,
+                "multi_modal_data": {"video": (video, video_metadata)},
+            }
+            for _ in range(config["MAX_NUM_SEQS"] * 3)
+        ]
+        generate = llm.generate
 
     params = SamplingParams(
         temperature=0.7,
@@ -374,7 +435,7 @@ def main() -> None:
         max_tokens=output_tokens,
     )
     # warmup
-    _ = llm.generate(requests[:config["MAX_NUM_SEQS"]], params, use_tqdm=False)
+    _ = generate(requests[:config["MAX_NUM_SEQS"]], params, use_tqdm=False)
 
     metrics_before = (
         read_spec_decode_metrics(llm, num_speculative_tokens)
@@ -388,7 +449,7 @@ def main() -> None:
         )
     started_at = time.perf_counter()
     try:
-        outputs = llm.generate(requests, params, use_tqdm=False)
+        outputs = generate(requests, params, use_tqdm=False)
     finally:
         elapsed_seconds = time.perf_counter() - started_at
         if args.profile:
@@ -397,7 +458,7 @@ def main() -> None:
 
     generated_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
     print(
-        f"frames={len(video)} generated_tokens={generated_tokens} elapsed={elapsed_seconds:.3f}s tok/s={generated_tokens / elapsed_seconds:.1f}"
+        f"{video_summary} generated_tokens={generated_tokens} elapsed={elapsed_seconds:.3f}s tok/s={generated_tokens / elapsed_seconds:.1f}"
     )
     if metrics_before is not None:
         metrics_after = read_spec_decode_metrics(llm, num_speculative_tokens)
