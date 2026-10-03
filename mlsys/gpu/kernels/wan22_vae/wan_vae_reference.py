@@ -1,4 +1,4 @@
-"""Eager and torch.compile Wan encoders for verification and benchmarking only.
+"""Eager and torch.compile Wan VAEs for verification and benchmarking only.
 
 Production code never imports this module. The reference keeps its own Torch
 layers and temporal orchestration; only small host-side utilities are shared.
@@ -8,7 +8,10 @@ from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
-from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
+from diffusers.models.autoencoders.autoencoder_kl_wan import (
+    AutoencoderKLWan,
+    unpatchify,
+)
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanAttentionBlock as DiffusersWanAttentionBlock,
 )
@@ -21,16 +24,23 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanResidualDownBlock as DiffusersWanResidualDownBlock,
 )
-
+from diffusers.models.autoencoders.autoencoder_kl_wan import (
+    WanResidualUpBlock as DiffusersWanResidualUpBlock,
+)
 from mega_wan_vae._utils import (
     FeatCache,
-    canonicalize_cache as raw_canonicalize_cache,
-    patchify as raw_patchify,
-    update_cache as raw_update_cache,
     validate_frame_count,
     with_channels_last_weights,
 )
-
+from mega_wan_vae._utils import (
+    canonicalize_cache as raw_canonicalize_cache,
+)
+from mega_wan_vae._utils import (
+    patchify as raw_patchify,
+)
+from mega_wan_vae._utils import (
+    update_cache as raw_update_cache,
+)
 
 CACHE_T = 2
 
@@ -144,6 +154,37 @@ def raw_avg_down3d(avg: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         width // avg.factor_s,
     )
     return x.mean(dim=2)
+
+
+def raw_dup_up3d(
+    up: torch.nn.Module, x: torch.Tensor, first_chunk: bool = False
+) -> torch.Tensor:
+    """Expand the decoder shortcut directly into channels-last storage."""
+    batch, _, frames, height, width = x.shape
+    x = x.permute(0, 2, 3, 4, 1).repeat_interleave(up.repeats, dim=-1)
+    x = x.reshape(
+        batch,
+        frames,
+        height,
+        width,
+        up.out_channels,
+        up.factor_t,
+        up.factor_s,
+        up.factor_s,
+    )
+    # Keep this expansion NTHWC: the NCTHW intermediate in DupUp3D can
+    # miscompile with incorrect input strides when fused with the next RMSNorm.
+    x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
+    x = x.view(
+        batch,
+        frames * up.factor_t,
+        height * up.factor_s,
+        width * up.factor_s,
+        up.out_channels,
+    ).permute(0, 4, 1, 2, 3)
+    if first_chunk:
+        x = x[:, :, up.factor_t - 1 :]
+    return x
 
 
 class RawWanCausalConv3d(torch.nn.Module):
@@ -516,3 +557,159 @@ class TorchCompileChunkWanVaeEncoder(torch.nn.Module):
 
     def forward(self, video: torch.Tensor) -> torch.Tensor:
         return self.raw_encoder.encode_temporal_chunks(video, self.chunk_encoder)
+
+
+class RawWanResidualUpBlock(torch.nn.Module):
+    """Torch residual stage with spatial/temporal upsampling and its shortcut."""
+
+    def __init__(self, block: DiffusersWanResidualUpBlock) -> None:
+        super().__init__()
+        self.resnets = torch.nn.ModuleList(
+            RawWanResidualBlock(resnet) for resnet in block.resnets
+        )
+        self.upsampler = (
+            RawWanResample(block.upsampler) if block.upsampler is not None else None
+        )
+        self.avg_shortcut = block.avg_shortcut
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        feat_cache: FeatCache,
+        feat_idx: int = 0,
+        first_chunk: bool = False,
+    ) -> tuple[torch.Tensor, FeatCache, int]:
+        shortcut = x
+        for resnet in self.resnets:
+            x, feat_cache, feat_idx = resnet(x, feat_cache, feat_idx)
+        if self.upsampler is not None:
+            x, feat_cache, feat_idx = self.upsampler(x, feat_cache, feat_idx)
+        if self.avg_shortcut is not None:
+            x = x + raw_dup_up3d(self.avg_shortcut, shortcut, first_chunk)
+        return x, feat_cache, feat_idx
+
+
+class RawWanDecoder3d(torch.nn.Module):
+    """Decode a latent chunk using channels-last Torch layers and explicit caches."""
+
+    def __init__(self, decoder: torch.nn.Module) -> None:
+        super().__init__()
+        if not all(
+            isinstance(block, DiffusersWanResidualUpBlock)
+            for block in decoder.up_blocks
+        ):
+            raise NotImplementedError(
+                "This reference targets the Wan2.2 residual decoder."
+            )
+        self.conv_in = RawWanCausalConv3d(decoder.conv_in)
+        self.mid_block = RawWanMidBlock(decoder.mid_block)
+        self.up_blocks = torch.nn.ModuleList(
+            RawWanResidualUpBlock(block) for block in decoder.up_blocks
+        )
+        self.norm_out = RawWanRMSNorm(decoder.norm_out)
+        self.activation = decoder.nonlinearity
+        self.conv_out = RawWanCausalConv3d(decoder.conv_out)
+        self.cache_size = raw_causal_conv3d_count(decoder)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        feat_cache: FeatCache,
+        first_chunk: bool = False,
+    ) -> tuple[torch.Tensor, FeatCache]:
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+        feat_cache = raw_canonicalize_cache(feat_cache)
+        x, feat_cache, feat_idx = raw_cached_causal_conv3d(
+            self.conv_in, x, feat_cache, 0
+        )
+        x, feat_cache, feat_idx = self.mid_block(x, feat_cache, feat_idx)
+        for block in self.up_blocks:
+            x, feat_cache, feat_idx = block(x, feat_cache, feat_idx, first_chunk)
+        x = self.activation(self.norm_out(x))
+        x, feat_cache, _ = raw_cached_causal_conv3d(
+            self.conv_out, x, feat_cache, feat_idx
+        )
+        return x, feat_cache
+
+
+class TorchWanVaeDecoder(torch.nn.Module):
+    """Decode unnormalized latents into clamped NCTHW video, matching Diffusers."""
+
+    def __init__(self, vae: AutoencoderKLWan) -> None:
+        super().__init__()
+        self.post_quant_conv = RawWanCausalConv3d(vae.post_quant_conv)
+        self.decoder = RawWanDecoder3d(vae.decoder)
+        self.patch_size = getattr(vae.config, "patch_size", None)
+        self.use_tiling = vae.use_tiling
+        self.tile_latent_min_width = (
+            vae.tile_sample_min_width // vae.spatial_compression_ratio
+        )
+        self.tile_latent_min_height = (
+            vae.tile_sample_min_height // vae.spatial_compression_ratio
+        )
+
+    def new_cache(self) -> FeatCache:
+        """Create empty history for an independent latent sequence."""
+        return (None,) * self.decoder.cache_size
+
+    def decode_chunk(
+        self,
+        chunk: torch.Tensor,
+        feat_cache: FeatCache,
+        first_chunk: bool = False,
+    ) -> tuple[torch.Tensor, FeatCache]:
+        """Decode a post-quant-convolution chunk into still-patchified pixels."""
+        return self.decoder(chunk, feat_cache, first_chunk)
+
+    def decode_temporal_chunks(
+        self,
+        latent: torch.Tensor,
+        chunk_decoder: Callable[
+            [torch.Tensor, FeatCache, bool], tuple[torch.Tensor, FeatCache]
+        ]
+        | None = None,
+    ) -> torch.Tensor:
+        """Decode one latent frame per call, then unpatchify and clamp to [-1, 1]."""
+        _, _, frames, height, width = latent.shape
+        if frames < 1:
+            raise ValueError("Decoding requires at least one latent frame.")
+        if self.use_tiling and (
+            width > self.tile_latent_min_width or height > self.tile_latent_min_height
+        ):
+            raise NotImplementedError(
+                "Raw PyTorch decode does not implement VAE tiling."
+            )
+        if chunk_decoder is None:
+            chunk_decoder = self.decode_chunk
+        x = self.post_quant_conv(latent)
+        feat_cache = self.new_cache()
+        outputs = []
+        for i in range(frames):
+            out, feat_cache = chunk_decoder(x[:, :, i : i + 1], feat_cache, i == 0)
+            outputs.append(out)
+        out = torch.cat(outputs, dim=2) if len(outputs) > 1 else outputs[0]
+        if self.patch_size is not None:
+            out = unpatchify(out, patch_size=self.patch_size)
+        return out.clamp(-1.0, 1.0)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode with fresh history; latent mean/std scaling belongs to the caller."""
+        return self.decode_temporal_chunks(latent)
+
+
+class TorchCompileChunkWanVaeDecoder(torch.nn.Module):
+    """Compile decoder chunks while preserving the eager reference's BF16 casts."""
+
+    def __init__(self, vae: AutoencoderKLWan) -> None:
+        super().__init__()
+        self.raw_decoder = TorchWanVaeDecoder(vae).eval()
+        self.chunk_decoder = torch.compile(
+            self.raw_decoder.decoder,
+            fullgraph=True,
+            dynamic=False,
+            options={"emulate_precision_casts": True},
+        )
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        """Run the same temporal loop with compiled chunk execution."""
+        return self.raw_decoder.decode_temporal_chunks(latent, self.chunk_decoder)
