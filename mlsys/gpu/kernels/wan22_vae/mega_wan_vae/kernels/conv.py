@@ -14,9 +14,11 @@ For contiguous NTHWC input X and OTRSC filters W, this computes
         FP32(X[n,t+dt,h+dh,w+dw,c]) * FP32(W[o,dt,dh,dw,c]))
 
 Input already includes causal/spatial padding. The filter is 3x3x3;
-stride and dilation are one, groups is one. The N tile is fixed at 160.
+stride and dilation are one, groups is one. Encoder convolutions use N160
+tiles. Decoder convolutions use N256 tiles for 512->256, 256->256, and 48->1024.
+C256 supports fused normalization and next-input preparation.
 ``prepare`` returns this raw convolution. ``prepare_next`` additionally applies
-the C160/C320 postprocessing below, with B denoting a separate BF16 rounding:
+the C160/C256/C320 postprocessing below, with B denoting a separate BF16 rounding:
 
     v_c = B(FP32(Y_c) + FP32(conv_bias_c))
     d = max(sqrt(sum_c(FP32(v_c)**2)), 1e-12)
@@ -27,7 +29,8 @@ the C160/C320 postprocessing below, with B denoting a separate BF16 rounding:
 TMA performs implicit im2col directly
 into staged shared memory; no global im2col or tensor transpose is allocated.
 The persistent device pipeline has independent producer, MMA, and epilogue
-warps and two TMEM accumulator stages. Fused C320->C320 uses six operand stages
+warps and two TMEM accumulator stages with static persistent scheduling.
+Fused C320->C320 uses six operand stages
 and six SMEM output-store stages. ``prepare_next`` stores activated output
 directly into the next convolution's padded NTHWC input and emits current
 cache frames in the same launch. Existing history is copied separately by the
@@ -41,6 +44,7 @@ and writes a zero bottom row/right column for spatial downsampling. This
 pointwise path supports independent output-channel tiles. Normalization keeps
 all channels of a row in one CTA group: one N160 tile for C160, two sequential
 N160 tiles for C320. C320 requires 2CTA MMA; both widths support residual addition.
+C256 uses one N256 tile with the same rounding and input/cache semantics.
 
 C12 input uses a 1CTA gather producer and seven K64 tiles over C16-padded
 activations and [160,448] weights. General convolutions use TMA im2col with
@@ -68,11 +72,12 @@ from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.experimental import cuda
 from cutlass.experimental import primitives as prims
-from cutlass.utils import PersistentTileSchedulerParams, StaticPersistentTileScheduler
 
 if __package__:
+    from ._scheduler import StaticTileSchedule
     from ._utils import PreparedConvInput, measure, print_benchmark_table
 else:
+    from _scheduler import StaticTileSchedule
     from _utils import PreparedConvInput, measure, print_benchmark_table
 
 
@@ -96,12 +101,47 @@ def _contiguous_tma_layout(
     return dims, tuple(strides)
 
 
+@cute.jit
+def _zero_prepared_padding(padded, vector_idx, vector_stride, zpq: cutlass.Constexpr, shape: cutlass.Constexpr, channels: cutlass.Constexpr):
+    """Zero missing history and spatial borders, leaving existing history intact."""
+    z, h, w = zpq
+    batches, previous_frames = shape
+    padded_h, padded_w = h + 2, w + 2
+    history_rows = (2 - previous_frames) * padded_h * padded_w
+    border_rows = 2 * padded_w + 2 * h
+    auxiliary_rows = history_rows + (z + previous_frames) * border_rows
+    index_type: cutlass.Constexpr = cutlass.Int32 if batches * auxiliary_rows * (channels // 8) < 2**31 else cutlass.Int64
+    while vector_idx < batches * auxiliary_rows * (channels // 8):
+        coordinate_idx = index_type(vector_idx)
+        channel = coordinate_idx % (channels // 8) * 8
+        auxiliary_row = coordinate_idx // (channels // 8)
+        batch = auxiliary_row // auxiliary_rows
+        local_row = auxiliary_row % auxiliary_rows
+        pt, ph, pw = index_type(0), index_type(0), index_type(0)
+        if local_row < history_rows:
+            pt = local_row // (padded_h * padded_w)
+            ph = local_row // padded_w % padded_h
+            pw = local_row % padded_w
+        else:
+            border = (local_row - history_rows) % border_rows
+            pt = (local_row - history_rows) // border_rows + 2 - previous_frames
+            if border < 2 * padded_w:
+                ph = border // padded_w * (h + 1)
+                pw = border % padded_w
+            else:
+                ph = (border - 2 * padded_w) // 2 + 1
+                pw = (border - 2 * padded_w) % 2 * (w + 1)
+        destination = (((cutlass.Int64(batch) * (z + 2) + pt) * padded_h + ph) * padded_w + pw) * channels + channel
+        (padded.iterator.raw_ptr() + destination).store(cutlass.vector.full((8,), 0, cutlass.BFloat16), alignment=16)
+        vector_idx += vector_stride
+
+
 @cute.kernel
 def kernel(
     # Leading specialization label remains visible before DSL name truncation.
     operation: cutlass.Constexpr[str],
     # Persistent tile scheduler parameters
-    tile_sched_params: PersistentTileSchedulerParams,
+    schedule: cutlass.Constexpr[StaticTileSchedule],
     # Constexpr knobs
     mma_tiler: cutlass.Constexpr[tuple[int, int, int]],
     mma_inst_shape_mnk: cutlass.Constexpr[tuple[int, int, int]],
@@ -149,8 +189,8 @@ def kernel(
     dilation_dhw = (1, 1, 1)
     if cutlass.const_expr(mma_tiler[0] != (256 if use_2cta_instrs else 128)):
         raise ValueError("Convolution core requires 128 rows per CTA")
-    if cutlass.const_expr(mma_tiler[1] != 160):
-        raise ValueError("Wan convolution uses tile N=160")
+    if cutlass.const_expr(mma_tiler[1] not in (160, 256)):
+        raise ValueError("Wan convolution uses tile N=160 or N=256")
     if cutlass.const_expr(mma_tiler[2] != 64):
         raise ValueError("Convolution core requires tile K=64")
     if cutlass.const_expr(mma_inst_shape_mnk != (mma_tiler[0], mma_tiler[1], 16)):
@@ -173,14 +213,14 @@ def kernel(
         if cutlass.const_expr(zpq != tuple(d - 2 for d in packed_shape[1:])):
             raise ValueError("Packed gather output geometry must match the padded input")
     if cutlass.const_expr(FUSE_NORM):
-        if cutlass.const_expr(mma_tiler[1] != 160):
-            raise ValueError("Fused normalization requires tileN=160")
         if cutlass.const_expr(conv_bias is None or gamma is None):
             raise ValueError("Fused normalization requires conv_bias and gamma")
         if cutlass.const_expr(conv_bias.element_type != cutlass.BFloat16 or gamma.element_type != cutlass.BFloat16):
             raise TypeError("Fused conv_bias and gamma must be BF16")
-        if cutlass.const_expr(conv_bias.shape not in ((160,), (320,)) or gamma.shape != conv_bias.shape):
-            raise ValueError("Fused conv_bias and gamma must have shape (160,) or (320,)")
+        if cutlass.const_expr(conv_bias.shape not in ((160,), (256,), (320,)) or gamma.shape != conv_bias.shape):
+            raise ValueError("Fused conv_bias and gamma require 160, 256, or 320 channels")
+        if cutlass.const_expr(mma_tiler[1] != (256 if gamma.shape[0] == 256 else 160)):
+            raise ValueError("Normalization tile width must match the channel family")
     if cutlass.const_expr(PREP_SHAPE is not None):
         if cutlass.const_expr(not FUSE_NORM or packed_shape is not None):
             raise ValueError("Next-convolution preparation requires normalization")
@@ -196,9 +236,9 @@ def kernel(
         raise ValueError("Spatial residual output requires bias/residual and output without norm/history")
 
     norm_channels: cutlass.Constexpr = gamma.shape[0] if FUSE_NORM else 160
-    paired_norm: cutlass.Constexpr = FUSE_NORM and norm_channels == 320
+    paired_norm: cutlass.Constexpr = FUSE_NORM and norm_channels == 2 * mma_tiler[1]
     if cutlass.const_expr(paired_norm and not use_2cta_instrs):
-        raise ValueError("C320 normalization requires 2CTA MMA")
+        raise ValueError("Two-tile normalization requires 2CTA MMA")
 
     # Warp / thread / cluster identity
     warp_idx = cute.arch.warp_idx()
@@ -229,8 +269,8 @@ def kernel(
         # None selects the CTA_1 no-multicast commit path (arrive on own mbar).
         _commit_mask = None
 
-    # Wide TMEM loads let four lanes share each fused-normalization row.
-    epilogue_warp_ids = tuple(range((16 if residual is not None or paired_norm else 8) if FUSE_NORM else 4))
+    # C256 needs sixteen epilogue warps to keep normalization from stalling MMA.
+    epilogue_warp_ids = tuple(range((16 if residual is not None or paired_norm or mma_tiler[1] == 256 else 8) if FUSE_NORM else 4))
     mma_warp_id = len(epilogue_warp_ids)
     tma_warp_id = mma_warp_id + 1
 
@@ -297,15 +337,15 @@ def kernel(
     )
 
     if cutlass.const_expr(paired_norm):
-        norm_params = cutlass.Array(cutlass.BFloat16, 640, space=cutlass.AddressSpace.smem, alignment=16)
-        if tidx < 160:
+        norm_params = cutlass.Array(cutlass.BFloat16, 2 * norm_channels, space=cutlass.AddressSpace.smem, alignment=16)
+        if tidx < norm_channels // 2:
             norm_params.store(
                 (conv_bias.iterator.raw_ptr() + tidx * 2).load(count=2, alignment=4),
                 tidx * 2,
             )
             norm_params.store(
                 (gamma.iterator.raw_ptr() + tidx * 2).load(count=2, alignment=4),
-                320 + tidx * 2,
+                norm_channels + tidx * 2,
             )
         # Publish ordinary SMEM loads independently of the async TMA barriers.
         prims.barrier_cta_sync(
@@ -355,8 +395,9 @@ def kernel(
     mma_kind = prims.Tcgen05MMAKind.F16
 
     # Persistent tile scheduler.
-    tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
-    work_tile = tile_sched.initial_work_tile_info()
+    work_index = cute.arch.block_idx()[2]
+    work_stride = cute.arch.grid_dim()[2]
+    tile_idx, valid_tile = schedule.get_work(work_index)
 
     # tcgen05 TMEM allocation knob (always 512 cols on Blackwell).
     num_tmem_cols = 512
@@ -421,55 +462,13 @@ def kernel(
                 (prep_padded.iterator.raw_ptr() + offset).store(zeros, alignment=16)
                 vector_idx += total_ctas * auxiliary_threads
         if cutlass.const_expr(PREP_SHAPE is not None):
-            # Auxiliary rows and the TMA interior are disjoint. Enumerate only
-            # missing history planes and spatial borders. Existing history
-            # interiors are preserved for the caller's separate copy.
-            Z_out, P_out, Q_out = zpq
-            batches, previous_frames = PREP_SHAPE
-            padded_h = P_out + 2
-            padded_w = Q_out + 2
-            history_rows = (2 - previous_frames) * padded_h * padded_w
-            border_rows = 2 * padded_w + 2 * P_out
-            auxiliary_rows = history_rows + (Z_out + previous_frames) * border_rows
             bx, by, bz = cute.arch.block_idx()
             gx, gy, gz = cute.arch.grid_dim()
             # The persistent scheduler places clusters along grid Z, not X.
-            # Row/vector coordinates fit in 32 bits for encoder shapes. Widen
-            # only element offsets, which can exceed 2 Gi elements after padding.
-            index_type: cutlass.Constexpr = (
-                cutlass.Int32 if batches * auxiliary_rows * (norm_channels // 8) < 2**31 else cutlass.Int64
-            )
             linear_cta = cutlass.Int64(bx) + cutlass.Int64(gx) * (cutlass.Int64(by) + cutlass.Int64(gy) * bz)
             total_ctas = cutlass.Int64(gx) * gy * gz
             vector_idx = linear_cta * auxiliary_threads + tidx - producer_warp_end * 32
-            while vector_idx < batches * auxiliary_rows * (norm_channels // 8):
-                coordinate_idx = index_type(vector_idx)
-                channel = coordinate_idx % (norm_channels // 8) * 8
-                auxiliary_row = coordinate_idx // (norm_channels // 8)
-                batch = auxiliary_row // auxiliary_rows
-                local_row = auxiliary_row % auxiliary_rows
-                pt = index_type(0)
-                ph = index_type(0)
-                pw = index_type(0)
-                if local_row < history_rows:
-                    pt = local_row // (padded_h * padded_w)
-                    ph = local_row // padded_w % padded_h
-                    pw = local_row % padded_w
-                else:
-                    border = (local_row - history_rows) % border_rows
-                    pt = (local_row - history_rows) // border_rows + 2 - previous_frames
-                    if border < 2 * padded_w:
-                        ph = border // padded_w * (P_out + 1)
-                        pw = border % padded_w
-                    else:
-                        ph = (border - 2 * padded_w) // 2 + 1
-                        pw = (border - 2 * padded_w) % 2 * (Q_out + 1)
-                values = cutlass.vector.full((8,), 0, cutlass.BFloat16)
-                destination = (
-                    ((cutlass.Int64(batch) * (Z_out + 2) + pt) * padded_h + ph) * padded_w + pw
-                ) * norm_channels + channel
-                (prep_padded.iterator.raw_ptr() + destination).store(values, alignment=16)
-                vector_idx += total_ctas * auxiliary_threads
+            _zero_prepared_padding(prep_padded, vector_idx, total_ctas * auxiliary_threads, zpq, PREP_SHAPE, norm_channels)
     elif warp_idx >= tma_warp_id:
         if cutlass.const_expr(packed_shape is not None):
             # Four producer warps gather flat TRSC in aligned eight-BF16 vectors.
@@ -480,9 +479,9 @@ def kernel(
             batch_count, input_t, input_h, input_w = packed_shape
             Z_out, P_out, Q_out = zpq
             total_rows = batch_count * Z_out * P_out * Q_out
-            while work_tile.is_valid_tile:
-                m_start = work_tile.tile_idx[0] * 128
-                n_start = work_tile.tile_idx[1] * mma_tiler[1]
+            while valid_tile:
+                m_start = tile_idx[0] * 128
+                n_start = tile_idx[1] * mma_tiler[1]
                 for k in cutlass.range(7, unroll=1):
                     full = ab_full_mbar_ptr.subview(ab_stage_idx)
                     empty = ab_empty_mbar_ptr.subview(ab_stage_idx)
@@ -539,8 +538,8 @@ def kernel(
                     if ab_stage_idx == num_ab_stage:
                         ab_stage_idx = 0
                         ab_empty_phase_bit = ab_empty_phase_bit ^ 1
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                work_index += work_stride
+                tile_idx, valid_tile = schedule.get_work(work_index)
         else:
             ab_stage_idx = 0
             Z_out, P_out, Q_out = zpq
@@ -548,9 +547,9 @@ def kernel(
             pad_d, pad_h, pad_w = lower_pad_dhw
             str_d, str_h, str_w = stride_dhw
             dil_d, dil_h, dil_w = dilation_dhw
-            while work_tile.is_valid_tile:
+            while valid_tile:
                 for channel_half in cutlass.range_constexpr(2 if paired_norm else 1):
-                    cur_tile_coord = work_tile.tile_idx
+                    cur_tile_coord = tile_idx
                     mma_tile_coord_mnl = (
                         cur_tile_coord[0] // (2 if use_2cta_instrs else 1),
                         channel_half if paired_norm else cur_tile_coord[1],
@@ -657,15 +656,14 @@ def kernel(
                                     t_idx = 0
                                     c_chunk_idx += 1
 
-                # Advance to next persistent work-tile (static schedule).
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                work_index += work_stride
+                tile_idx, valid_tile = schedule.get_work(work_index)
 
     # ---- MMA consumer warp ----
     elif warp_idx == mma_warp_id:
         # MMA and all epilogue warps participate in this barrier so the MMA warp
         # can pick up the tmem_ptr written by the allocator (epilogue warp 0).
-        # This subset has 160 raw or 288 fused threads, excluding producers.
+        # Producers, scheduler, and padding warps do not participate.
         tmem_bar_id = 1
         tmem_bar_threads = 32 * (1 + len(epilogue_warp_ids))
         prims.barrier_cta_sync(tmem_bar_id, thread_count=tmem_bar_threads)
@@ -711,7 +709,7 @@ def kernel(
         num_k_blocks = cute.size(mma_tiler, mode=[2]) // mma_inst_shape_mnk[2]
 
         # Persistent loop: outer = work tiles (acc stages); inner = K-tiles.
-        while work_tile.is_valid_tile:
+        while valid_tile:
             for channel_half in cutlass.range_constexpr(2 if paired_norm else 1):
                 current_acc_stage = acc_stage_idx
                 acc_empty_mbar_ptr_stage = acc_empty_mbar_ptr.subview(current_acc_stage)
@@ -815,8 +813,8 @@ def kernel(
                             group=_cta_group,
                         )
 
-            tile_sched.advance_to_next_work()
-            work_tile = tile_sched.get_current_work()
+            work_index += work_stride
+            tile_idx, valid_tile = schedule.get_work(work_index)
 
         # Producer tail: drain the remaining acc stages before exit so the
         # kernel doesn't race against epilogue warps still signalling
@@ -889,11 +887,11 @@ def kernel(
         # epilogue subtiles within each tile.
         acc_stage_idx = 0
         epi_stage_idx = 0
-        while work_tile.is_valid_tile:
+        while valid_tile:
             if cutlass.const_expr(paired_norm):
-                # Both N160 halves belong to this M task. Keep BF16 N0 values
+                # Both channel halves belong to this M task. Keep BF16 N0 values
                 # and contiguous-channel FP32 partials live until N1 arrives.
-                retained = cutlass.Array(cutlass.Uint32, 40, space=cutlass.AddressSpace.rmem)
+                retained = cutlass.Array(cutlass.Uint32, subtile_cnt * 8, space=cutlass.AddressSpace.rmem)
                 partials = cutlass.Array(cutlass.Float32, 32, space=cutlass.AddressSpace.rmem)
             for channel_half in cutlass.range_constexpr(2 if paired_norm else 1):
                 current_acc_stage = acc_stage_idx
@@ -906,7 +904,7 @@ def kernel(
                     acc_stage_idx = 0
                     acc_full_phase_bit = acc_full_phase_bit ^ 1
 
-                cur_tile_coord = work_tile.tile_idx
+                cur_tile_coord = tile_idx
                 mma_tile_coord_mnl = (
                     cur_tile_coord[0] // (2 if use_2cta_instrs else 1),
                     channel_half if paired_norm else cur_tile_coord[1],
@@ -948,9 +946,8 @@ def kernel(
                 k_off_base = mma_tile_coord_mnl[1] * mma_tiler[1]
 
                 if cutlass.const_expr(FUSE_NORM):
-                    # Residual loads need more latency hiding: sixteen warps own
-                    # one row/lane, versus eight warps and two rows for norm-only.
-                    rows_per_lane: cutlass.Constexpr = 1 if residual is not None or paired_norm else 2
+                    # Sixteen epilogue warps own one row/lane; eight own two.
+                    rows_per_lane: cutlass.Constexpr = 16 // len(epilogue_warp_ids)
                     lane = tidx % 32
                     lane_col = lane % 4
                     # Warp rank modulo four fixes the accessible 32-row TMEM band.
@@ -960,13 +957,13 @@ def kernel(
                     if cutlass.const_expr(not paired_norm):
                         retained = cutlass.Array(
                             cutlass.Uint32,
-                            20 * rows_per_lane,
+                            subtile_cnt * 4 * rows_per_lane,
                             space=cutlass.AddressSpace.rmem,
                         )
                     if cutlass.const_expr(residual is not None):
                         # Drain before global residual traffic. Reuse the same packed
                         # words for raw values, then overwrite them with summed values.
-                        for drain_subtile in cutlass.range_constexpr(5):
+                        for drain_subtile in cutlass.range_constexpr(subtile_cnt):
                             drain_addr = (((tmem_raw_addr >> 16) + row_base) << 16) | (base_col_id + drain_subtile * 32)
                             drain_ptr = cutlass.inttoptr(drain_addr, 6, cutlass.Float32)
                             drain_values = prims.tcgen05_ld("16x256b", drain_ptr, num=4)
@@ -980,7 +977,7 @@ def kernel(
                                     drain_selected[j] = drain_values[(j // 2) * 4 + j % 2 + 2].to(cutlass.BFloat16)
                             retained.store(
                                 drain_selected.load(0, 8).bitcast(cutlass.Uint32),
-                                (channel_half * 5 + drain_subtile) * 4,
+                                (channel_half * subtile_cnt + drain_subtile) * 4,
                             )
                         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         if prims.elect_sync():
@@ -999,7 +996,7 @@ def kernel(
                     if cutlass.const_expr(channel_half == 0):
                         for part in cutlass.range_constexpr(32 * rows_per_lane):
                             partials[part] = cutlass.Float32(0.0)
-                    for norm_subtile in cutlass.range_constexpr(5):
+                    for norm_subtile in cutlass.range_constexpr(subtile_cnt):
                         rounded = cutlass.Array(
                             cutlass.BFloat16,
                             8 * rows_per_lane,
@@ -1010,7 +1007,7 @@ def kernel(
                             norm_ptr = cutlass.inttoptr(norm_addr, 6, cutlass.Float32)
                             norm_rmem = prims.tcgen05_ld("16x256b", norm_ptr, num=4)
                             prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                            if cutlass.const_expr(paired_norm):
+                            if cutlass.const_expr(rows_per_lane == 1):
                                 if drain_half == 0:
                                     for j in cutlass.range_constexpr(8):
                                         rounded[j] = norm_rmem[(j // 2) * 4 + j % 2].to(cutlass.BFloat16)
@@ -1021,14 +1018,14 @@ def kernel(
                                 rounded.store(norm_rmem.to(cutlass.BFloat16), 0)
                         else:
                             rounded.store(
-                                retained.load((channel_half * 5 + norm_subtile) * 4, 4).bitcast(cutlass.BFloat16),
+                                retained.load((channel_half * subtile_cnt + norm_subtile) * 4, 4).bitcast(cutlass.BFloat16),
                                 0,
                             )
-                        math_width = 1 if paired_norm else 2
+                        math_width = 1 if norm_channels == 320 else 2
                         for j in cutlass.range_constexpr(8 * rows_per_lane // math_width):
                             scalar = j * math_width
                             channel = (
-                                channel_half * 160
+                                channel_half * mma_tiler[1]
                                 + norm_subtile * 32
                                 + (scalar // (2 * rows_per_lane)) * 8
                                 + lane_col * 2
@@ -1050,7 +1047,7 @@ def kernel(
                                 skip_row = row_base + lane // 4 + drain_half * 8
                                 skip_pixel = cutlass.Int64(m_off_cta) + skip_row
                                 if skip_pixel < PREP_SHAPE[0] * Z_out * P_out * Q_out:
-                                    channel = channel_half * 160 + norm_subtile * 32 + pair * 8 + lane_col * 2
+                                    channel = channel_half * mma_tiler[1] + norm_subtile * 32 + pair * 8 + lane_col * 2
                                     offset = skip_pixel * norm_channels + channel
                                     skip = (residual.iterator.raw_ptr() + offset).load(count=2, alignment=4)
                                     if cutlass.const_expr(residual_bias is not None):
@@ -1073,13 +1070,13 @@ def kernel(
                             # Physical lanes retain two channels from each group
                             # of eight; neighboring pairs complete a virtual lane.
                             channel_group = (
-                                (channel_half * 160 + norm_subtile * 32 + (scalar // (2 * rows_per_lane)) * 8) // 8 % 16
+                                (channel_half * mma_tiler[1] + norm_subtile * 32 + (scalar // (2 * rows_per_lane)) * 8) // 8 % 16
                             )
                             part = ((scalar // 2) % rows_per_lane) * 32 + channel_group * 2 + scalar % 2
                             partials.store(partials.load(part, math_width) + value * value, part)
                         retained.store(
                             rounded.load(0, 8 * rows_per_lane).bitcast(cutlass.Uint32),
-                            (channel_half * 5 + norm_subtile) * 4 * rows_per_lane,
+                            (channel_half * subtile_cnt + norm_subtile) * 4 * rows_per_lane,
                         )
 
                     # All accumulators are now register-owned. Release TMEM before
@@ -1143,7 +1140,7 @@ def kernel(
                                 space=cutlass.AddressSpace.rmem,
                                 alignment=4,
                             )
-                            math_width = 1 if paired_norm else 2
+                            math_width = 1 if norm_channels == 320 else 2
                             for j in cutlass.range_constexpr(8 * rows_per_lane // math_width):
                                 scalar = j * math_width
                                 col = subtile_idx * 32 + (scalar // (2 * rows_per_lane)) * 8 + lane_col * 2 + scalar % 2
@@ -1151,7 +1148,7 @@ def kernel(
                                 normalized = (value / denominators[(scalar // 2) % rows_per_lane]).to(cutlass.BFloat16)
                                 scaled = (normalized.to(cutlass.Float32) * (norm_channels**0.5)).to(cutlass.BFloat16)
                                 if cutlass.const_expr(paired_norm):
-                                    gamma_pair = (norm_params.data_ptr() + 320 + col).load(
+                                    gamma_pair = (norm_params.data_ptr() + norm_channels + col).load(
                                         count=math_width, alignment=2 * math_width
                                     )
                                 else:
@@ -1264,8 +1261,8 @@ def kernel(
                         scope=prims.MemScope.CLUSTER,
                     )
 
-            tile_sched.advance_to_next_work()
-            work_tile = tile_sched.get_current_work()
+            work_index += work_stride
+            tile_idx, valid_tile = schedule.get_work(work_index)
 
         # The issuing lane drains global writes, not only SMEM reads.
         if warp_idx == epilogue_warp_ids[0] and store_issuer:
@@ -1302,9 +1299,13 @@ def kernel(
             prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=_cta_group)
 
 
+_ENCODER_CHANNEL_PAIRS = ((160, 160), (160, 320), (320, 320), (320, 640), (640, 640))
+_DECODER_CHANNEL_PAIRS = ((512, 256), (256, 256), (48, 1024))
+
+
 @dataclass(frozen=True)
 class ConvConfig:
-    """Padded NTHWC dimensions for the fixed 3x3x3, N160, 2CTA Wan kernel."""
+    """Padded NTHWC dimensions for the 3x3x3, 2CTA Wan kernel."""
 
     n: int = 1
     t: int = 4
@@ -1312,7 +1313,12 @@ class ConvConfig:
     w: int = 8
     ci: int = 160
     co: int = 160
-    ctas: int = 148
+    ctas: int = 148  # Static persistent grid limit.
+
+    @property
+    def tile_n(self) -> int:
+        """Preserve encoder N160 tiling and select N256 for decoder channels."""
+        return 256 if self.co in (256, 1024) else 160
 
     @property
     def input_shape(self) -> tuple[int, ...]:
@@ -1328,14 +1334,8 @@ class ConvConfig:
         return self.n, self.t - 2, self.h - 2, self.w - 2, self.co
 
     def validate(self) -> None:
-        """Reject geometry outside the encoder's production convolution family."""
-        if (self.ci, self.co) not in (
-            (160, 160),
-            (160, 320),
-            (320, 320),
-            (320, 640),
-            (640, 640),
-        ):
+        """Reject geometry outside the supported Wan convolution families."""
+        if (self.ci, self.co) not in _ENCODER_CHANNEL_PAIRS + _DECODER_CHANNEL_PAIRS:
             raise ValueError("Unsupported Wan residual-convolution channel pair")
         if min(*self.output_shape, self.ctas) <= 0 or self.ctas % 2:
             raise ValueError("Expected nonempty output and complete 2CTA groups")
@@ -1365,7 +1365,7 @@ class _Launch:
         return (
             f"WanConv{'NormSilu' if self.fuse_norm else 'Raw'}_"
             f"{cfg.n}x{cfg.t}x{cfg.h}x{cfg.w}x{cfg.ci}_{cfg.co}_"
-            f"2cta_n160_k3_ctas{cfg.ctas}_prev{self.previous_frames}"
+            f"2cta_n{cfg.tile_n}_k3_ctas{cfg.ctas}_prev{self.previous_frames}"
             f"_res{self.has_residual}_rb{self.has_residual_bias}"
             f"_spatial{self.spatial_output}"
         )
@@ -1395,14 +1395,13 @@ class _Launch:
             spatial_output=self.spatial_output,
         )
         groups = 2
-        tiles = (
-            cute.ceil_div(math.prod(cfg.output_shape[:-1]), 128),
-            1 if self.fuse_norm else cute.ceil_div(cfg.co, 160),
-            1,
+        scheduler = StaticTileSchedule(
+            (math.prod(cfg.output_shape[:-1]) + 127) // 128,
+            1 if self.fuse_norm else (cfg.co + cfg.tile_n - 1) // cfg.tile_n,
+            groups,
         )
-        scheduler = PersistentTileSchedulerParams(tiles, (groups, 1, 1))
-        grid = StaticPersistentTileScheduler.get_grid_shape(scheduler, cfg.ctas // groups)
-        ab_stages, c_stages = 8, 2
+        grid = scheduler.grid_shape(cfg.ctas // groups)
+        ab_stages, c_stages = (6 if cfg.tile_n == 256 else 8), 2
         if cutlass.const_expr(self.fuse_norm and cfg.co == 320 and cfg.ci == 320):
             # The longer K135 convolution benefits from a deeper output-store
             # queue; C160->C320 keeps its measured faster eight/two schedule.
@@ -1419,8 +1418,8 @@ class _Launch:
             if self.previous_frames is not None
             else "conv_raw",
             scheduler,
-            (128 * groups, 160, 64),
-            (128 * groups, 160, 16),
+            (128 * groups, cfg.tile_n, 64),
+            (128 * groups, cfg.tile_n, 16),
             reduction_tiles,
             ab_stages,
             c_stages,
@@ -1441,7 +1440,7 @@ class _Launch:
         ).launch(
             grid=grid,
             block=(
-                (704 if cfg.co == 320 else (640 if self.has_residual else 384))
+                (704 if cfg.co == 320 else (640 if self.has_residual or cfg.co == 256 else 384))
                 if self.previous_frames is not None
                 else (320 if self.spatial_output else 192),
                 1,
@@ -1504,7 +1503,7 @@ def _make_tensor_maps(
         dtype=dtype,
         global_dims=b_dims,
         global_strides=b_strides,
-        box_dims=(64, 1, 1, 1, 80),
+        box_dims=(64, 1, 1, 1, cfg.tile_n // 2),
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     tma_c_desc = cuda.create_tensor_map_im2col(
@@ -1562,8 +1561,8 @@ def compile_prepared(
 ) -> Callable:
     """GPU-free compilation of convolution and next-input/cache production."""
     config.validate()
-    if config.co not in (160, 320):
-        raise ValueError("The prepared epilogue requires Co in (160, 320) and tile_n=160")
+    if config.co not in (160, 256, 320):
+        raise ValueError("The prepared epilogue requires Co in (160, 256, 320)")
     if previous_frames not in (0, 1, 2):
         raise ValueError("History must contain zero, one or two frames")
     if has_residual_bias and not has_residual:
@@ -1736,8 +1735,8 @@ class PreparedConv:
                 raise ValueError(f"{label} must be aligned contiguous BF16 on the input device, shape {shape}")
         self.parameters = ()
         if conv_bias is not None:
-            if not spatial_output and (config.co not in (160, 320)):
-                raise ValueError("The fused epilogue requires Co in (160, 320) and tile_n=160")
+            if not spatial_output and (config.co not in (160, 256, 320)):
+                raise ValueError("The fused epilogue requires Co in (160, 256, 320)")
             for parameter in (conv_bias, gamma):
                 if parameter is None:
                     continue
@@ -1857,7 +1856,7 @@ def prepare_next(
     residual: torch.Tensor | None = None,
     residual_bias: torch.Tensor | None = None,
 ) -> PreparedConv:
-    """Bind C160/C320 conv/bias/norm/SiLU with causal padding and history outputs.
+    """Bind C160/C256/C320 conv/bias/norm/SiLU with causal padding and history outputs.
 
     Let v = B(conv(x) + bias), where B denotes separate BF16 rounding. With
     a residual, replace v by B(v + B(residual + residual_bias)) and save v
@@ -1899,12 +1898,12 @@ class WanConv3d(torch.nn.Module):
         if (
             weight.ndim != 5
             or tuple(weight.shape[2:]) != (3, 3, 3)
-            or (weight.shape[1], weight.shape[0]) not in ((160, 160), (160, 320), (320, 320), (320, 640), (640, 640))
+            or (weight.shape[1], weight.shape[0]) not in _ENCODER_CHANNEL_PAIRS + _DECODER_CHANNEL_PAIRS
         ):
             raise ValueError("WanConv3d requires a supported Wan residual 3x3x3 weight")
         self.in_channels = weight.shape[1]
         self.out_channels = weight.shape[0]
-        # All residual channel counts divide 160 exactly, avoiding N-tail MMA.
+        # Supported output channels are multiples of their N160/N256 tile.
         self.register_buffer(
             "weight",
             torch.nn.functional.pad(
@@ -2083,9 +2082,8 @@ class _InputLaunch:
     ) -> None:
         cfg = self.cfg
         tma_b_desc, tma_c_desc = _make_input_tensor_maps(cfg, weight, output)
-        tiles = ((math.prod(cfg.output_shape[:-1]) + 127) // 128, 1, 1)
-        scheduler = PersistentTileSchedulerParams(tiles, (1, 1, 1))
-        grid = StaticPersistentTileScheduler.get_grid_shape(scheduler, cfg.ctas)
+        scheduler = StaticTileSchedule((math.prod(cfg.output_shape[:-1]) + 127) // 128, 1, 1)
+        grid = scheduler.grid_shape(cfg.ctas)
         kernel(
             "conv_input_c12",
             scheduler,
@@ -2202,13 +2200,69 @@ class WanInputConv3d(torch.nn.Module):
 def compile() -> None:
     """Compile raw, normalized, residual-prepared, spatial, and input kernels."""
     compile_input()
-    for ci, co in ((160, 160), (160, 320), (320, 320), (320, 640), (640, 640)):
+    for ci, co in _ENCODER_CHANNEL_PAIRS:
         cfg = ConvConfig(ci=ci, co=co)
         compile_conv(cfg)
         if co <= 320:
             compile_prepared(cfg, previous_frames=2, has_residual=True, has_residual_bias=co == 320)
         if ci == co:
             compile_spatial_residual(cfg)
+    for ci, co in _DECODER_CHANNEL_PAIRS:
+        cfg = ConvConfig(ci=ci, co=co)
+        compile_conv(cfg)
+        if co != 1024:
+            compile_prepared(cfg, previous_frames=2, has_residual=True)
+
+
+@torch.inference_mode()
+def _verify_decoder() -> None:
+    """Check raw and fused decodes, including persistent partial CTA pairs."""
+    if __package__:
+        from .norm import torch_reference as norm_reference
+    else:
+        from norm import torch_reference as norm_reference
+    torch.manual_seed(44)
+    torch.backends.cudnn.allow_tf32 = False
+    for ci, co in _DECODER_CHANNEL_PAIRS:
+        weight = torch.randn(co, ci, 3, 3, 3, device="cuda", dtype=torch.bfloat16) * 0.1
+        module = WanConv3d(weight).eval()
+        module.ctas = 4  # Force static-scheduler reuse on small tensors.
+        shapes = ((2, 6, 11, 13), (1, 3, 7, 9))
+        for n, t, h, w in shapes:
+            # History-copy specializations are independent across test shapes.
+            torch.compiler.reset()
+            cfg = ConvConfig(n=n, t=t, h=h, w=w, ci=ci, co=co, ctas=module.ctas)
+            x = torch.randn(cfg.input_shape, device="cuda", dtype=weight.dtype) * 0.1
+            bound = prepare(x, module.weight, cfg)
+
+            def reference(x=x, weight=weight) -> torch.Tensor:
+                return torch.nn.functional.conv3d(x.permute(0, 4, 1, 2, 3).float(), weight.float()).permute(0, 2, 3, 4, 1)
+
+            expected = reference()
+            torch.testing.assert_close(module(x).float(), expected, atol=0.02, rtol=0.02)
+            torch.testing.assert_close(bound().float(), expected, atol=0.02, rtol=0.02)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                bound()
+            for _ in range(3):
+                x.normal_(0, 0.1)
+                bound.output.fill_(float("nan"))
+                graph.replay()
+                torch.testing.assert_close(bound.output.float(), reference(), atol=0.02, rtol=0.02)
+            if co == 1024:
+                continue  # The latent input convolution has no integrated normalization.
+            bias = torch.randn(co, device="cuda", dtype=x.dtype)
+            gamma = torch.randn_like(bias)
+            for history, has_residual in ((0, False), (1, False), (2, False), (1, True), (2, True)):
+                previous = torch.randn(n, history, h - 2, w - 2, co, device="cuda", dtype=x.dtype) if history else None
+                residual = torch.randn(cfg.output_shape, device="cuda", dtype=x.dtype) if has_residual else None
+                actual = prepare_next(x, module.weight, bias, gamma, cfg, previous, residual=residual)()
+                expected_prep = norm_reference(bound(), gamma, previous=previous, input_bias=bias, residual=residual)
+                torch.testing.assert_close(actual.padded, expected_prep.padded, atol=0, rtol=0)
+                torch.testing.assert_close(actual.cache, expected_prep.cache, atol=0, rtol=0)
+                if has_residual:
+                    torch.testing.assert_close(actual.residual, expected_prep.residual, atol=0, rtol=0)
+        print(f"Decoder C{ci}->{co}: correctness PASS (including partial CTA pair and graph replay)", flush=True)
 
 
 @torch.inference_mode()
@@ -2231,7 +2285,7 @@ def verify() -> None:
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-    for ci, co in ((160, 160), (160, 320), (320, 320), (320, 640), (640, 640)):
+    for ci, co in _ENCODER_CHANNEL_PAIRS:
         # Each family is an independent set of compiled-copy specializations.
         torch.compiler.reset()
         # These reduced batches are correctness checks, never performance results.
@@ -2355,7 +2409,8 @@ def verify() -> None:
         raw.output.fill_(float("nan"))
         graph.replay()
         torch.testing.assert_close(raw.output, reference(), atol=0.02, rtol=0.02)
-    print("Convolution family: PASS (raw, fused, history, residual, input)", flush=True)
+    _verify_decoder()
+    print("Convolution family: PASS (raw, fused, history, residual, input, decoder)", flush=True)
 
 
 @torch.inference_mode()
@@ -2388,7 +2443,7 @@ def _benchmark_conv(cfg: ConvConfig, history: int, spatial: bool) -> None:
     torch_results = [measure("conv", torch_conv, raw)]
     fusion_results = []
     bias = torch.randn(cfg.co, device="cuda", dtype=x.dtype) * 0.1
-    if cfg.co <= 320:
+    if cfg.co in (160, 256, 320):
         gamma = torch.randn_like(bias)
         previous = (
             torch.randn(
@@ -2484,21 +2539,23 @@ def _benchmark_input(cfg: InputConvConfig) -> None:
 
 
 def benchmark_production() -> None:
-    """Measure the batch-32 encoder's initial and steady-state chunk shapes.
+    """Measure production encoder and decoder convolution shapes.
 
-    C160/C320 stages retain four warm frames; the temporal downsamplers reduce
+    The batch-32 encoder's C160/C320 stages retain four warm frames; downsampling reduces
     C640 at 80x60 to two frames and C640 at 40x30 to one. All initial chunks have
-    one frame. Shape reduction belongs only in verify(), never in these timings.
+    one frame. Decoder convolutions and C256 fusions use batch 1 and four output frames.
+    Shape reduction belongs only in verify(), never in these timings.
     """
     torch.manual_seed(44)
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     print(
-        "\nProduction benchmark: batch=32, BF16, prepared channels-last operands."
-        "\nMedian GPU ms; 5 alternating samples x 20 CUDA-graph replays."
+        "\nProduction benchmark: BF16, prepared channels-last operands."
+        "\nMedian GPU ms from alternating CUDA-graph samples."
         "\nCompilation, weight packing, and input preparation are excluded."
         "\nTorch reference is eager, not torch.compile; speedup=reference/custom.",
         flush=True,
     )
+    print("\nEncoder: batch=32", flush=True)
     for ci, co, frames, height, width in (
         (160, 160, 4, 320, 240),
         (160, 320, 4, 160, 120),
@@ -2524,17 +2581,29 @@ def benchmark_production() -> None:
             )
     for frames in (1, 4):
         _benchmark_input(InputConvConfig(n=32, t=frames + 2, h=322, w=242, ctas=sm_count))
+    print("\nDecoder: batch=1, four output frames", flush=True)
+    for ci, co, height, width in (
+        (512, 256, 360, 640),
+        (256, 256, 360, 640),
+    ):
+        cfg = ConvConfig(n=1, t=6, h=height + 2, w=width + 2, ci=ci, co=co, ctas=sm_count // 2 * 2)
+        _benchmark_conv(cfg, history=0, spatial=False)
+    print("\nDecoder latent input: batch=1, one latent frame", flush=True)
+    _benchmark_conv(ConvConfig(n=1, t=3, h=47, w=82, ci=48, co=1024, ctas=sm_count // 2 * 2), history=2, spatial=False)
     print("\nProduction benchmark: PASS", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--only-compile", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--only-compile", action="store_true")
+    mode.add_argument("--verify-only", action="store_true", help="Run correctness checks without production benchmarks")
     args = parser.parse_args()
     if args.only_compile:
         compile()
         print("Convolution family compile: PASS", flush=True)
-    else:
+    elif args.verify_only:
         print("Correctness checks (small cases, untimed):", flush=True)
         verify()
+    else:
         benchmark_production()

@@ -29,11 +29,13 @@ class BenchmarkResult:
         return self.reference_ms / self.custom_ms
 
 
-def measure(label: str, reference: Callable, custom: Callable) -> BenchmarkResult:
+def measure(
+    label: str, reference: Callable, custom: Callable, *, samples: int = 3, replays: int = 5
+) -> BenchmarkResult:
     """Measure paired median GPU times, excluding Python and JIT compilation.
 
     Warm both functions before graph capture. Alternate replay order across
-    five samples to reduce clock drift bias; retain graph outputs throughout.
+    samples to reduce clock drift bias; retain graph outputs throughout.
     Both callables must be inference-only and use the current CUDA device.
     """
     graphs = []
@@ -49,14 +51,14 @@ def measure(label: str, reference: Callable, custom: Callable) -> BenchmarkResul
     times = [[], []]
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    for sample in range(5):
+    for sample in range(samples):
         for index in (0, 1) if sample % 2 == 0 else (1, 0):
             start.record()
-            for _ in range(20):
+            for _ in range(replays):
                 graphs[index].replay()
             end.record()
             end.synchronize()
-            times[index].append(start.elapsed_time(end) / 20)
+            times[index].append(start.elapsed_time(end) / replays)
     ref_ms, custom_ms = (median(values) for values in times)
     return BenchmarkResult(label, custom_ms, ref_ms)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Benchmark Wan2.2 decoding: Diffusers, eager Torch, and compiled Torch.
+"""Benchmark Wan2.2 decoding: Diffusers, eager/compiled Torch, and custom fusion.
 
 Shapes describe the output video, not the input latent. Latents are seeded
 Gaussian tensors; omitting --model uses the production architecture with random
@@ -15,7 +15,10 @@ input generation, compilation, warmup, and validation are excluded.
     nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
         python bench_wan22_vae_decoder.py --resolutions 480x832 --frames 17
 
-Use --capture-range-end=repeat to profile multiple cases. Mega is not included.
+Use --capture-range-end=repeat to profile multiple cases. The fused variant
+replaces input packing/convolution, attention post-processing, and C256
+convolutions; C512 convolutions use cuDNN with custom fused post-processing.
+It requires BF16 plus CUTLASS DSL.
 """
 
 import argparse
@@ -85,13 +88,17 @@ def parse_args() -> argparse.Namespace:
         "--seed", type=int, default=42, help="Synthetic weights and latent seed."
     )
     parser.add_argument(
-        "--benchmark-repeats", type=int, default=5, help="Full-decode timing samples."
+        "--benchmark-repeats", type=int, default=4, help="Full-decode timing samples."
     )
     parser.add_argument(
         "--torch-compile",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Include compiled Torch in validation, timing, and profiling.",
+    )
+    parser.add_argument(
+        "--fused", action=argparse.BooleanOptionalAction, default=True,
+        help="Include custom decoder fusions (BF16 only).",
     )
     args = parser.parse_args()
     if args.batch_size < 1 or args.benchmark_repeats < 1:
@@ -140,6 +147,7 @@ def median_timings(paths: dict[str, Callable], repeats: int) -> dict[str, float]
     samples = {name: [] for name in paths}
     for i in range(repeats):
         order = list(paths) if i % 2 == 0 else list(reversed(paths))
+        # print(f"  Timing round {i + 1}/{repeats}: {' -> '.join(order)}", flush=True)
         for name in order:
             start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
             start.record()
@@ -148,6 +156,7 @@ def median_timings(paths: dict[str, Callable], repeats: int) -> dict[str, float]
             end.synchronize()
             samples[name].append(start.elapsed_time(end))
             del output
+            # print(f"    {name}: {samples[name][-1]:.3f} ms", flush=True)
     return {name: statistics.median(values) for name, values in samples.items()}
 
 
@@ -180,6 +189,12 @@ def run_case(
     if args.torch_compile:
         compiled = TorchCompileChunkWanVaeDecoder(vae).eval()
         paths["Compiled"] = lambda: compiled(latent)
+    if args.fused and args.dtype == "bf16":
+        from mega_wan_vae import MegaWanVaeDecoder
+
+        fused = MegaWanVaeDecoder(vae).eval()
+        print(f"  Fused-postprocessing residual blocks: {fused.fused_blocks}", flush=True)
+        paths["Fused"] = lambda: fused(latent)
     print(f"\nOutput={shape} latent={tuple(latent.shape)}", flush=True)
     expected = paths["Diffusers"]()
     if tuple(expected.shape) != shape:
@@ -234,21 +249,21 @@ def run_case(
 
 
 def print_summary(results: list[Result], args: argparse.Namespace) -> None:
-    """Report latency and compiled speedup without hiding failed cases."""
+    """Report latency and fused speedup without hiding failed cases."""
     print(
         f"\nSummary: {args.dtype}, median of {args.benchmark_repeats} full-decode samples."
     )
     print(
-        "Output N,C,T,H,W | Diffusers (ms) | Torch (ms) | Compiled (ms) | Torch/Compiled | Validation"
+        "Output N,C,T,H,W | Diffusers (ms) | Torch (ms) | Compiled (ms) | Fused (ms) | Compiled/Fused | Validation"
     )
     for result in results:
         times = result.timings
         columns = [
             f"{times[name]:.3f}" if name in times else "-"
-            for name in ("Diffusers", "Torch", "Compiled")
+            for name in ("Diffusers", "Torch", "Compiled", "Fused")
         ]
         speedup = (
-            f"{times['Torch'] / times['Compiled']:.3f}x" if "Compiled" in times else "-"
+            f"{times['Compiled'] / times['Fused']:.3f}x" if "Compiled" in times and "Fused" in times else "-"
         )
         print(
             " | ".join([str(result.shape), *columns, speedup, result.status]),

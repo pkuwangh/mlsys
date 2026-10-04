@@ -268,7 +268,15 @@ def causal_pack_host(
             stream=stream,
         )
         return
-    vector = 8 if not SPEC[9] and SPEC[3] % 8 == 0 else 1
+    # Decoder latent chunks are strided NCTHW views with contiguous channels.
+    # Such views can use the same vector copies as physically NTHWC input.
+    channel_contiguous = not SPEC[9] or (
+        len(SPEC) > 11
+        and SPEC[11] is not None
+        and SPEC[11][1] == 1
+        and all(stride % 8 == 0 for axis, stride in enumerate(SPEC[11]) if axis != 1)
+    )
+    vector = 8 if channel_contiguous and SPEC[3] % 8 == 0 else 1
     addresses = x.iterator.toint() | out.iterator.toint() | cache.iterator.toint()
     if cutlass.const_expr(SPEC[4] > 0):
         addresses = addresses | previous.iterator.toint()
@@ -439,6 +447,7 @@ def compile() -> None:
             compile_initial_pack((False, 8, 6, channels, None, alignment))
     for c, ncthw, pad, history in (
         (12, True, (2, 1, 1), 2),
+        (48, True, (2, 1, 1), 2),
         (320, False, (1, 0, 0), 1),
     ):
         for t, p in ((1, 0), (4, history)):
@@ -456,6 +465,7 @@ def verify() -> None:
     torch.manual_seed(43)
     for c, ncthw, pad, history in (
         (12, True, (2, 1, 1), 2),
+        (48, True, (2, 1, 1), 2),
         (320, False, (1, 0, 0), 1),
     ):
         for t, p in [(t, p) for t in (1, 4) for p in range(history + 1)]:
@@ -492,23 +502,27 @@ def verify() -> None:
                 packed.cache, joined[:, -history:], atol=0, rtol=0
             )
             if ncthw:
-                storage = torch.full(
-                    (2, c, t + 5, 8, 6), float("nan"), device=x.device, dtype=x.dtype
-                )
-                sliced = storage[:, :, 2 : 2 + t]
-                sliced.copy_(x.permute(0, 4, 1, 2, 3))
-                strided = pack_history(
-                    sliced,
-                    previous,
-                    bias,
-                    padding=pad,
-                    cache_frames=history,
-                    input_ncthw=True,
-                )
-                torch.testing.assert_close(strided.padded, expected, atol=0, rtol=0)
-                torch.testing.assert_close(
-                    strided.cache, joined[:, -history:], atol=0, rtol=0
-                )
+                for layout in (torch.contiguous_format, torch.channels_last_3d):
+                    storage = torch.full(
+                        (2, c, t + 5, 8, 6),
+                        float("nan"),
+                        device=x.device,
+                        dtype=x.dtype,
+                    ).contiguous(memory_format=layout)
+                    sliced = storage[:, :, 2 : 2 + t]
+                    sliced.copy_(x.permute(0, 4, 1, 2, 3))
+                    strided = pack_history(
+                        sliced,
+                        previous,
+                        bias,
+                        padding=pad,
+                        cache_frames=history,
+                        input_ncthw=True,
+                    )
+                    torch.testing.assert_close(strided.padded, expected, atol=0, rtol=0)
+                    torch.testing.assert_close(
+                        strided.cache, joined[:, -history:], atol=0, rtol=0
+                    )
     # Offset/strided views and partial CTAs exercise both initial specializations.
     for c in (320, 640, 7):
         x = torch.randn(3 * 3 * 5 * c + 1, device="cuda", dtype=torch.bfloat16)[
@@ -575,43 +589,49 @@ def verify() -> None:
 
 @torch.inference_mode()
 def benchmark_production() -> None:
-    """Time batch-32 input packing and both temporal-downsample callsites.
+    """Time encoder input/downsample packing and batch-1 decoder latent packing.
 
     Initial input chunks are strided views into a patchified 17-frame NCTHW
     480x832 video, as in the encoder. Downsample inputs are already NTHWC:
     C320 at 60x104 before temporal reduction, C640 at 30x52 before the second.
     Initial downsample chunks have no history or temporal padding.
+    Decoder input is a one-frame view into channels-last C48 latent storage.
     """
     torch.manual_seed(43)
     print(
-        "\nProduction benchmark: batch=32, BF16; Torch reference is eager."
-        "\nMedian GPU ms; 5 alternating samples x 20 CUDA-graph replays."
+        "\nProduction benchmark: encoder batch=32, decoder batch=1, BF16; Torch reference is eager."
+        "\nMedian GPU ms from alternating CUDA-graph samples."
         "\nCompilation and input generation are excluded; speedup=reference/custom."
-        "\nOperation labels give current T,H,W,C and previous-history frames."
-        "\nInput pack includes NCTHW->NTHWC, C12->C16, padding and cache."
+        "\nOperation labels give current N,T,H,W,C and previous-history frames."
+        "\nInput pack includes NCTHW->NTHWC, padding and cache (C12 also pads to C16)."
         "\nDownsample pack includes bias, history and cache.",
         flush=True,
     )
     results = []
-    for c, ncthw, t, h, w, p in (
-        (12, True, 1, 240, 416, 0),
-        (12, True, 4, 240, 416, 1),
-        (12, True, 4, 240, 416, 2),
-        (320, False, 1, 60, 104, 0),
-        (320, False, 4, 60, 104, 1),
-        (640, False, 1, 30, 52, 0),
-        (640, False, 2, 30, 52, 1),
+    for n, c, ncthw, t, h, w, p in (
+        (32, 12, True, 1, 240, 416, 0),
+        (32, 12, True, 4, 240, 416, 1),
+        (32, 12, True, 4, 240, 416, 2),
+        (32, 320, False, 1, 60, 104, 0),
+        (32, 320, False, 4, 60, 104, 1),
+        (32, 640, False, 1, 30, 52, 0),
+        (32, 640, False, 2, 30, 52, 1),
+        (1, 48, True, 1, 45, 80, 0),
+        (1, 48, True, 1, 45, 80, 1),
+        (1, 48, True, 1, 45, 80, 2),
     ):
         if ncthw:
-            video = torch.randn(32, c, 17, h, w, device="cuda", dtype=torch.bfloat16)
-            start = 0 if p == 0 else 1 if p == 1 else 5
+            video = torch.randn(n, c, 5 if c == 48 else 17, h, w, device="cuda", dtype=torch.bfloat16)
+            if c == 48:
+                video = video.contiguous(memory_format=torch.channels_last_3d)
+            start = p if c == 48 else 0 if p == 0 else 1 if p == 1 else 5
             x = video[:, :, start : start + t]
         else:
-            x = torch.randn(32, t, h, w, c, device="cuda", dtype=torch.bfloat16)
+            x = torch.randn(n, t, h, w, c, device="cuda", dtype=torch.bfloat16)
         pad = (2, 1, 1) if ncthw else (p, 0, 0)
         cache_frames = 2 if ncthw else 1
         previous = (
-            torch.randn(32, p, h, w, c, device="cuda", dtype=x.dtype) if p else None
+            torch.randn(n, p, h, w, c, device="cuda", dtype=x.dtype) if p else None
         )
         bias = None if ncthw else torch.randn(c, device="cuda", dtype=x.dtype)
 
@@ -630,7 +650,7 @@ def benchmark_production() -> None:
                 current if previous is None else torch.cat((previous, current), dim=1)
             )
             pt, ph, pw = pad
-            torch_padding = (0, 16 - c if ncthw else 0, pw, pw, ph, ph, pt - p, 0)
+            torch_padding = (0, 4 if c == 12 else 0, pw, pw, ph, ph, pt - p, 0)
             padded = (
                 torch.nn.functional.pad(joined, torch_padding)
                 if any(torch_padding)
@@ -659,9 +679,9 @@ def benchmark_production() -> None:
         torch.testing.assert_close(actual.padded, expected.padded, atol=0, rtol=0)
         torch.testing.assert_close(actual.cache, expected.cache, atol=0, rtol=0)
         del actual, expected
-        operation = "Input pack" if ncthw else "Downsample pack"
+        operation = "Latent pack" if c == 48 else "Input pack" if ncthw else "Downsample pack"
         results.append(
-            measure(f"{operation} ({t},{h},{w},{c}) history={p}", reference, custom)
+            measure(f"{operation} ({n},{t},{h},{w},{c}) history={p}", reference, custom)
         )
     print_benchmark_table(results)
     print("Production pack/cache correctness: PASS", flush=True)

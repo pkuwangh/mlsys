@@ -5,7 +5,7 @@
 """Fuse Wan convolution bias, RMSNorm/SiLU, causal padding, and cache updates.
 
 All activation and cache tensors are contiguous BF16 [N,T,H,W,C]. The canonical
-C160/320/640 path partitions one launch into current-frame normalization CTAs
+C160/256/320/512/640/1024 path partitions one launch into current-frame normalization CTAs
 and vectorized history/padding CTAs. Post-attention reduction keeps one group per
 padded output row. Each owner also writes its part of the next cache; history
 is already activated and is never normalized again. There are no temporary
@@ -253,8 +253,8 @@ def compile_rmsnorm(
     has_bias: bool = False,
 ) -> Callable:
     """Cache code by channel count, bias mode, and reference reduction order."""
-    if channels not in (160, 320, 640):
-        raise ValueError("RMSNorm SiLU supports C160, C320, and C640")
+    if channels not in (160, 256, 320, 512, 640, 1024):
+        raise ValueError("Unsupported Wan encoder/decoder RMSNorm channel count")
     tensor = make_fake_compact_tensor(
         cutlass.BFloat16,
         (cute.sym_int64(), channels),
@@ -311,8 +311,8 @@ def validate_rmsnorm_inputs(
     if x.ndim != 5 or not x.is_contiguous():
         raise ValueError("RMSNorm SiLU requires contiguous [N,T,H,W,C] input")
     channels = x.shape[-1]
-    if channels not in (160, 320, 640):
-        raise ValueError("RMSNorm SiLU supports C160, C320, and C640")
+    if channels not in (160, 256, 320, 512, 640, 1024):
+        raise ValueError("Unsupported Wan encoder/decoder RMSNorm channel count")
     tensors = (x, gamma) if bias is None else (x, gamma, bias)
     for tensor in tensors:
         if tensor.device.type != "cuda" or tensor.device != x.device:
@@ -706,8 +706,8 @@ def _prep_contiguous_row(
 ) -> None:
     """Vectorize channels while preserving Torch's 32-lane reduction tree.
 
-    C160/C320 use eight physical lanes to represent 32 virtual lanes;
-    C640 uses a full warp to bound per-thread retained values. Each lane owns
+    C160/C256/C320 use eight physical lanes to represent 32 virtual lanes;
+    wider channels use a full warp to bound per-thread retained values. Each lane owns
     four adjacent channels per group. Channels separated by 128 accumulate
     before each virtual lane's four partials are summed. For eight lanes,
     ((group0 + group2) + (group1 + group3)) implements warp offsets 16 and 8;
@@ -717,7 +717,7 @@ def _prep_contiguous_row(
     Canonical row strides and column offsets preserve the checked 8B alignment.
     """
     tid, _, _ = cute.arch.thread_idx()
-    LANES = 32 if CHANNELS == 640 else 8
+    LANES = 32 if CHANNELS >= 512 else 8
     VIRTUAL_GROUPS = 32 // LANES
     lane = tid % LANES
     lane_base = tid % 32 // LANES * LANES
@@ -832,9 +832,9 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
 ) -> None:
     """Partition one nonpersistent launch into normalization and auxiliary CTAs.
 
-    Canonical C160/320/640 with padding (2,1,1) enters here. Channels-last
+    Canonical Wan channels with padding (2,1,1) enter here. Channels-last
     normalization uses vector memory operations, with four rows per warp for
-    C160/C320 and one row per warp for C640 to bound register pressure.
+    C160/C256/C320 and one row per warp for wider channels to bound register pressure.
     Legacy arithmetic keeps
     its eight/sixteen-lane mapping for explicit standalone comparisons only.
     Auxiliary CTAs own disjoint vectors, including the history part of cache;
@@ -850,7 +850,7 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
     )
     VECTOR_CONTIGUOUS = CONTIGUOUS_REDUCTION
     ROW_LANES = (
-        (32 if CHANNELS == 640 else 8) if VECTOR_CONTIGUOUS else (8 if PAIRED else 16)
+        (32 if CHANNELS >= 512 else 8) if VECTOR_CONTIGUOUS else (8 if PAIRED else 16)
     )
     SLOTS = (CHANNELS + 127) // 128 * 4 if CONTIGUOUS_REDUCTION else CHANNELS // 16
     current_blocks = (x.shape[0] + THREADS // ROW_LANES - 1) // (THREADS // ROW_LANES)
@@ -1096,10 +1096,11 @@ def conv_prep_host(
 ) -> None:
     """Use partitioned canonical CTAs, or the unchanged general row scheduler."""
     if cutlass.const_expr(
-        CHANNELS in (160, 320, 640) and (PAD_T, PAD_H, PAD_W) == (2, 1, 1)
+        (CHANNELS in (160, 320, 640) or (CONTIGUOUS_REDUCTION and CHANNELS in (256, 512, 1024)))
+        and (PAD_T, PAD_H, PAD_W) == (2, 1, 1)
     ):
         row_lanes = (
-            (32 if CHANNELS == 640 else 8)
+            (32 if CHANNELS >= 512 else 8)
             if CONTIGUOUS_REDUCTION
             else (
                 8
@@ -1400,7 +1401,7 @@ def compile() -> None:
 def verify() -> None:
     """Check first/cached chunks on small, untimed inputs."""
     torch.manual_seed(42)
-    for channels in (160, 320, 640):
+    for channels in (160, 256, 320, 512, 640, 1024):
         gamma = torch.randn(channels, device="cuda", dtype=torch.bfloat16)
         bias = torch.randn_like(gamma)
         for frames, history, has_residual in (
@@ -1432,6 +1433,7 @@ def verify() -> None:
                 actual.residual, expected.residual, atol=0, rtol=0
             )
     x = torch.randn(1, 4, 40, 30, 640, device="cuda", dtype=torch.bfloat16)
+    gamma = torch.randn(640, device="cuda", dtype=x.dtype)
     expected = (
         torch.nn.functional.normalize(x.float(), dim=-1).to(x.dtype) * 640**0.5 * gamma
     )
@@ -1439,7 +1441,7 @@ def verify() -> None:
     # Vector accesses must also accept 2B-aligned offset views and a
     # partial final CTA. Exercise every optional affine/residual input here.
     for channels, frames, history in (
-        (c, t, p) for c in (160, 320, 640) for t, p in ((1, 0), (1, 1), (4, 2))
+        (c, t, p) for c in (160, 256, 320, 512, 640, 1024) for t, p in ((1, 0), (1, 1), (4, 2))
     ):
         shape = (1, frames, 3, 5, channels)
         x = torch.randn(
@@ -1487,29 +1489,39 @@ def verify() -> None:
 
 @torch.inference_mode()
 def benchmark_production() -> None:
-    """Time batch-32 preparation and attention normalization with eager Torch.
+    """Time encoder/decoder preparation and encoder attention normalization.
 
     Use the 480x832 encode shapes, including both standalone C160 call sites.
     Include preparations used for the separate side of conv-fusion
     comparisons. Cold chunks have one frame and no history; steady-state chunks
     have four, two, or one frame depending on temporal-downsample depth.
+    Decoder shapes target 720x1280 output at batch 1, including attention-boundary
+    fusion and separate preparations used to compare against C256 conv fusion.
     """
     torch.manual_seed(42)
     print(
-        "\nProduction benchmark: batch=32, BF16, NTHWC; Torch reference is eager."
-        "\nMedian GPU ms; 5 alternating samples x 20 CUDA-graph replays."
+        "\nProduction benchmark: encoder batch=32, decoder batch=1, BF16, NTHWC; Torch reference is eager."
+        "\nMedian GPU ms from alternating CUDA-graph samples."
         "\nCompilation and input generation excluded; speedup=reference/custom.",
         flush=True,
     )
-    for c, frames, h, w, save_input in (
-        (160, 4, 240, 416, True),
-        (160, 4, 120, 208, False),
-        (320, 4, 120, 208, True),
-        (640, 2, 60, 104, True),
-        (640, 1, 30, 52, True),
+    for n, c, frames, h, w, mode in (
+        (32, 160, 4, 240, 416, "save_skip"),
+        (32, 160, 4, 120, 208, "norm"),
+        (32, 320, 4, 120, 208, "save_skip"),
+        (32, 640, 2, 60, 104, "save_skip"),
+        (32, 640, 1, 30, 52, "save_skip"),
+        (1, 1024, 1, 45, 80, "bias_residual"),  # Attention projection boundary.
+        (1, 1024, 4, 180, 320, "norm"),  # Input to the C512 residual stage.
+        (1, 512, 4, 180, 320, "bias"),  # After cuDNN C512 convolutions.
+        (1, 512, 4, 360, 640, "norm"),  # Input to the C256 residual stage.
+        (1, 256, 4, 360, 640, "bias"),  # Separate side of C256 conv-fusion comparisons.
     ):
+        save_input = mode == "save_skip"
+        has_input_bias = mode != "norm"
+        residual_modes = (False, True) if mode in ("save_skip", "bias") else (mode == "bias_residual",)
         for t, p in ((1, 0), (frames, 2)):
-            shape = (32, t, h, w, c)
+            shape = (n, t, h, w, c)
             print(
                 f"\nInput NTHWC={shape} | history={p} | reduction=channels-last",
                 flush=True,
@@ -1518,15 +1530,15 @@ def benchmark_production() -> None:
             gamma = torch.randn(c, device="cuda", dtype=x.dtype)
             bias = torch.randn_like(gamma)
             previous = (
-                torch.randn(32, p, h, w, c, device="cuda", dtype=x.dtype) if p else None
+                torch.randn(n, p, h, w, c, device="cuda", dtype=x.dtype) if p else None
             )
             results = []
-            for has_residual in (False, True) if save_input else (False,):
+            for has_residual in residual_modes:
                 kwargs = {
-                    "input_bias": bias if save_input else None,
+                    "input_bias": bias if has_input_bias else None,
                     "residual": torch.randn_like(x) if has_residual else None,
                     "residual_bias": bias
-                    if has_residual and (c == 320 or frames == 2)
+                    if has_residual and save_input and (c == 320 or frames == 2)
                     else None,
                     "save_input": save_input,
                 }
@@ -1555,7 +1567,7 @@ def benchmark_production() -> None:
                 )
                 del actual, expected
                 operation = (
-                    "bias + RMSNorm/SiLU/prep" if save_input else "RMSNorm/SiLU/prep"
+                    "bias + RMSNorm/SiLU/prep" if has_input_bias else "RMSNorm/SiLU/prep"
                 )
                 if has_residual:
                     operation = "bias + residual + RMSNorm/SiLU/prep"

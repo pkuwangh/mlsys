@@ -208,7 +208,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--benchmark-repeats", type=int, default=5, help="benchmark iters"
+        "--benchmark-repeats", type=int, default=4, help="benchmark iters"
     )
     args = parser.parse_args()
     if args.benchmark_repeats < 1:
@@ -474,6 +474,7 @@ def median_timings(
     samples: dict[str, list[float]] = {name: [] for name in paths}
     for repeat in range(repeats):
         order = list(paths) if repeat % 2 == 0 else list(reversed(paths))
+        # print(f"  Timing round {repeat + 1}/{repeats}: {' -> '.join(order)}", flush=True)
         for name in order:
             start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
             start.record()
@@ -482,6 +483,7 @@ def median_timings(
             end.synchronize()
             samples[name].append(start.elapsed_time(end))
             del output
+            # print(f"    {name}: {samples[name][-1]:.3f} ms", flush=True)
     return {name: statistics.median(values) for name, values in samples.items()}
 
 
