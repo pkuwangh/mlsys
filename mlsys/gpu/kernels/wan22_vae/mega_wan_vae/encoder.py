@@ -115,9 +115,7 @@ class ResidualConvOutput:
     residual_bias: torch.Tensor | None = None
 
     def materialize(self) -> torch.Tensor:
-        return primitive_bias_residual(
-            self.value, self.residual, self.bias, residual_bias=self.residual_bias
-        )
+        return primitive_bias_residual(self.value, self.residual, self.bias, residual_bias=self.residual_bias)
 
 
 @dataclass(frozen=True)
@@ -170,9 +168,7 @@ class _PreparedResidualBlock(torch.nn.Module):
         self.norm2 = _ConvPrep(block.norm2)
         self.conv2 = _ConvWeights(block.conv2)
         self.conv_shortcut = (
-            None
-            if isinstance(block.conv_shortcut, torch.nn.Identity)
-            else _ConvWeights(block.conv_shortcut)
+            None if isinstance(block.conv_shortcut, torch.nn.Identity) else _ConvWeights(block.conv_shortcut)
         )
         self.contiguous_norm1 = contiguous_norm1
         for conv in (self.conv1.conv, self.conv2.conv):
@@ -181,35 +177,18 @@ class _PreparedResidualBlock(torch.nn.Module):
                 0,
                 0,
             ):
-                raise ValueError(
-                    "Prepared residual convolution requires causal 3x3x3 padding"
-                )
-            if (
-                tuple(conv.stride) != (1, 1, 1)
-                or tuple(conv.dilation) != (1, 1, 1)
-                or conv.groups != 1
-            ):
-                raise ValueError(
-                    "Primitive residual convolution requires unit stride/dilation "
-                    "and groups=1"
-                )
+                raise ValueError("Prepared residual convolution requires causal 3x3x3 padding")
+            if tuple(conv.stride) != (1, 1, 1) or tuple(conv.dilation) != (1, 1, 1) or conv.groups != 1:
+                raise ValueError("Primitive residual convolution requires unit stride/dilation and groups=1")
         self.primitive_convs = torch.nn.ModuleDict(
-            {
-                name: WanConv3d(getattr(self, name).conv.weight)
-                for name in ("conv1", "conv2")
-            }
+            {name: WanConv3d(getattr(self, name).conv.weight) for name in ("conv1", "conv2")}
         )
-        if (
-            self.primitive_convs["conv1"].out_channels in (160, 320)
-            and self.norm2.affine_bias() is not None
-        ):
+        if self.primitive_convs["conv1"].out_channels in (160, 320) and self.norm2.affine_bias() is not None:
             raise ValueError("Fused convolution requires bias-free RMSNorm")
         if self.conv_shortcut is not None:
             self.register_buffer(
                 "shortcut_weight",
-                self.conv_shortcut.conv.weight.detach().contiguous(
-                    memory_format=torch.channels_last_3d
-                ),
+                self.conv_shortcut.conv.weight.detach().contiguous(memory_format=torch.channels_last_3d),
                 persistent=False,
             )
 
@@ -250,15 +229,8 @@ class _PreparedResidualBlock(torch.nn.Module):
         """Consume NTHWC preparation and retain its independently owned cache."""
         conv = wrapper.conv
         name = "conv1" if wrapper is self.conv1 else "conv2"
-        if (
-            tuple(conv.stride) != (1, 1, 1)
-            or tuple(conv.dilation) != (1, 1, 1)
-            or conv.groups != 1
-        ):
-            raise ValueError(
-                "Primitive residual convolution requires unit stride/dilation "
-                "and groups=1"
-            )
+        if tuple(conv.stride) != (1, 1, 1) or tuple(conv.dilation) != (1, 1, 1) or conv.groups != 1:
+            raise ValueError("Primitive residual convolution requires unit stride/dilation and groups=1")
         out = self.primitive_convs[name](prepared.padded)
         if feat_cache is not None:
             feat_cache = update_cache(feat_cache, feat_idx, prepared.cache)
@@ -279,9 +251,7 @@ class _PreparedResidualBlock(torch.nn.Module):
         int,
     ]:
         if self.training:
-            raise ValueError(
-                "Prepared residual convolution is inference-only; call eval()"
-            )
+            raise ValueError("Prepared residual convolution is inference-only; call eval()")
         residual_bias = None
         if isinstance(x, PreparedResidualOutput):
             if self.conv_shortcut is not None:
@@ -289,9 +259,7 @@ class _PreparedResidualBlock(torch.nn.Module):
             prepared = x.prepared
             residual = prepared.residual
             if residual is None:
-                raise ValueError(
-                    "Fused residual preparation must preserve the skip input"
-                )
+                raise ValueError("Fused residual preparation must preserve the skip input")
         elif isinstance(x, ResidualConvOutput):
             if self.conv_shortcut is not None:
                 raise ValueError("Deferred residual input requires an identity skip")
@@ -322,9 +290,7 @@ class _PreparedResidualBlock(torch.nn.Module):
             residual = prepared.residual
             assert residual is not None
         else:
-            prepared = self.prepare(
-                x, self.norm1, feat_cache, feat_idx, self.contiguous_norm1
-            )
+            prepared = self.prepare(x, self.norm1, feat_cache, feat_idx, self.contiguous_norm1)
             residual = x
             if self.conv_shortcut is not None:
                 conv = self.conv_shortcut.conv
@@ -358,9 +324,7 @@ class _PreparedResidualBlock(torch.nn.Module):
                 feat_idx += 1
             prepared = next_prepared
         else:
-            x, feat_cache, feat_idx = self.convolve(
-                prepared, self.conv1, feat_cache, feat_idx
-            )
+            x, feat_cache, feat_idx = self.convolve(prepared, self.conv1, feat_cache, feat_idx)
             prepared = self.prepare(
                 x,
                 self.norm2,
@@ -371,13 +335,9 @@ class _PreparedResidualBlock(torch.nn.Module):
             )
         if next_norm is not None:
             if pad_output:
-                raise ValueError(
-                    "A residual block cannot prepare two distinct consumers"
-                )
+                raise ValueError("A residual block cannot prepare two distinct consumers")
             if next_norm.affine_bias() is not None:
-                raise ValueError(
-                    "Fused inter-block preparation requires bias-free RMSNorm"
-                )
+                raise ValueError("Fused inter-block preparation requires bias-free RMSNorm")
             previous = None if feat_cache is None else feat_cache[feat_idx + 1]
             if isinstance(previous, str):
                 raise TypeError("Residual convolution cache must be a tensor or None")
@@ -401,9 +361,7 @@ class _PreparedResidualBlock(torch.nn.Module):
                 feat_cache = update_cache(feat_cache, feat_idx, prepared.cache)
                 feat_idx += 1
             return SpatialResidualOutput(padded, residual), feat_cache, feat_idx
-        x, feat_cache, feat_idx = self.convolve(
-            prepared, self.conv2, feat_cache, feat_idx
-        )
+        x, feat_cache, feat_idx = self.convolve(prepared, self.conv2, feat_cache, feat_idx)
         return (
             ResidualConvOutput(x, self.conv2.conv.bias, residual, residual_bias),
             feat_cache,
@@ -426,9 +384,7 @@ class _Downsample(torch.nn.Module):
             raise ValueError("Expected one-sided bottom/right spatial padding")
         self.mode = resample.mode
         self.conv = with_channels_last_weights(resample.resample[1])
-        self.time_conv = (
-            _ConvWeights(resample.time_conv) if hasattr(resample, "time_conv") else None
-        )
+        self.time_conv = _ConvWeights(resample.time_conv) if hasattr(resample, "time_conv") else None
         self.register_buffer(
             "weight",
             self.conv.weight.detach().contiguous(memory_format=torch.channels_last),
@@ -437,9 +393,7 @@ class _Downsample(torch.nn.Module):
         if self.time_conv is not None:
             self.register_buffer(
                 "time_weight",
-                self.time_conv.conv.weight.detach().contiguous(
-                    memory_format=torch.channels_last_3d
-                ),
+                self.time_conv.conv.weight.detach().contiguous(memory_format=torch.channels_last_3d),
                 persistent=False,
             )
 
@@ -512,12 +466,9 @@ class _ResidualDownBlock(torch.nn.Module):
     def __init__(self, block: WanResidualDownBlock) -> None:
         super().__init__()
         self.resnets = torch.nn.ModuleList(
-            _PreparedResidualBlock(resnet, contiguous_norm1=True)
-            for resnet in block.resnets
+            _PreparedResidualBlock(resnet, contiguous_norm1=True) for resnet in block.resnets
         )
-        self.downsampler = (
-            None if block.downsampler is None else _Downsample(block.downsampler)
-        )
+        self.downsampler = None if block.downsampler is None else _Downsample(block.downsampler)
         self.avg_shortcut = block.avg_shortcut
 
     def forward(
@@ -534,22 +485,15 @@ class _ResidualDownBlock(torch.nn.Module):
             if index + 1 < len(self.resnets):
                 following = self.resnets[index + 1]
                 if resnet.primitive_convs["conv2"].out_channels in (160, 320):
-                    if (
-                        not following.contiguous_norm1
-                        or following.conv_shortcut is not None
-                    ):
-                        raise ValueError(
-                            "Inter-block fusion requires channels-last norm "
-                            "and identity skip"
-                        )
+                    if not following.contiguous_norm1 or following.conv_shortcut is not None:
+                        raise ValueError("Inter-block fusion requires channels-last norm and identity skip")
                     next_norm = following.norm1
             x, feat_cache, feat_idx = resnet(
                 x,
                 feat_cache,
                 feat_idx,
                 next_norm=next_norm,
-                pad_output=index + 1 == len(self.resnets)
-                and self.downsampler is not None,
+                pad_output=index + 1 == len(self.resnets) and self.downsampler is not None,
             )
             if deferred_input and index == 0:
                 # The first preparation writes the biased input for both skips.
@@ -587,21 +531,16 @@ class _MidBlock(torch.nn.Module):
     def __init__(self, block: torch.nn.Module) -> None:
         super().__init__()
         self.resnets = torch.nn.ModuleList(
-            _PreparedResidualBlock(resnet, contiguous_norm1=True)
-            for resnet in block.resnets
+            _PreparedResidualBlock(resnet, contiguous_norm1=True) for resnet in block.resnets
         )
-        self.attentions = torch.nn.ModuleList(
-            _AttentionBlock(attention) for attention in block.attentions
-        )
+        self.attentions = torch.nn.ModuleList(_AttentionBlock(attention) for attention in block.attentions)
 
     def forward(
         self, x: torch.Tensor, feat_cache: FeatCache | None = None, feat_idx: int = 0
     ) -> tuple[ResidualConvOutput, FeatCache | None, int]:
         for index, resnet in enumerate(self.resnets):
             if index:
-                x, feat_cache, feat_idx = self.attentions[index - 1](
-                    x, feat_cache, feat_idx
-                )
+                x, feat_cache, feat_idx = self.attentions[index - 1](x, feat_cache, feat_idx)
             out, feat_cache, feat_idx = resnet(x, feat_cache, feat_idx)
             if index + 1 < len(self.resnets):
                 x = out.materialize()
@@ -685,13 +624,9 @@ class _AttentionBlock(torch.nn.Module):
 class _ZeroPadConv(_ConvWeights):
     """Avoid F.pad's full tensor clone for convolutions with no explicit padding."""
 
-    def forward(
-        self, x: torch.Tensor, cache_x: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
         if cache_x is not None or any(self.conv._padding):
-            raise ValueError(
-                "Zero-pad adapter cannot consume history or nonzero padding"
-            )
+            raise ValueError("Zero-pad adapter cannot consume history or nonzero padding")
         conv = self.conv
         return F.conv3d(
             x,
@@ -709,27 +644,19 @@ class _Encoder3d(torch.nn.Module):
 
     def __init__(self, encoder: torch.nn.Module) -> None:
         super().__init__()
-        if not all(
-            isinstance(block, WanResidualDownBlock) for block in encoder.down_blocks
-        ):
+        if not all(isinstance(block, WanResidualDownBlock) for block in encoder.down_blocks):
             raise TypeError("Custom encoder requires Wan residual down stages")
         self.conv_in = _ConvWeights(encoder.conv_in)
-        self.down_blocks = torch.nn.ModuleList(
-            _ResidualDownBlock(block) for block in encoder.down_blocks
-        )
+        self.down_blocks = torch.nn.ModuleList(_ResidualDownBlock(block) for block in encoder.down_blocks)
         self.mid_block = _MidBlock(encoder.mid_block)
         self.norm_out = _ConvPrep(encoder.norm_out)
         self.conv_out = _ConvWeights(encoder.conv_out)
-        self.cache_size = sum(
-            isinstance(layer, WanCausalConv3d) for layer in encoder.modules()
-        )
+        self.cache_size = sum(isinstance(layer, WanCausalConv3d) for layer in encoder.modules())
         if tuple(self.conv_out.conv._padding) != (1, 1, 1, 1, 2, 0):
             raise ValueError("Custom output head requires causal 3x3x3 padding")
         self.register_buffer(
             "head_weight",
-            self.conv_out.conv.weight.detach().contiguous(
-                memory_format=torch.channels_last_3d
-            ),
+            self.conv_out.conv.weight.detach().contiguous(memory_format=torch.channels_last_3d),
             persistent=False,
         )
         conv = self.conv_in.conv
@@ -740,14 +667,10 @@ class _Encoder3d(torch.nn.Module):
             or tuple(conv.dilation) != (1, 1, 1)
             or conv.groups != 1
         ):
-            raise ValueError(
-                "Primitive input convolution requires causal unit-stride 3x3x3"
-            )
+            raise ValueError("Primitive input convolution requires causal unit-stride 3x3x3")
         self.primitive_input_conv = WanInputConv3d(conv.weight)
 
-    def forward(
-        self, x: torch.Tensor, feat_cache: FeatCache
-    ) -> tuple[torch.Tensor, FeatCache]:
+    def forward(self, x: torch.Tensor, feat_cache: FeatCache) -> tuple[torch.Tensor, FeatCache]:
         feat_cache = canonicalize_cache(feat_cache, torch.contiguous_format)
         packed = pack_history(x, feat_cache[0], input_ncthw=True)
         conv = self.conv_in.conv
@@ -804,9 +727,7 @@ class MegaWanVaeEncoder(torch.nn.Module):
         """Create empty history for an independent video stream."""
         return (None,) * self.encoder.cache_size
 
-    def encode_chunk(
-        self, chunk: torch.Tensor, feat_cache: FeatCache
-    ) -> tuple[torch.Tensor, FeatCache]:
+    def encode_chunk(self, chunk: torch.Tensor, feat_cache: FeatCache) -> tuple[torch.Tensor, FeatCache]:
         """Encode one already-patchified NCTHW chunk and return updated history."""
         return self.encoder(chunk, feat_cache)
 
@@ -820,19 +741,13 @@ class MegaWanVaeEncoder(torch.nn.Module):
         validate_frame_count(num_frame)
         if self.patch_size is not None:
             video = patchify(video, patch_size=int(self.patch_size))
-        if self.use_tiling and (
-            width > self.tile_sample_min_width or height > self.tile_sample_min_height
-        ):
-            raise NotImplementedError(
-                "MegaWanVaeEncoder does not implement spatial tiling."
-            )
+        if self.use_tiling and (width > self.tile_sample_min_width or height > self.tile_sample_min_height):
+            raise NotImplementedError("MegaWanVaeEncoder does not implement spatial tiling.")
 
         feat_cache = self.new_cache()
         outs: list[torch.Tensor] = []
         for i in range(1 + (num_frame - 1) // 4):
-            chunk = (
-                video[:, :, :1] if i == 0 else video[:, :, 1 + 4 * (i - 1) : 1 + 4 * i]
-            )
+            chunk = video[:, :, :1] if i == 0 else video[:, :, 1 + 4 * (i - 1) : 1 + 4 * i]
             out, feat_cache = self.encode_chunk(chunk, feat_cache)
             outs.append(out)
         out = torch.cat(outs, 2) if len(outs) > 1 else outs[0]

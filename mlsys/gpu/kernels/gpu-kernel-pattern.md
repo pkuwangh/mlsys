@@ -196,6 +196,13 @@ for step in range(reduction_steps):
   # load data written by peer and reduce into *values
 ```
 
+This is an **all-reduce**: every CTA ends with the combined value. The sketch
+omits barrier initialization and storage reuse. Each round needs either its
+own mailbox/barrier or a safe reuse protocol with phase tracking; a CTA fence
+alone does not ensure that a peer has finished reading a reused mailbox.
+See [the DSMEM reduction tutorial](tutorial_dsmem_101_reduce.py) for a
+complete one-shot gather/reduce alternative.
+
 
 ### Dense GEMM
 
@@ -410,9 +417,9 @@ up = up + up_bias
 gate = gate + gate_bias
 up = max(min(up, swiglu_limit), -swiglu_limit)
 gate = min(gate, swiglu_limit)
-exp_neg = exp2(-gate * swiglu_alpha_log2e, fastmath=True)   # exp(-gate * swiglu_alpha)
-sigmoid = rcp(one + exp_neg, approx=True, ftz=True)         # 1 / (1 + exp_neg)
-out = fma(up, gate, gate) * sigmoid                         # (up + 1) * gate * sigmoid
+exp_neg = exp2(-gate * swiglu_alpha_log2e, fastmath=True)  # exp(-gate * swiglu_alpha)
+sigmoid = rcp(one + exp_neg, approx=True, ftz=True)  # 1 / (1 + exp_neg)
+out = fma(up, gate, gate) * sigmoid  # (up + 1) * gate * sigmoid
 
 # Store activated subtile to SMEM, then launch TMA store to GMEM.
 ```
@@ -428,7 +435,7 @@ expanded_idx = permuted_idx_to_expanded_idx[abs_row]
 original_token_idx = expanded_idx // topK
 for col in subtile_cols:
     value = tmem_acc[epilogue_thread_row, col] + bias[expert_idx, col]
-    atomic_add(out[original_token_idx, col], value)     # red.relaxed.gpu.global
+    atomic_add(out[original_token_idx, col], value)  # red.relaxed.gpu.global
 ```
 
 
@@ -635,9 +642,7 @@ s = k % NUM_STAGES
 # prologue pre-signal all empty bars to flip the phase to 1, making all empty slots free
 parity = (k // NUM_STAGES) & 1
 # producer waits for an empty slot
-while not nvvm.mbarrier_try_wait_parity_timelimit(
-    empty_bar + s, parity, 10_000_000
-):
+while not nvvm.mbarrier_try_wait_parity_timelimit(empty_bar + s, parity, 10_000_000):
     pass
 # register the expected bytes and launch TMA
 nvvm.mbarrier_arrive_expect_tx(full_bar + s, TILE_BYTES)
@@ -647,9 +652,7 @@ nvvm.cp_async_bulk_shared_cluster_global(smem_ptr, gmem_ptr, full_bar + s, TILE_
 s = k % NUM_STAGES
 parity = (k // NUM_STAGES) & 1
 # consumer waits for a full slot
-while not nvvm.mbarrier_try_wait_parity_timelimit(
-    full_bar + s, parity, 10_000_000
-):
+while not nvvm.mbarrier_try_wait_parity_timelimit(full_bar + s, parity, 10_000_000):
     pass
 nvvm.cp_async_bulk_global_shared_cta(gmem_ptr, smem_ptr, TILE_BYTES)
 # commit a TMA store group
@@ -692,3 +695,22 @@ For small `N` with large `K`, split `K` across CTAs:
 - partial outputs are stored to `partial_c[split_k_factor, M, N]`.
 
 Then a separate reduction kernel sums along the split-K axis for each element.
+
+Alternatively, place all splits of an output tile in one CTA cluster and reduce
+through DSMEM in the same kernel:
+
+| Method | Partial-result handoff | Where the result is produced |
+| --- | --- | --- |
+| Global-memory split-K | Store partials, launch another kernel | Reduction kernel |
+| Cluster gather/reduce | `st.async` to an owner's mailbox, wait on transaction bytes | Owner CTA |
+| Cluster butterfly | XOR-peer exchanges over `log2(cluster_size)` rounds | Every CTA |
+
+Gather/reduce is enough when only the output owner needs the sum; different
+owners can handle different output rows. Butterfly is useful when every split
+needs the combined value, such as attention normalization statistics. Neither
+replaces the softmax max/sum correction described in the attention section.
+
+The cluster path avoids global partial-result traffic and a second launch, but
+constrains the split count and CTA placement and adds reduction work inside the
+kernel. It is not universally faster. See [cluster-local reduction](gpu-low-latency.md#4-use-dsmem-for-cluster-local-handoffs-and-reductions)
+and [tutorial_dsmem_101_reduce.py](tutorial_dsmem_101_reduce.py).

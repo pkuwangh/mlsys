@@ -90,11 +90,7 @@ def rmsnorm_silu_row(
     """
     VECTOR_REDUCE = CONTIGUOUS_REDUCTION and CHANNELS >= 128 and CHANNELS % 4 == 0
     GROUPS = 16 if not VECTOR_REDUCE and CHANNELS in (160, 320, 640) else 32
-    SLOTS = (
-        (CHANNELS + 127) // 128 * 4
-        if VECTOR_REDUCE
-        else (CHANNELS + GROUPS - 1) // GROUPS
-    )
+    SLOTS = (CHANNELS + 127) // 128 * 4 if VECTOR_REDUCE else (CHANNELS + GROUPS - 1) // GROUPS
     lane_base = cutlass.Int32(0)
     shuffle_mask = cutlass.Uint32(0xFFFFFFFF)
     if ROW_LANES == 16:
@@ -122,15 +118,11 @@ def rmsnorm_silu_row(
             if lane < GROUPS and col < CHANNELS:
                 value = cutlass.Float32(x[row, col])
                 if HAS_INPUT_BIAS:
-                    value = cutlass.Float32(
-                        cutlass.BFloat16(value + cutlass.Float32(input_bias[col]))
-                    )
+                    value = cutlass.Float32(cutlass.BFloat16(value + cutlass.Float32(input_bias[col])))
                 if HAS_RESIDUAL:
                     skip = cutlass.Float32(residual[row, col])
                     if HAS_RESIDUAL_BIAS:
-                        skip = cutlass.Float32(
-                            cutlass.BFloat16(skip + cutlass.Float32(residual_bias[col]))
-                        )
+                        skip = cutlass.Float32(cutlass.BFloat16(skip + cutlass.Float32(residual_bias[col])))
                     value = cutlass.Float32(cutlass.BFloat16(value + skip))
                 if HAS_RESIDUAL or SAVE_INPUT:
                     residual_out[row, col] = cutlass.BFloat16(value)
@@ -154,15 +146,11 @@ def rmsnorm_silu_row(
                     mask=shuffle_mask,
                 )
             for offset in [2, 1]:
-                total = total + cute.arch.shuffle_sync_down(
-                    total, offset, mask=shuffle_mask
-                )
+                total = total + cute.arch.shuffle_sync_down(total, offset, mask=shuffle_mask)
         else:
             for offset in [16, 8, 4, 2, 1]:
                 total = total + cute.arch.shuffle_sync_down(total, offset)
-        denominator = cute.math.sqrt(
-            cute.arch.shuffle_sync(total, lane_base, mask=shuffle_mask), fastmath=False
-        )
+        denominator = cute.math.sqrt(cute.arch.shuffle_sync(total, lane_base, mask=shuffle_mask), fastmath=False)
         if denominator < 1e-12:
             denominator = cutlass.Float32(1e-12)
         for slot in cutlass.range_constexpr(SLOTS):
@@ -172,19 +160,13 @@ def rmsnorm_silu_row(
             if lane < GROUPS and col < CHANNELS:
                 normalized = cutlass.BFloat16(values[slot] / denominator)
                 scaled = cutlass.BFloat16(cutlass.Float32(normalized) * (CHANNELS**0.5))
-                affine = cutlass.BFloat16(
-                    cutlass.Float32(scaled) * cutlass.Float32(gamma[col])
-                )
+                affine = cutlass.BFloat16(cutlass.Float32(scaled) * cutlass.Float32(gamma[col]))
                 if HAS_BIAS:
-                    affine = cutlass.BFloat16(
-                        cutlass.Float32(affine) + cutlass.Float32(bias[col])
-                    )
+                    affine = cutlass.BFloat16(cutlass.Float32(affine) + cutlass.Float32(bias[col]))
                 value = cutlass.Float32(affine)
                 result[slot] = affine
                 if APPLY_SILU:
-                    result[slot] = cutlass.BFloat16(
-                        value / (1.0 + cute.math.exp(-value, fastmath=False))
-                    )
+                    result[slot] = cutlass.BFloat16(value / (1.0 + cute.math.exp(-value, fastmath=False)))
     return result
 
 
@@ -304,9 +286,7 @@ def rmsnorm(
     return out
 
 
-def validate_rmsnorm_inputs(
-    x: torch.Tensor, gamma: torch.Tensor, bias: torch.Tensor | None
-) -> None:
+def validate_rmsnorm_inputs(x: torch.Tensor, gamma: torch.Tensor, bias: torch.Tensor | None) -> None:
     """Validate the shared inference-only BF16 NTHWC and affine contract."""
     if x.ndim != 5 or not x.is_contiguous():
         raise ValueError("RMSNorm SiLU requires contiguous [N,T,H,W,C] input")
@@ -320,9 +300,7 @@ def validate_rmsnorm_inputs(
         if tensor.dtype != torch.bfloat16:
             raise TypeError("RMSNorm SiLU requires torch.bfloat16")
         if torch.is_grad_enabled() and tensor.requires_grad:
-            raise ValueError(
-                "RMSNorm SiLU is inference-only; disable gradient tracking"
-            )
+            raise ValueError("RMSNorm SiLU is inference-only; disable gradient tracking")
     for weight in tensors[1:]:
         if weight.shape != (channels,) or not weight.is_contiguous():
             raise ValueError("RMSNorm SiLU affine weights must be contiguous C-vectors")
@@ -390,11 +368,7 @@ def _conv_prep_row(
         valid_spatial = h >= 0 and h < height and w >= 0 and w < width
         VECTOR_REDUCE = CONTIGUOUS_REDUCTION and CHANNELS >= 128 and CHANNELS % 4 == 0
         GROUPS = 16 if not VECTOR_REDUCE and CHANNELS in (160, 320, 640) else 32
-        SLOTS = (
-            (CHANNELS + 127) // 128 * 4
-            if VECTOR_REDUCE
-            else (CHANNELS + GROUPS - 1) // GROUPS
-        )
+        SLOTS = (CHANNELS + 127) // 128 * 4 if VECTOR_REDUCE else (CHANNELS + GROUPS - 1) // GROUPS
         values = cutlass.Array(cutlass.BFloat16, SLOTS, space=cutlass.AddressSpace.rmem)
         for slot in cutlass.range_constexpr(SLOTS):
             values[slot] = cutlass.BFloat16(0.0)
@@ -421,9 +395,7 @@ def _conv_prep_row(
                     SAVE_INPUT=SAVE_INPUT,
                 )
             elif t >= -previous_frames:
-                previous_row = (
-                    (n * previous_frames + t + previous_frames) * height + h
-                ) * width + w
+                previous_row = ((n * previous_frames + t + previous_frames) * height + h) * width + w
                 for slot in cutlass.range_constexpr(SLOTS):
                     col = lane + slot * GROUPS
                     if VECTOR_REDUCE:
@@ -437,9 +409,7 @@ def _conv_prep_row(
             if lane < GROUPS and col < CHANNELS:
                 padded[row, col] = values[slot]
                 if valid_spatial and t >= frames - cache_frames:
-                    cache_row = (
-                        (n * cache_frames + t - frames + cache_frames) * height + h
-                    ) * width + w
+                    cache_row = ((n * cache_frames + t - frames + cache_frames) * height + h) * width + w
                     cache[cache_row, col] = values[slot]
 
 
@@ -536,9 +506,7 @@ def _conv_prep_aux_vector(
     batches = padded.shape[0] // ((frames + 2) * padded_h * padded_w)
     if vector_idx < batches * vectors_per_batch:
         batch = vector_idx // vectors_per_batch
-        index_type: cutlass.Constexpr = (
-            cutlass.Int32 if vectors_per_batch < 2**31 else cutlass.Int64
-        )
+        index_type: cutlass.Constexpr = cutlass.Int32 if vectors_per_batch < 2**31 else cutlass.Int64
         local_vector = index_type(vector_idx % vectors_per_batch)
         channel = local_vector % vectors_per_row * EPILOGUE_VECTOR
         local_row = local_vector // vectors_per_row
@@ -562,31 +530,15 @@ def _conv_prep_aux_vector(
         valid_spatial = ph > 0 and ph <= height and pw > 0 and pw <= width
         if pt < 2 and pt >= 2 - previous_frames and valid_spatial:
             source = (
-                ((batch * previous_frames + pt - 2 + previous_frames) * height + ph - 1)
-                * width
-                + pw
-                - 1
+                ((batch * previous_frames + pt - 2 + previous_frames) * height + ph - 1) * width + pw - 1
             ) * CHANNELS + channel
-            values = (previous.iterator.raw_ptr() + source).load(
-                count=EPILOGUE_VECTOR, alignment=ALIGNMENT
-            )
+            values = (previous.iterator.raw_ptr() + source).load(count=EPILOGUE_VECTOR, alignment=ALIGNMENT)
             if pt - 2 >= frames - cache_frames:
                 cache_offset = (
-                    (
-                        (batch * cache_frames + pt - 2 - frames + cache_frames) * height
-                        + ph
-                        - 1
-                    )
-                    * width
-                    + pw
-                    - 1
+                    ((batch * cache_frames + pt - 2 - frames + cache_frames) * height + ph - 1) * width + pw - 1
                 ) * CHANNELS + channel
-                (cache.iterator.raw_ptr() + cache_offset).store(
-                    values, alignment=ALIGNMENT
-                )
-        destination = (
-            ((batch * (frames + 2) + pt) * padded_h + ph) * padded_w + pw
-        ) * CHANNELS + channel
+                (cache.iterator.raw_ptr() + cache_offset).store(values, alignment=ALIGNMENT)
+        destination = (((batch * (frames + 2) + pt) * padded_h + ph) * padded_w + pw) * CHANNELS + channel
         (padded.iterator.raw_ptr() + destination).store(values, alignment=ALIGNMENT)
 
 
@@ -621,9 +573,7 @@ def _prep_current_row_pair(
     lane = tid % 8
     lane_base = tid % 32 // 8 * 8
     mask = cutlass.Uint32(0xFF) << lane_base
-    retained = cutlass.Array(
-        cutlass.Uint32, CHANNELS // 16, space=cutlass.AddressSpace.rmem
-    )
+    retained = cutlass.Array(cutlass.Uint32, CHANNELS // 16, space=cutlass.AddressSpace.rmem)
     partials = cutlass.Array(cutlass.Float32, 2, space=cutlass.AddressSpace.rmem)
     for parity in cutlass.range_constexpr(2):
         partials[parity] = cutlass.Float32(0.0)
@@ -632,12 +582,8 @@ def _prep_current_row_pair(
         offset = input_row * CHANNELS + col
         pair = (x.iterator.raw_ptr() + offset).load(count=2, alignment=ALIGNMENT)
         if HAS_INPUT_BIAS:
-            bias_pair = (input_bias.iterator.raw_ptr() + col).load(
-                count=2, alignment=ALIGNMENT
-            )
-            pair = (pair.to(cutlass.Float32) + bias_pair.to(cutlass.Float32)).to(
-                cutlass.BFloat16
-            )
+            bias_pair = (input_bias.iterator.raw_ptr() + col).load(count=2, alignment=ALIGNMENT)
+            pair = (pair.to(cutlass.Float32) + bias_pair.to(cutlass.Float32)).to(cutlass.BFloat16)
         if SAVE_INPUT:
             (residual_out.iterator.raw_ptr() + offset).store(pair, alignment=ALIGNMENT)
         retained.store(pair.bitcast(cutlass.Uint32), slot)
@@ -649,9 +595,7 @@ def _prep_current_row_pair(
         partial = partials[parity]
         total = partial
         for offset in (2, 4, 6):
-            total = total + cute.arch.shuffle_sync(
-                partial, lane_base + (lane + offset) % 8, mask=mask
-            )
+            total = total + cute.arch.shuffle_sync(partial, lane_base + (lane + offset) % 8, mask=mask)
         groups[parity] = total
     even = groups[0] + cute.arch.shuffle_sync(groups[0], lane_base + 1, mask=mask)
     odd = groups[1] + cute.arch.shuffle_sync(groups[1], lane_base + 1, mask=mask)
@@ -665,20 +609,12 @@ def _prep_current_row_pair(
         normalized = (values / denominator).to(cutlass.BFloat16)
         scaled = (normalized.to(cutlass.Float32) * (CHANNELS**0.5)).to(cutlass.BFloat16)
         gamma_pair = (gamma.iterator.raw_ptr() + col).load(count=2, alignment=ALIGNMENT)
-        affine = (scaled.to(cutlass.Float32) * gamma_pair.to(cutlass.Float32)).to(
-            cutlass.BFloat16
-        )
+        affine = (scaled.to(cutlass.Float32) * gamma_pair.to(cutlass.Float32)).to(cutlass.BFloat16)
         activated = affine.to(cutlass.Float32)
-        result = (activated / (1.0 + cute.math.exp(-activated, fastmath=False))).to(
-            cutlass.BFloat16
-        )
-        (padded.iterator.raw_ptr() + padded_row * CHANNELS + col).store(
-            result, alignment=ALIGNMENT
-        )
+        result = (activated / (1.0 + cute.math.exp(-activated, fastmath=False))).to(cutlass.BFloat16)
+        (padded.iterator.raw_ptr() + padded_row * CHANNELS + col).store(result, alignment=ALIGNMENT)
         if write_cache:
-            (cache.iterator.raw_ptr() + cache_row * CHANNELS + col).store(
-                result, alignment=ALIGNMENT
-            )
+            (cache.iterator.raw_ptr() + cache_row * CHANNELS + col).store(result, alignment=ALIGNMENT)
 
 
 @cute.jit
@@ -722,35 +658,21 @@ def _prep_contiguous_row(
     lane = tid % LANES
     lane_base = tid % 32 // LANES * LANES
     mask = cutlass.Uint32((1 << LANES) - 1) << lane_base
-    retained = cutlass.Array(
-        cutlass.BFloat16, CHANNELS // LANES, space=cutlass.AddressSpace.rmem
-    )
-    partials = cutlass.Array(
-        cutlass.Float32, VIRTUAL_GROUPS * 4, space=cutlass.AddressSpace.rmem
-    )
+    retained = cutlass.Array(cutlass.BFloat16, CHANNELS // LANES, space=cutlass.AddressSpace.rmem)
+    partials = cutlass.Array(cutlass.Float32, VIRTUAL_GROUPS * 4, space=cutlass.AddressSpace.rmem)
     for group in cutlass.range_constexpr(CHANNELS // (LANES * 4)):
         col = lane * 4 + group * LANES * 4
         offset = input_row * CHANNELS + col
         value = (x.iterator.raw_ptr() + offset).load(count=4, alignment=ALIGNMENT)
         if HAS_INPUT_BIAS:
             b = (input_bias.iterator.raw_ptr() + col).load(count=4, alignment=ALIGNMENT)
-            value = (value.to(cutlass.Float32) + b.to(cutlass.Float32)).to(
-                cutlass.BFloat16
-            )
+            value = (value.to(cutlass.Float32) + b.to(cutlass.Float32)).to(cutlass.BFloat16)
         if HAS_RESIDUAL:
-            skip = (residual.iterator.raw_ptr() + offset).load(
-                count=4, alignment=ALIGNMENT
-            )
+            skip = (residual.iterator.raw_ptr() + offset).load(count=4, alignment=ALIGNMENT)
             if HAS_RESIDUAL_BIAS:
-                b = (residual_bias.iterator.raw_ptr() + col).load(
-                    count=4, alignment=ALIGNMENT
-                )
-                skip = (skip.to(cutlass.Float32) + b.to(cutlass.Float32)).to(
-                    cutlass.BFloat16
-                )
-            value = (value.to(cutlass.Float32) + skip.to(cutlass.Float32)).to(
-                cutlass.BFloat16
-            )
+                b = (residual_bias.iterator.raw_ptr() + col).load(count=4, alignment=ALIGNMENT)
+                skip = (skip.to(cutlass.Float32) + b.to(cutlass.Float32)).to(cutlass.BFloat16)
+            value = (value.to(cutlass.Float32) + skip.to(cutlass.Float32)).to(cutlass.BFloat16)
         if HAS_RESIDUAL or SAVE_INPUT:
             (residual_out.iterator.raw_ptr() + offset).store(value, alignment=ALIGNMENT)
         retained.store(value, group * 4)
@@ -759,9 +681,7 @@ def _prep_contiguous_row(
         if cutlass.const_expr(group >= VIRTUAL_GROUPS):
             squares = partials.load((group % VIRTUAL_GROUPS) * 4, 4) + squares
         partials.store(squares, (group % VIRTUAL_GROUPS) * 4)
-    groups = cutlass.Array(
-        cutlass.Float32, VIRTUAL_GROUPS, space=cutlass.AddressSpace.rmem
-    )
+    groups = cutlass.Array(cutlass.Float32, VIRTUAL_GROUPS, space=cutlass.AddressSpace.rmem)
     for group in cutlass.range_constexpr(VIRTUAL_GROUPS):
         total = partials[group * 4]
         for part in cutlass.range_constexpr(1, 4):
@@ -773,9 +693,7 @@ def _prep_contiguous_row(
         total = groups[0]
     for offset in (16, 8, 4, 2, 1) if LANES == 32 else (4, 2, 1):
         total = total + cute.arch.shuffle_sync_down(total, offset, mask=mask)
-    denominator = cute.math.sqrt(
-        cute.arch.shuffle_sync(total, lane_base, mask=mask), fastmath=False
-    )
+    denominator = cute.math.sqrt(cute.arch.shuffle_sync(total, lane_base, mask=mask), fastmath=False)
     if denominator < 1e-12:
         denominator = cutlass.Float32(1e-12)
     for group in cutlass.range_constexpr(CHANNELS // (LANES * 4)):
@@ -784,25 +702,15 @@ def _prep_contiguous_row(
         normalized = (value / denominator).to(cutlass.BFloat16)
         scaled = (normalized.to(cutlass.Float32) * (CHANNELS**0.5)).to(cutlass.BFloat16)
         g = (gamma.iterator.raw_ptr() + col).load(count=4, alignment=ALIGNMENT)
-        affine = (scaled.to(cutlass.Float32) * g.to(cutlass.Float32)).to(
-            cutlass.BFloat16
-        )
+        affine = (scaled.to(cutlass.Float32) * g.to(cutlass.Float32)).to(cutlass.BFloat16)
         if HAS_BIAS:
             b = (bias.iterator.raw_ptr() + col).load(count=4, alignment=ALIGNMENT)
-            affine = (affine.to(cutlass.Float32) + b.to(cutlass.Float32)).to(
-                cutlass.BFloat16
-            )
+            affine = (affine.to(cutlass.Float32) + b.to(cutlass.Float32)).to(cutlass.BFloat16)
         value = affine.to(cutlass.Float32)
-        result = (value / (1.0 + cute.math.exp(-value, fastmath=False))).to(
-            cutlass.BFloat16
-        )
-        (padded.iterator.raw_ptr() + padded_row * CHANNELS + col).store(
-            result, alignment=ALIGNMENT
-        )
+        result = (value / (1.0 + cute.math.exp(-value, fastmath=False))).to(cutlass.BFloat16)
+        (padded.iterator.raw_ptr() + padded_row * CHANNELS + col).store(result, alignment=ALIGNMENT)
         if write_cache:
-            (cache.iterator.raw_ptr() + cache_row * CHANNELS + col).store(
-                result, alignment=ALIGNMENT
-            )
+            (cache.iterator.raw_ptr() + cache_row * CHANNELS + col).store(result, alignment=ALIGNMENT)
 
 
 @cute.kernel
@@ -842,25 +750,16 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
     """
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
-    PAIRED = (
-        not CONTIGUOUS_REDUCTION
-        and CHANNELS in (160, 320)
-        and not HAS_RESIDUAL
-        and not HAS_BIAS
-    )
+    PAIRED = not CONTIGUOUS_REDUCTION and CHANNELS in (160, 320) and not HAS_RESIDUAL and not HAS_BIAS
     VECTOR_CONTIGUOUS = CONTIGUOUS_REDUCTION
-    ROW_LANES = (
-        (32 if CHANNELS >= 512 else 8) if VECTOR_CONTIGUOUS else (8 if PAIRED else 16)
-    )
+    ROW_LANES = (32 if CHANNELS >= 512 else 8) if VECTOR_CONTIGUOUS else (8 if PAIRED else 16)
     SLOTS = (CHANNELS + 127) // 128 * 4 if CONTIGUOUS_REDUCTION else CHANNELS // 16
     current_blocks = (x.shape[0] + THREADS // ROW_LANES - 1) // (THREADS // ROW_LANES)
     if bid < current_blocks:
         input_row = cutlass.Int64(bid) * (THREADS // ROW_LANES) + tid // ROW_LANES
         if input_row < x.shape[0]:
             lane = tid % ROW_LANES
-            values = cutlass.Array(
-                cutlass.BFloat16, SLOTS, space=cutlass.AddressSpace.rmem
-            )
+            values = cutlass.Array(cutlass.BFloat16, SLOTS, space=cutlass.AddressSpace.rmem)
             # Decode output coordinates after normalization: hoisting them
             # across normalization increases live registers on residual paths.
             if cutlass.const_expr(not PAIRED and not VECTOR_CONTIGUOUS):
@@ -884,28 +783,17 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
                     SAVE_INPUT=SAVE_INPUT,
                 )
             rows_per_batch = frames * height * width
-            index_type: cutlass.Constexpr = (
-                cutlass.Int32 if rows_per_batch < 2**31 else cutlass.Int64
-            )
+            index_type: cutlass.Constexpr = cutlass.Int32 if rows_per_batch < 2**31 else cutlass.Int64
             batch = input_row // rows_per_batch
             local_row = index_type(input_row % rows_per_batch)
             t = local_row // (height * width)
             h = local_row // width % height
             w = local_row % width
-            padded_row = (
-                ((batch * (frames + 2) + t + 2) * (height + 2) + h + 1) * (width + 2)
-                + w
-                + 1
-            )
-            cache_row = (
-                (batch * cache_frames + t - frames + cache_frames) * height + h
-            ) * width + w
+            padded_row = ((batch * (frames + 2) + t + 2) * (height + 2) + h + 1) * (width + 2) + w + 1
+            cache_row = ((batch * cache_frames + t - frames + cache_frames) * height + h) * width + w
             if cutlass.const_expr(VECTOR_CONTIGUOUS):
                 addresses = (
-                    x.iterator.toint()
-                    | gamma.iterator.toint()
-                    | padded.iterator.toint()
-                    | cache.iterator.toint()
+                    x.iterator.toint() | gamma.iterator.toint() | padded.iterator.toint() | cache.iterator.toint()
                 )
                 if HAS_BIAS:
                     addresses = addresses | bias.iterator.toint()
@@ -965,10 +853,7 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
                     )
             elif cutlass.const_expr(PAIRED):
                 addresses = (
-                    x.iterator.toint()
-                    | gamma.iterator.toint()
-                    | padded.iterator.toint()
-                    | cache.iterator.toint()
+                    x.iterator.toint() | gamma.iterator.toint() | padded.iterator.toint() | cache.iterator.toint()
                 )
                 if HAS_INPUT_BIAS:
                     addresses = addresses | input_bias.iterator.toint()
@@ -1020,20 +905,11 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
                         if t >= frames - cache_frames:
                             cache[cache_row, col] = values[slot]
     else:
-        vector_idx = (
-            cutlass.Int64(bid) - current_blocks
-        ) * THREADS * AUX_VECTORS_PER_THREAD + tid
+        vector_idx = (cutlass.Int64(bid) - current_blocks) * THREADS * AUX_VECTORS_PER_THREAD + tid
         # The public ABI promises only 2B alignment, including offset history
         # views and direct compiled-call outputs. Use wide operations only when
         # every auxiliary base is aligned; all vector offsets are multiples of 8.
-        aligned = (
-            (
-                previous.iterator.toint()
-                | padded.iterator.toint()
-                | cache.iterator.toint()
-            )
-            & 15
-        ) == 0
+        aligned = ((previous.iterator.toint() | padded.iterator.toint() | cache.iterator.toint()) & 15) == 0
         for step in cutlass.range(AUX_VECTORS_PER_THREAD, unroll=1):
             if aligned:
                 _conv_prep_aux_vector(
@@ -1102,15 +978,9 @@ def conv_prep_host(
         row_lanes = (
             (32 if CHANNELS >= 512 else 8)
             if CONTIGUOUS_REDUCTION
-            else (
-                8
-                if CHANNELS in (160, 320) and not HAS_RESIDUAL and not HAS_BIAS
-                else 16
-            )
+            else (8 if CHANNELS in (160, 320) and not HAS_RESIDUAL and not HAS_BIAS else 16)
         )
-        current_blocks = (x.shape[0] + THREADS // row_lanes - 1) // (
-            THREADS // row_lanes
-        )
+        current_blocks = (x.shape[0] + THREADS // row_lanes - 1) // (THREADS // row_lanes)
         padded_h = height + 2
         padded_w = width + 2
         auxiliary_rows = 2 * padded_h * padded_w + frames * (2 * padded_w + 2 * height)
@@ -1292,9 +1162,7 @@ def rmsnorm_silu_conv_prep(
             raise ValueError("Previous cache must share the input CUDA device")
         previous_frames = previous.shape[1]
         if not 1 <= previous_frames <= min(CACHE_FRAMES, padding[0]):
-            raise ValueError(
-                "Previous cache length must be 1..min(2, temporal padding)"
-            )
+            raise ValueError("Previous cache length must be 1..min(2, temporal padding)")
     cache_frames = min(CACHE_FRAMES, frames + previous_frames)
     padded = torch.empty(
         (
@@ -1307,9 +1175,7 @@ def rmsnorm_silu_conv_prep(
         device=x.device,
         dtype=x.dtype,
     )
-    cache = torch.empty(
-        (n, cache_frames, height, width, channels), device=x.device, dtype=x.dtype
-    )
+    cache = torch.empty((n, cache_frames, height, width, channels), device=x.device, dtype=x.dtype)
     residual_out = torch.empty_like(x) if save_input or residual is not None else None
     if n:
         with torch.cuda.device(x.device):
@@ -1359,9 +1225,7 @@ def torch_reference(
     """
     value = x if input_bias is None else x + input_bias
     if residual is not None:
-        value = value + (
-            residual if residual_bias is None else residual + residual_bias
-        )
+        value = value + (residual if residual_bias is None else residual + residual_bias)
     affine = torch.nn.functional.normalize(value.float(), dim=-1).to(x.dtype)
     affine = affine * x.shape[-1] ** 0.5 * gamma
     if bias is not None:
@@ -1410,11 +1274,7 @@ def verify() -> None:
             (4, 2, True),
         ):
             x = torch.randn(2, frames, 3, 5, channels, device="cuda", dtype=gamma.dtype)
-            previous = (
-                torch.randn(2, history, 3, 5, channels, device="cuda", dtype=x.dtype)
-                if history
-                else None
-            )
+            previous = torch.randn(2, history, 3, 5, channels, device="cuda", dtype=x.dtype) if history else None
             kwargs = {
                 "input_bias": bias,
                 "residual": torch.randn_like(x) if has_residual else None,
@@ -1423,20 +1283,12 @@ def verify() -> None:
             }
             actual = rmsnorm_silu_conv_prep(x, gamma, previous=previous, **kwargs)
             expected = torch_reference(x, gamma, previous=previous, **kwargs)
-            torch.testing.assert_close(
-                actual.padded, expected.padded, atol=1e-3, rtol=1e-2
-            )
-            torch.testing.assert_close(
-                actual.cache, expected.cache, atol=1e-3, rtol=1e-2
-            )
-            torch.testing.assert_close(
-                actual.residual, expected.residual, atol=0, rtol=0
-            )
+            torch.testing.assert_close(actual.padded, expected.padded, atol=1e-3, rtol=1e-2)
+            torch.testing.assert_close(actual.cache, expected.cache, atol=1e-3, rtol=1e-2)
+            torch.testing.assert_close(actual.residual, expected.residual, atol=0, rtol=0)
     x = torch.randn(1, 4, 40, 30, 640, device="cuda", dtype=torch.bfloat16)
     gamma = torch.randn(640, device="cuda", dtype=x.dtype)
-    expected = (
-        torch.nn.functional.normalize(x.float(), dim=-1).to(x.dtype) * 640**0.5 * gamma
-    )
+    expected = torch.nn.functional.normalize(x.float(), dim=-1).to(x.dtype) * 640**0.5 * gamma
     torch.testing.assert_close(rmsnorm(x, gamma), expected, atol=1e-3, rtol=1e-2)
     # Vector accesses must also accept 2B-aligned offset views and a
     # partial final CTA. Exercise every optional affine/residual input here.
@@ -1444,21 +1296,17 @@ def verify() -> None:
         (c, t, p) for c in (160, 256, 320, 512, 640, 1024) for t, p in ((1, 0), (1, 1), (4, 2))
     ):
         shape = (1, frames, 3, 5, channels)
-        x = torch.randn(
-            frames * 3 * 5 * channels + 1, device="cuda", dtype=torch.bfloat16
-        )[1:].view(shape)
+        x = torch.randn(frames * 3 * 5 * channels + 1, device="cuda", dtype=torch.bfloat16)[1:].view(shape)
         gamma = torch.randn(channels + 1, device="cuda", dtype=x.dtype)[1:]
         bias = torch.randn(channels + 1, device="cuda", dtype=x.dtype)[1:]
         previous = (
-            torch.randn(history * 3 * 5 * channels + 1, device="cuda", dtype=x.dtype)[
-                1:
-            ].view(1, history, 3, 5, channels)
+            torch.randn(history * 3 * 5 * channels + 1, device="cuda", dtype=x.dtype)[1:].view(
+                1, history, 3, 5, channels
+            )
             if history
             else None
         )
-        residual = torch.randn(x.numel() + 1, device="cuda", dtype=x.dtype)[1:].view(
-            shape
-        )
+        residual = torch.randn(x.numel() + 1, device="cuda", dtype=x.dtype)[1:].view(shape)
         for zero in (False, True):
             if zero:
                 x.zero_()
@@ -1472,15 +1320,9 @@ def verify() -> None:
             }
             actual = rmsnorm_silu_conv_prep(x, gamma, previous=previous, **kwargs)
             expected = torch_reference(x, gamma, previous=previous, **kwargs)
-            torch.testing.assert_close(
-                actual.padded, expected.padded, atol=1e-3, rtol=1e-2
-            )
-            torch.testing.assert_close(
-                actual.cache, expected.cache, atol=1e-3, rtol=1e-2
-            )
-            torch.testing.assert_close(
-                actual.residual, expected.residual, atol=0, rtol=0
-            )
+            torch.testing.assert_close(actual.padded, expected.padded, atol=1e-3, rtol=1e-2)
+            torch.testing.assert_close(actual.cache, expected.cache, atol=1e-3, rtol=1e-2)
+            torch.testing.assert_close(actual.residual, expected.residual, atol=0, rtol=0)
     print(
         "Normalization/preparation: PASS (Torch values, padding, cache, saved skip)",
         flush=True,
@@ -1529,23 +1371,17 @@ def benchmark_production() -> None:
             x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
             gamma = torch.randn(c, device="cuda", dtype=x.dtype)
             bias = torch.randn_like(gamma)
-            previous = (
-                torch.randn(n, p, h, w, c, device="cuda", dtype=x.dtype) if p else None
-            )
+            previous = torch.randn(n, p, h, w, c, device="cuda", dtype=x.dtype) if p else None
             results = []
             for has_residual in residual_modes:
                 kwargs = {
                     "input_bias": bias if has_input_bias else None,
                     "residual": torch.randn_like(x) if has_residual else None,
-                    "residual_bias": bias
-                    if has_residual and save_input and (c == 320 or frames == 2)
-                    else None,
+                    "residual_bias": bias if has_residual and save_input and (c == 320 or frames == 2) else None,
                     "save_input": save_input,
                 }
 
-                reference = partial(
-                    torch_reference, x, gamma, previous=previous, **kwargs
-                )
+                reference = partial(torch_reference, x, gamma, previous=previous, **kwargs)
                 custom = partial(
                     rmsnorm_silu_conv_prep,
                     x,
@@ -1556,19 +1392,11 @@ def benchmark_production() -> None:
 
                 actual = custom()
                 expected = reference()
-                torch.testing.assert_close(
-                    actual.padded, expected.padded, atol=2e-3, rtol=2e-2
-                )
-                torch.testing.assert_close(
-                    actual.cache, expected.cache, atol=2e-3, rtol=2e-2
-                )
-                torch.testing.assert_close(
-                    actual.residual, expected.residual, atol=0, rtol=0
-                )
+                torch.testing.assert_close(actual.padded, expected.padded, atol=2e-3, rtol=2e-2)
+                torch.testing.assert_close(actual.cache, expected.cache, atol=2e-3, rtol=2e-2)
+                torch.testing.assert_close(actual.residual, expected.residual, atol=0, rtol=0)
                 del actual, expected
-                operation = (
-                    "bias + RMSNorm/SiLU/prep" if has_input_bias else "RMSNorm/SiLU/prep"
-                )
+                operation = "bias + RMSNorm/SiLU/prep" if has_input_bias else "RMSNorm/SiLU/prep"
                 if has_residual:
                     operation = "bias + residual + RMSNorm/SiLU/prep"
                     if kwargs["residual_bias"] is not None:
@@ -1582,11 +1410,7 @@ def benchmark_production() -> None:
     gamma = torch.randn(640, device="cuda", dtype=x.dtype)
 
     def attention_reference() -> torch.Tensor:
-        return (
-            torch.nn.functional.normalize(x.float(), dim=-1).to(x.dtype)
-            * 640**0.5
-            * gamma
-        )
+        return torch.nn.functional.normalize(x.float(), dim=-1).to(x.dtype) * 640**0.5 * gamma
 
     expected = attention_reference()
     torch.testing.assert_close(rmsnorm(x, gamma), expected, atol=1e-3, rtol=1e-2)
@@ -1594,9 +1418,7 @@ def benchmark_production() -> None:
         f"\nAttention input NTHWC={tuple(x.shape)} (same shape in every chunk)",
         flush=True,
     )
-    print_benchmark_table(
-        [measure("attention RMSNorm", attention_reference, lambda: rmsnorm(x, gamma))]
-    )
+    print_benchmark_table([measure("attention RMSNorm", attention_reference, lambda: rmsnorm(x, gamma))])
     print("Production normalization/preparation correctness: PASS", flush=True)
 
 

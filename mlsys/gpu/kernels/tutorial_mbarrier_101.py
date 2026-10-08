@@ -1,4 +1,12 @@
-#!/usr/bin/env python3
+"""Use a shared-memory mbarrier to coordinate two threads across two phases.
+
+- thread 0 writes 0, signals phase 0, and waits for phase 1
+- thread 10 waits, writes 1, and signals phase 1
+- thread 0 then resumes and writes 2
+
+Command:
+  python tutorial_mbarrier_101.py
+"""
 
 import cutlass
 import torch
@@ -48,7 +56,7 @@ if __name__ == "__main__":
     # compile the kernel
     compiled = cute.compile(
         test_barrier_host,
-        make_fake_compact_tensor(cutlass.Float32, (cutlass.sym_int64(), )),
+        make_fake_compact_tensor(cutlass.Float32, (cutlass.sym_int64(),)),
     )
     # run it
     x_t = torch.zeros(1, dtype=torch.float32, device="cuda")

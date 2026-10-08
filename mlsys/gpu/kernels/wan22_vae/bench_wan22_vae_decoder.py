@@ -57,18 +57,10 @@ def resolution(value: str) -> tuple[int, int]:
 
 def parse_args() -> argparse.Namespace:
     """Parse output shapes and model settings, showing defaults in --help."""
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument(
-        "--model", help="Local Diffusers model directory; omit for synthetic weights."
-    )
-    parser.add_argument(
-        "--dtype", choices=DTYPES, default="bf16", help="Weights and latent dtype."
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=1, help="Fixed batch for every case."
-    )
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--model", help="Local Diffusers model directory; omit for synthetic weights.")
+    parser.add_argument("--dtype", choices=DTYPES, default="bf16", help="Weights and latent dtype.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Fixed batch for every case.")
     parser.add_argument(
         "--frames",
         type=int,
@@ -84,12 +76,8 @@ def parse_args() -> argparse.Namespace:
         metavar="HEIGHTxWIDTH",
         help="Decoded video resolutions.",
     )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="Synthetic weights and latent seed."
-    )
-    parser.add_argument(
-        "--benchmark-repeats", type=int, default=4, help="Full-decode timing samples."
-    )
+    parser.add_argument("--seed", type=int, default=42, help="Synthetic weights and latent seed.")
+    parser.add_argument("--benchmark-repeats", type=int, default=4, help="Full-decode timing samples.")
     parser.add_argument(
         "--torch-compile",
         action=argparse.BooleanOptionalAction,
@@ -97,7 +85,9 @@ def parse_args() -> argparse.Namespace:
         help="Include compiled Torch in validation, timing, and profiling.",
     )
     parser.add_argument(
-        "--fused", action=argparse.BooleanOptionalAction, default=True,
+        "--fused",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Include custom decoder fusions (BF16 only).",
     )
     args = parser.parse_args()
@@ -114,9 +104,7 @@ def load_vae(args: argparse.Namespace) -> AutoencoderKLWan:
     """Load shared channels-last weights without loading a checkpoint by default."""
     dtype = DTYPES[args.dtype]
     if args.model:
-        vae = AutoencoderKLWan.from_pretrained(
-            args.model, subfolder="vae", torch_dtype=dtype
-        )
+        vae = AutoencoderKLWan.from_pretrained(args.model, subfolder="vae", torch_dtype=dtype)
     else:
         torch.manual_seed(args.seed)
         vae = AutoencoderKLWan(
@@ -198,9 +186,7 @@ def run_case(
     print(f"\nOutput={shape} latent={tuple(latent.shape)}", flush=True)
     expected = paths["Diffusers"]()
     if tuple(expected.shape) != shape:
-        raise ValueError(
-            f"Checkpoint output shape {tuple(expected.shape)} does not match requested {shape}"
-        )
+        raise ValueError(f"Checkpoint output shape {tuple(expected.shape)} does not match requested {shape}")
     failures = []
     atol, rtol = TOLERANCES[args.dtype]
     for name in list(paths):
@@ -250,21 +236,14 @@ def run_case(
 
 def print_summary(results: list[Result], args: argparse.Namespace) -> None:
     """Report latency and fused speedup without hiding failed cases."""
-    print(
-        f"\nSummary: {args.dtype}, median of {args.benchmark_repeats} full-decode samples."
-    )
-    print(
-        "Output N,C,T,H,W | Diffusers (ms) | Torch (ms) | Compiled (ms) | Fused (ms) | Compiled/Fused | Validation"
-    )
+    print(f"\nSummary: {args.dtype}, median of {args.benchmark_repeats} full-decode samples.")
+    print("Output N,C,T,H,W | Diffusers (ms) | Torch (ms) | Compiled (ms) | Fused (ms) | Compiled/Fused | Validation")
     for result in results:
         times = result.timings
         columns = [
-            f"{times[name]:.3f}" if name in times else "-"
-            for name in ("Diffusers", "Torch", "Compiled", "Fused")
+            f"{times[name]:.3f}" if name in times else "-" for name in ("Diffusers", "Torch", "Compiled", "Fused")
         ]
-        speedup = (
-            f"{times['Compiled'] / times['Fused']:.3f}x" if "Compiled" in times and "Fused" in times else "-"
-        )
+        speedup = f"{times['Compiled'] / times['Fused']:.3f}x" if "Compiled" in times and "Fused" in times else "-"
         print(
             " | ".join([str(result.shape), *columns, speedup, result.status]),
             flush=True,
@@ -276,9 +255,7 @@ def main() -> None:
     args = parse_args()
     print(f"Wan2.2 decoder | {torch.cuda.get_device_name()} | {args.dtype}", flush=True)
     print(f"Weights: {args.model or 'synthetic production architecture'}", flush=True)
-    print(
-        f"Validation tolerances: atol={TOLERANCES[args.dtype][0]}, rtol={TOLERANCES[args.dtype][1]}"
-    )
+    print(f"Validation tolerances: atol={TOLERANCES[args.dtype][0]}, rtol={TOLERANCES[args.dtype][1]}")
     vae = load_vae(args)
     results = []
     try:
@@ -291,9 +268,7 @@ def main() -> None:
                         "  CUDA OOM: retaining requested batch and continuing sweep.",
                         flush=True,
                     )
-                    results.append(
-                        Result((args.batch_size, 3, frames, height, width), {}, "OOM")
-                    )
+                    results.append(Result((args.batch_size, 3, frames, height, width), {}, "OOM"))
                 finally:
                     torch.compiler.reset()
                     gc.collect()

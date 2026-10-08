@@ -102,7 +102,14 @@ def _contiguous_tma_layout(
 
 
 @cute.jit
-def _zero_prepared_padding(padded, vector_idx, vector_stride, zpq: cutlass.Constexpr, shape: cutlass.Constexpr, channels: cutlass.Constexpr):
+def _zero_prepared_padding(
+    padded,
+    vector_idx,
+    vector_stride,
+    zpq: cutlass.Constexpr,
+    shape: cutlass.Constexpr,
+    channels: cutlass.Constexpr,
+):
     """Zero missing history and spatial borders, leaving existing history intact."""
     z, h, w = zpq
     batches, previous_frames = shape
@@ -110,7 +117,9 @@ def _zero_prepared_padding(padded, vector_idx, vector_stride, zpq: cutlass.Const
     history_rows = (2 - previous_frames) * padded_h * padded_w
     border_rows = 2 * padded_w + 2 * h
     auxiliary_rows = history_rows + (z + previous_frames) * border_rows
-    index_type: cutlass.Constexpr = cutlass.Int32 if batches * auxiliary_rows * (channels // 8) < 2**31 else cutlass.Int64
+    index_type: cutlass.Constexpr = (
+        cutlass.Int32 if batches * auxiliary_rows * (channels // 8) < 2**31 else cutlass.Int64
+    )
     while vector_idx < batches * auxiliary_rows * (channels // 8):
         coordinate_idx = index_type(vector_idx)
         channel = coordinate_idx % (channels // 8) * 8
@@ -270,7 +279,9 @@ def kernel(
         _commit_mask = None
 
     # C256 needs sixteen epilogue warps to keep normalization from stalling MMA.
-    epilogue_warp_ids = tuple(range((16 if residual is not None or paired_norm or mma_tiler[1] == 256 else 8) if FUSE_NORM else 4))
+    epilogue_warp_ids = tuple(
+        range((16 if residual is not None or paired_norm or mma_tiler[1] == 256 else 8) if FUSE_NORM else 4)
+    )
     mma_warp_id = len(epilogue_warp_ids)
     tma_warp_id = mma_warp_id + 1
 
@@ -337,7 +348,12 @@ def kernel(
     )
 
     if cutlass.const_expr(paired_norm):
-        norm_params = cutlass.Array(cutlass.BFloat16, 2 * norm_channels, space=cutlass.AddressSpace.smem, alignment=16)
+        norm_params = cutlass.Array(
+            cutlass.BFloat16,
+            2 * norm_channels,
+            space=cutlass.AddressSpace.smem,
+            alignment=16,
+        )
         if tidx < norm_channels // 2:
             norm_params.store(
                 (conv_bias.iterator.raw_ptr() + tidx * 2).load(count=2, alignment=4),
@@ -468,7 +484,14 @@ def kernel(
             linear_cta = cutlass.Int64(bx) + cutlass.Int64(gx) * (cutlass.Int64(by) + cutlass.Int64(gy) * bz)
             total_ctas = cutlass.Int64(gx) * gy * gz
             vector_idx = linear_cta * auxiliary_threads + tidx - producer_warp_end * 32
-            _zero_prepared_padding(prep_padded, vector_idx, total_ctas * auxiliary_threads, zpq, PREP_SHAPE, norm_channels)
+            _zero_prepared_padding(
+                prep_padded,
+                vector_idx,
+                total_ctas * auxiliary_threads,
+                zpq,
+                PREP_SHAPE,
+                norm_channels,
+            )
     elif warp_idx >= tma_warp_id:
         if cutlass.const_expr(packed_shape is not None):
             # Four producer warps gather flat TRSC in aligned eight-BF16 vectors.
@@ -1018,7 +1041,9 @@ def kernel(
                                 rounded.store(norm_rmem.to(cutlass.BFloat16), 0)
                         else:
                             rounded.store(
-                                retained.load((channel_half * subtile_cnt + norm_subtile) * 4, 4).bitcast(cutlass.BFloat16),
+                                retained.load((channel_half * subtile_cnt + norm_subtile) * 4, 4).bitcast(
+                                    cutlass.BFloat16
+                                ),
                                 0,
                             )
                         math_width = 1 if norm_channels == 320 else 2
@@ -1070,7 +1095,9 @@ def kernel(
                             # Physical lanes retain two channels from each group
                             # of eight; neighboring pairs complete a virtual lane.
                             channel_group = (
-                                (channel_half * mma_tiler[1] + norm_subtile * 32 + (scalar // (2 * rows_per_lane)) * 8) // 8 % 16
+                                (channel_half * mma_tiler[1] + norm_subtile * 32 + (scalar // (2 * rows_per_lane)) * 8)
+                                // 8
+                                % 16
                             )
                             part = ((scalar // 2) % rows_per_lane) * 32 + channel_group * 2 + scalar % 2
                             partials.store(partials.load(part, math_width) + value * value, part)
@@ -1749,8 +1776,7 @@ class PreparedConv:
                 ):
                     raise ValueError(f"Bias/gamma must be aligned CUDA BF16 vectors of {config.co}")
             self.parameters = tuple(
-                parameter.detach() if parameter is not None else None
-                for parameter in (conv_bias, gamma)
+                parameter.detach() if parameter is not None else None for parameter in (conv_bias, gamma)
             )
         self.device = x.device
         self.history_copies: tuple[tuple[torch.Tensor, torch.Tensor], ...] = ()
@@ -1772,10 +1798,7 @@ class PreparedConv:
             summed = torch.empty(config.output_shape, device=x.device, dtype=x.dtype) if residual is not None else None
             self.output = PreparedConvInput(padded, cache, summed)
             output_storage = padded
-            self.parameters += tuple(
-                tensor.detach().view(-1)
-                for tensor in (padded, cache)
-            )
+            self.parameters += tuple(tensor.detach().view(-1) for tensor in (padded, cache))
             if previous is not None:
                 previous = previous.detach()
                 self.history_copies = ((padded[:, 2 - previous_frames : 2, 1:-1, 1:-1, :], previous),)
@@ -1783,8 +1806,7 @@ class PreparedConv:
                 if old_frames > 0:
                     self.history_copies += ((cache[:, :old_frames], previous[:, -old_frames:]),)
             self.parameters += tuple(
-                tensor.detach().view(-1) if tensor is not None else None
-                for tensor in (residual, residual_bias, summed)
+                tensor.detach().view(-1) if tensor is not None else None for tensor in (residual, residual_bias, summed)
             )
             self.compiled = compile_prepared(config, previous_frames, residual is not None, residual_bias is not None)
         elif spatial_output:
@@ -1800,9 +1822,7 @@ class PreparedConv:
             self.output = torch.empty(config.output_shape, device=x.device, dtype=x.dtype)
             output_storage = self.output
             self.compiled = compile_conv(config)
-        self.operands = tuple(
-            tensor.detach().view(-1) for tensor in (x, weight, output_storage)
-        )
+        self.operands = tuple(tensor.detach().view(-1) for tensor in (x, weight, output_storage))
 
     def __call__(self) -> torch.Tensor | PreparedConvInput:
         """Enqueue convolution and history copies, returning reused output storage."""
@@ -2157,10 +2177,7 @@ class PreparedInputConv:
         self.weight = weight
         self.output = torch.empty(cfg.output_shape, dtype=x.dtype, device=x.device)
         with torch.cuda.device(x.device):
-            self.operands = tuple(
-                tensor.detach().view(-1)
-                for tensor in (x, weight, self.output)
-            )
+            self.operands = tuple(tensor.detach().view(-1) for tensor in (x, weight, self.output))
             self.compiled = compile_input(cfg)
 
     def __call__(self) -> torch.Tensor:
@@ -2236,7 +2253,9 @@ def _verify_decoder() -> None:
             bound = prepare(x, module.weight, cfg)
 
             def reference(x=x, weight=weight) -> torch.Tensor:
-                return torch.nn.functional.conv3d(x.permute(0, 4, 1, 2, 3).float(), weight.float()).permute(0, 2, 3, 4, 1)
+                return torch.nn.functional.conv3d(x.permute(0, 4, 1, 2, 3).float(), weight.float()).permute(
+                    0, 2, 3, 4, 1
+                )
 
             expected = reference()
             torch.testing.assert_close(module(x).float(), expected, atol=0.02, rtol=0.02)
@@ -2253,16 +2272,31 @@ def _verify_decoder() -> None:
                 continue  # The latent input convolution has no integrated normalization.
             bias = torch.randn(co, device="cuda", dtype=x.dtype)
             gamma = torch.randn_like(bias)
-            for history, has_residual in ((0, False), (1, False), (2, False), (1, True), (2, True)):
+            for history, has_residual in (
+                (0, False),
+                (1, False),
+                (2, False),
+                (1, True),
+                (2, True),
+            ):
                 previous = torch.randn(n, history, h - 2, w - 2, co, device="cuda", dtype=x.dtype) if history else None
                 residual = torch.randn(cfg.output_shape, device="cuda", dtype=x.dtype) if has_residual else None
                 actual = prepare_next(x, module.weight, bias, gamma, cfg, previous, residual=residual)()
-                expected_prep = norm_reference(bound(), gamma, previous=previous, input_bias=bias, residual=residual)
+                expected_prep = norm_reference(
+                    bound(),
+                    gamma,
+                    previous=previous,
+                    input_bias=bias,
+                    residual=residual,
+                )
                 torch.testing.assert_close(actual.padded, expected_prep.padded, atol=0, rtol=0)
                 torch.testing.assert_close(actual.cache, expected_prep.cache, atol=0, rtol=0)
                 if has_residual:
                     torch.testing.assert_close(actual.residual, expected_prep.residual, atol=0, rtol=0)
-        print(f"Decoder C{ci}->{co}: correctness PASS (including partial CTA pair and graph replay)", flush=True)
+        print(
+            f"Decoder C{ci}->{co}: correctness PASS (including partial CTA pair and graph replay)",
+            flush=True,
+        )
 
 
 @torch.inference_mode()
@@ -2362,10 +2396,20 @@ def verify() -> None:
         torch.testing.assert_close(tail_raw().float(), tail_ref, atol=0.02, rtol=0.02)
         if co <= 320:
             for history_frames in (0, 1, 2):
-                history = torch.randn(1, history_frames, 5, 7, co, device="cuda", dtype=x.dtype) if history_frames else None
+                history = (
+                    torch.randn(1, history_frames, 5, 7, co, device="cuda", dtype=x.dtype) if history_frames else None
+                )
                 for with_residual in (False, True):
                     skip = torch.randn(tail_cfg.output_shape, device="cuda", dtype=x.dtype) if with_residual else None
-                    tail_fused = prepare_next(tail_x, module.weight, bias, gamma, tail_cfg, history, residual=skip)
+                    tail_fused = prepare_next(
+                        tail_x,
+                        module.weight,
+                        bias,
+                        gamma,
+                        tail_cfg,
+                        history,
+                        residual=skip,
+                    )
                     actual = tail_fused()
                     if history_frames == 2:
                         for _ in range(3):
@@ -2377,7 +2421,13 @@ def verify() -> None:
                         actual.padded.fill_(float("nan"))
                         actual.cache.fill_(float("nan"))
                         graph.replay()
-                    expected = rmsnorm_silu_conv_prep(tail_raw(), gamma, previous=history, input_bias=bias, residual=skip)
+                    expected = rmsnorm_silu_conv_prep(
+                        tail_raw(),
+                        gamma,
+                        previous=history,
+                        input_bias=bias,
+                        residual=skip,
+                    )
                     torch.testing.assert_close(actual.padded, expected.padded, atol=0, rtol=0)
                     torch.testing.assert_close(actual.cache, expected.cache, atol=0, rtol=0)
                     if with_residual:
@@ -2410,7 +2460,10 @@ def verify() -> None:
         graph.replay()
         torch.testing.assert_close(raw.output, reference(), atol=0.02, rtol=0.02)
     _verify_decoder()
-    print("Convolution family: PASS (raw, fused, history, residual, input, decoder)", flush=True)
+    print(
+        "Convolution family: PASS (raw, fused, history, residual, input, decoder)",
+        flush=True,
+    )
 
 
 @torch.inference_mode()
@@ -2589,7 +2642,11 @@ def benchmark_production() -> None:
         cfg = ConvConfig(n=1, t=6, h=height + 2, w=width + 2, ci=ci, co=co, ctas=sm_count // 2 * 2)
         _benchmark_conv(cfg, history=0, spatial=False)
     print("\nDecoder latent input: batch=1, one latent frame", flush=True)
-    _benchmark_conv(ConvConfig(n=1, t=3, h=47, w=82, ci=48, co=1024, ctas=sm_count // 2 * 2), history=2, spatial=False)
+    _benchmark_conv(
+        ConvConfig(n=1, t=3, h=47, w=82, ci=48, co=1024, ctas=sm_count // 2 * 2),
+        history=2,
+        spatial=False,
+    )
     print("\nProduction benchmark: PASS", flush=True)
 
 
@@ -2597,7 +2654,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--only-compile", action="store_true")
-    mode.add_argument("--verify-only", action="store_true", help="Run correctness checks without production benchmarks")
+    mode.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Run correctness checks without production benchmarks",
+    )
     args = parser.parse_args()
     if args.only_compile:
         compile()

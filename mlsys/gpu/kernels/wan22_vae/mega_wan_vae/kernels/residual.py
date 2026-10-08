@@ -71,34 +71,22 @@ def bias_residual_kernel(
             w = row % (WIDTH + 1)
             h = row // (WIDTH + 1) % (HEIGHT + 1)
             nt = row // ((WIDTH + 1) * (HEIGHT + 1))
-            input_offset = (
-                (nt * HEIGHT + h) * WIDTH + w
-            ) * CHANNELS + offset % CHANNELS
+            input_offset = ((nt * HEIGHT + h) * WIDTH + w) * CHANNELS + offset % CHANNELS
             valid = h < HEIGHT and w < WIDTH
         if valid:
-            value = (x.iterator.raw_ptr() + input_offset).load(
-                count=EPILOGUE_VECTOR, alignment=ALIGNMENT
-            )
+            value = (x.iterator.raw_ptr() + input_offset).load(count=EPILOGUE_VECTOR, alignment=ALIGNMENT)
             if HAS_BIAS:
                 channel_bias = (bias.iterator.raw_ptr() + offset % CHANNELS).load(
                     count=EPILOGUE_VECTOR, alignment=ALIGNMENT
                 )
-                value = (
-                    value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)
-                ).to(cutlass.BFloat16)
-            skip = (residual.iterator.raw_ptr() + input_offset).load(
-                count=EPILOGUE_VECTOR, alignment=ALIGNMENT
-            )
+                value = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(cutlass.BFloat16)
+            skip = (residual.iterator.raw_ptr() + input_offset).load(count=EPILOGUE_VECTOR, alignment=ALIGNMENT)
             if HAS_RESIDUAL_BIAS:
                 skip_bias = (residual_bias.iterator.raw_ptr() + offset % CHANNELS).load(
                     count=EPILOGUE_VECTOR, alignment=ALIGNMENT
                 )
-                skip = (skip.to(cutlass.Float32) + skip_bias.to(cutlass.Float32)).to(
-                    cutlass.BFloat16
-                )
-            result = (value.to(cutlass.Float32) + skip.to(cutlass.Float32)).to(
-                cutlass.BFloat16
-            )
+                skip = (skip.to(cutlass.Float32) + skip_bias.to(cutlass.Float32)).to(cutlass.BFloat16)
+            result = (value.to(cutlass.Float32) + skip.to(cutlass.Float32)).to(cutlass.BFloat16)
             (out.iterator.raw_ptr() + offset).store(result, alignment=ALIGNMENT)
         else:
             zeros = cutlass.vector.full((EPILOGUE_VECTOR,), 0, cutlass.BFloat16)
@@ -154,9 +142,7 @@ def compile_bias_residual(
 ) -> Callable:
     """Cache shape-dynamic epilogue code by channel count and bias presence."""
     if channels <= 0 or channels % EPILOGUE_VECTOR:
-        raise ValueError(
-            "Bias/residual fusion requires C to be a positive multiple of 8"
-        )
+        raise ValueError("Bias/residual fusion requires C to be a positive multiple of 8")
     if alignment not in (2, 16):
         raise ValueError("Bias/residual alignment must be 2 or 16 bytes")
     tensor = make_fake_compact_tensor(
@@ -169,9 +155,7 @@ def compile_bias_residual(
         (cute.sym_int64(divisibility=EPILOGUE_VECTOR),),
         assumed_align=alignment,
     )
-    weight = make_fake_compact_tensor(
-        cutlass.BFloat16, (channels,), assumed_align=alignment
-    )
+    weight = make_fake_compact_tensor(cutlass.BFloat16, (channels,), assumed_align=alignment)
     return cute.compile(
         bias_residual_host,
         tensor,
@@ -212,9 +196,7 @@ def bias_residual(
         raise ValueError("Bias/residual fusion requires equal NTHWC input shapes")
     channels = x.shape[-1]
     if channels <= 0 or channels % EPILOGUE_VECTOR:
-        raise ValueError(
-            "Bias/residual fusion requires C to be a positive multiple of 8"
-        )
+        raise ValueError("Bias/residual fusion requires C to be a positive multiple of 8")
     for weight in (bias, residual_bias):
         if weight is not None and weight.shape != (channels,):
             raise ValueError("Convolution biases must be C-vectors")
@@ -267,9 +249,7 @@ def torch_bias_residual(
     pad_spatial: bool = False,
 ) -> torch.Tensor:
     """Torch reference with separately rounded BF16 additions."""
-    value = (x if bias is None else x + bias) + (
-        residual if residual_bias is None else residual + residual_bias
-    )
+    value = (x if bias is None else x + bias) + (residual if residual_bias is None else residual + residual_bias)
     return torch.nn.functional.pad(value, (0, 0, 0, 1, 0, 1)) if pad_spatial else value
 
 
@@ -329,9 +309,7 @@ def stage_add_kernel(
         if HAS_BIAS:
             value = cutlass.Float32(cutlass.BFloat16(value + cutlass.Float32(bias[c])))
         if HAS_RESIDUAL:
-            value = cutlass.Float32(
-                cutlass.BFloat16(value + cutlass.Float32(residual[i]))
-            )
+            value = cutlass.Float32(cutlass.BFloat16(value + cutlass.Float32(residual[i])))
         out[i] = cutlass.BFloat16(value + cutlass.Float32(pooled))
 
 
@@ -394,17 +372,11 @@ def stage_add_vector(
         value = (x.iterator.raw_ptr() + i).load(count=8, alignment=ALIGNMENT)
         if HAS_BIAS:
             b = (bias.iterator.raw_ptr() + c).load(count=8, alignment=ALIGNMENT)
-            value = (value.to(cutlass.Float32) + b.to(cutlass.Float32)).to(
-                cutlass.BFloat16
-            )
+            value = (value.to(cutlass.Float32) + b.to(cutlass.Float32)).to(cutlass.BFloat16)
         if HAS_RESIDUAL:
             r = (residual.iterator.raw_ptr() + i).load(count=8, alignment=ALIGNMENT)
-            value = (value.to(cutlass.Float32) + r.to(cutlass.Float32)).to(
-                cutlass.BFloat16
-            )
-        result = (value.to(cutlass.Float32) + pooled.load(0, 8).to(cutlass.Float32)).to(
-            cutlass.BFloat16
-        )
+            value = (value.to(cutlass.Float32) + r.to(cutlass.Float32)).to(cutlass.BFloat16)
+        result = (value.to(cutlass.Float32) + pooled.load(0, 8).to(cutlass.Float32)).to(cutlass.BFloat16)
         (out.iterator.raw_ptr() + i).store(result, alignment=ALIGNMENT)
 
 
@@ -453,12 +425,8 @@ def compile_stage(
     spec: tuple[int, int, int, int, int, int, int, bool, bool],
 ) -> Callable:
     """Cache code by scalar shape/factor metadata, never by tensor identity."""
-    tensor = make_fake_compact_tensor(
-        cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2
-    )
-    skip = make_fake_compact_tensor(
-        cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2
-    )
+    tensor = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2)
+    skip = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2)
     bias = make_fake_compact_tensor(cutlass.BFloat16, (spec[4],), assumed_align=2)
     return cute.compile(
         stage_add_host,
@@ -509,9 +477,7 @@ def stage_add(
     out = torch.empty_like(x)
     if out.numel():
         with torch.cuda.device(x.device):
-            compile_stage(
-                (t, h, w, ci, co, ft, fs, residual is not None, bias is not None)
-            )(
+            compile_stage((t, h, w, ci, co, ft, fs, residual is not None, bias is not None))(
                 x.view(-1),
                 skip.view(-1),
                 x.view(-1)[:co] if bias is None else bias,
@@ -564,13 +530,9 @@ def verify() -> None:
         bias = torch.randn(c, device="cuda", dtype=torch.bfloat16)
         # Offset storage exercises the live natural-alignment specialization.
         for offset in (0, 1):
-            x = torch.randn(15 * c + offset, device="cuda", dtype=bias.dtype)[
-                offset:
-            ].view(1, 1, 3, 5, c)
+            x = torch.randn(15 * c + offset, device="cuda", dtype=bias.dtype)[offset:].view(1, 1, 3, 5, c)
             skip = -(x + bias)
-            torch.testing.assert_close(
-                bias_residual(x, skip, bias), torch.zeros_like(x), atol=0, rtol=0
-            )
+            torch.testing.assert_close(bias_residual(x, skip, bias), torch.zeros_like(x), atol=0, rtol=0)
             for pad in (False, True):
                 for rb in (None, bias):
                     kwargs = {"residual_bias": rb, "pad_spatial": pad}
@@ -611,9 +573,7 @@ def verify() -> None:
                 if value is None:
                     shifted.append(None)
                 else:
-                    storage = torch.empty(
-                        value.numel() + 1, device=value.device, dtype=value.dtype
-                    )
+                    storage = torch.empty(value.numel() + 1, device=value.device, dtype=value.dtype)
                     view = storage[1:].view(value.shape)
                     view.copy_(value)
                     shifted.append(view)
@@ -656,9 +616,7 @@ def _verify_stage_ordered(
     value = x if bias is None else x + bias
     if residual is not None:
         value = value + residual
-    torch.testing.assert_close(
-        stage_add(x, skip, ft, fs, bias, residual), value + pooled, atol=0, rtol=0
-    )
+    torch.testing.assert_close(stage_add(x, skip, ft, fs, bias, residual), value + pooled, atol=0, rtol=0)
 
 
 @torch.inference_mode()
@@ -685,10 +643,7 @@ def benchmark_production() -> None:
             results = []
             # Spatial padding is the separate reference for fused downsample convs.
             for pad in (False, True) if h >= 60 else (False,):
-
-                reference = partial(
-                    torch_bias_residual, x, skip, bias, pad_spatial=pad
-                )
+                reference = partial(torch_bias_residual, x, skip, bias, pad_spatial=pad)
                 custom = partial(bias_residual, x, skip, bias, pad_spatial=pad)
 
                 torch.testing.assert_close(custom(), reference(), atol=0, rtol=0)

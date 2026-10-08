@@ -17,3 +17,4 @@ slurm-*.out
 /run_cute_dsl_kernel.py
 /allocate_gpu_node.py
 
+/tmp/

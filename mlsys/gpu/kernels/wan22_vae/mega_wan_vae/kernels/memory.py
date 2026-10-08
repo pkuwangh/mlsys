@@ -91,13 +91,9 @@ def input_pack_kernel(
             if t >= T - CT:
                 cache_offset = (((n * CT + t - T + CT) * H + h) * W + w) * 12
                 for part in cutlass.range_constexpr(3):
-                    (cache.iterator.raw_ptr() + cache_offset + part * 4).store(
-                        values.load(part * 4, 4), alignment=8
-                    )
+                    (cache.iterator.raw_ptr() + cache_offset + part * 4).store(values.load(part * 4, 4), alignment=8)
         for part in cutlass.range_constexpr(2):
-            (out.iterator.raw_ptr() + pixel * 16 + part * 8).store(
-                values.load(part * 8, 8), alignment=16
-            )
+            (out.iterator.raw_ptr() + pixel * 16 + part * 8).store(values.load(part * 8, 8), alignment=16)
 
 
 @cute.kernel
@@ -118,12 +114,8 @@ def initial_bias_kernel(
     offset = (cutlass.Int64(bid) * 256 + tid) * 8
     if offset < out.shape[0]:
         value = (x.iterator.raw_ptr() + offset).load(count=8, alignment=ALIGNMENT)
-        channel_bias = (bias.iterator.raw_ptr() + offset % C).load(
-            count=8, alignment=ALIGNMENT
-        )
-        result = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(
-            cutlass.BFloat16
-        )
+        channel_bias = (bias.iterator.raw_ptr() + offset % C).load(count=8, alignment=ALIGNMENT)
+        result = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(cutlass.BFloat16)
         (out.iterator.raw_ptr() + offset).store(result, alignment=16)
 
 
@@ -156,12 +148,8 @@ def compile_initial_pack(spec: tuple) -> Callable:
     """Compile initial-chunk specializations without allocating device tensors."""
     x = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2)
     bias = make_fake_compact_tensor(cutlass.BFloat16, (spec[3],), assumed_align=2)
-    out = make_fake_compact_tensor(
-        cutlass.BFloat16, (cute.sym_int64(divisibility=8),), assumed_align=16
-    )
-    cache = make_fake_compact_tensor(
-        cutlass.BFloat16, (cute.sym_int64(),), assumed_align=8
-    )
+    out = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(divisibility=8),), assumed_align=16)
+    cache = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=8)
     return cute.compile(
         initial_pack_host,
         x,
@@ -223,21 +211,13 @@ def causal_pack_kernel(
                     if cutlass.const_expr(INPUT_STRIDES is not None):
                         sn, sc, st, sh, sw = INPUT_STRIDES
                         offset = n * sn + c * sc + t * st + h * sh + w * sw
-                value = (x.iterator.raw_ptr() + offset).load(
-                    count=VECTOR, alignment=ALIGNMENT
-                )
+                value = (x.iterator.raw_ptr() + offset).load(count=VECTOR, alignment=ALIGNMENT)
                 if HAS_BIAS:
-                    channel_bias = (bias.iterator.raw_ptr() + c).load(
-                        count=VECTOR, alignment=ALIGNMENT
-                    )
-                    value = (
-                        value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)
-                    ).to(cutlass.BFloat16)
+                    channel_bias = (bias.iterator.raw_ptr() + c).load(count=VECTOR, alignment=ALIGNMENT)
+                    value = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(cutlass.BFloat16)
             elif t >= -P:
                 offset = (((n * P + t + P) * H + h) * W + w) * C + c
-                value = (previous.iterator.raw_ptr() + offset).load(
-                    count=VECTOR, alignment=ALIGNMENT
-                )
+                value = (previous.iterator.raw_ptr() + offset).load(count=VECTOR, alignment=ALIGNMENT)
         (out.iterator.raw_ptr() + i).store(value, alignment=ALIGNMENT)
         if spatial and c < C and t >= T - CT:
             offset = (((n * CT + t - T + CT) * H + h) * W + w) * C + c
@@ -254,9 +234,7 @@ def causal_pack_host(
     stream: cuda.CUstream,
     SPEC: cutlass.Constexpr,
 ) -> None:
-    if cutlass.const_expr(
-        SPEC[9] and SPEC[3] == 12 and not SPEC[10] and SPEC[5:8] == (2, 1, 1)
-    ):
+    if cutlass.const_expr(SPEC[9] and SPEC[3] == 12 and not SPEC[10] and SPEC[5:8] == (2, 1, 1)):
         t, h, w, c, p = SPEC[:5]
         ct = SPEC[8]
         strides = SPEC[11] if len(SPEC) > 11 else None
@@ -283,17 +261,13 @@ def causal_pack_host(
     if cutlass.const_expr(SPEC[10]):
         addresses = addresses | bias.iterator.toint()
     if vector == 8 and (addresses & 15) == 0:
-        causal_pack_kernel(
-            x, previous, bias, out, cache, *SPEC, VECTOR=vector, ALIGNMENT=16
-        ).launch(
+        causal_pack_kernel(x, previous, bias, out, cache, *SPEC, VECTOR=vector, ALIGNMENT=16).launch(
             grid=((out.shape[0] + 256 * vector - 1) // (256 * vector), 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )
     else:
-        causal_pack_kernel(
-            x, previous, bias, out, cache, *SPEC, VECTOR=vector, ALIGNMENT=2
-        ).launch(
+        causal_pack_kernel(x, previous, bias, out, cache, *SPEC, VECTOR=vector, ALIGNMENT=2).launch(
             grid=((out.shape[0] + 256 * vector - 1) // (256 * vector), 1, 1),
             block=(256, 1, 1),
             stream=stream,
@@ -303,10 +277,7 @@ def causal_pack_host(
 @cache
 def compile_pack(spec: tuple) -> Callable:
     """Compile only immutable geometry/layout metadata; never cache tensors."""
-    tensors = [
-        make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2)
-        for _ in range(4)
-    ]
+    tensors = [make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2) for _ in range(4)]
     bias = make_fake_compact_tensor(cutlass.BFloat16, (spec[3],), assumed_align=2)
     return cute.compile(
         causal_pack_host,
@@ -356,10 +327,7 @@ def pack_history(
             or value.dtype != torch.bfloat16
             or (not value.is_contiguous() and not (value is x and input_ncthw))
         ):
-            raise ValueError(
-                "Pack inputs must be BF16 on one CUDA device; "
-                "only NCTHW input may be strided"
-            )
+            raise ValueError("Pack inputs must be BF16 on one CUDA device; only NCTHW input may be strided")
         if torch.is_grad_enabled() and value.requires_grad:
             raise ValueError("History packing is inference-only")
     ct = min(cache_frames, p + t)
@@ -369,41 +337,17 @@ def pack_history(
         device=x.device,
         dtype=x.dtype,
     )
-    initial_bias = (
-        not input_ncthw
-        and t == 1
-        and p == 0
-        and padding == (0, 0, 0)
-        and bias is not None
-        and c % 8 == 0
-    )
-    cache = (
-        out
-        if initial_bias
-        else torch.empty((n, ct, h, w, c), device=x.device, dtype=x.dtype)
-    )
+    initial_bias = not input_ncthw and t == 1 and p == 0 and padding == (0, 0, 0) and bias is not None and c % 8 == 0
+    cache = out if initial_bias else torch.empty((n, ct, h, w, c), device=x.device, dtype=x.dtype)
     input_strides = tuple(x.stride()) if input_ncthw else None
     if input_strides is not None and min(input_strides) < 0:
         raise ValueError("NCTHW input strides must be nonnegative")
-    input_span = 1 + sum(
-        (size - 1) * stride for size, stride in zip(x.shape, x.stride())
-    )
+    input_span = 1 + sum((size - 1) * stride for size, stride in zip(x.shape, x.stride()))
     flat_input = x.as_strided((input_span,), (1,))
     with torch.cuda.device(x.device):
-        initial_input = (
-            input_ncthw
-            and t == 1
-            and c == 12
-            and p == 0
-            and padding == (2, 1, 1)
-            and bias is None
-        )
+        initial_input = input_ncthw and t == 1 and c == 12 and p == 0 and padding == (2, 1, 1) and bias is None
         if initial_input or initial_bias:
-            alignment = (
-                16
-                if initial_bias and x.data_ptr() % 16 == 0 and bias.data_ptr() % 16 == 0
-                else 2
-            )
+            alignment = 16 if initial_bias and x.data_ptr() % 16 == 0 and bias.data_ptr() % 16 == 0 else 2
             compile_initial_pack((initial_input, h, w, c, input_strides, alignment))(
                 flat_input,
                 cache.view(-1)[:c] if bias is None else bias,
@@ -439,9 +383,7 @@ def pack_history(
 
 
 def compile() -> None:
-    compile_initial_pack(
-        (True, 8, 6, 12, (12 * 17 * 8 * 6, 17 * 8 * 6, 8 * 6, 6, 1), 2)
-    )
+    compile_initial_pack((True, 8, 6, 12, (12 * 17 * 8 * 6, 17 * 8 * 6, 8 * 6, 6, 1), 2))
     for channels in (320, 640):
         for alignment in (2, 16):
             compile_initial_pack((False, 8, 6, channels, None, alignment))
@@ -454,9 +396,7 @@ def compile() -> None:
             compile_pack((t, 8, 6, c, p, *pad, min(history, p + t), ncthw, not ncthw))
             if ncthw:
                 strides = (c * 17 * 8 * 6, 17 * 8 * 6, 8 * 6, 6, 1)
-                compile_pack(
-                    (t, 8, 6, c, p, *pad, min(history, p + t), True, False, strides)
-                )
+                compile_pack((t, 8, 6, c, p, *pad, min(history, p + t), True, False, strides))
 
 
 @torch.inference_mode()
@@ -471,21 +411,13 @@ def verify() -> None:
         for t, p in [(t, p) for t in (1, 4) for p in range(history + 1)]:
             x = torch.randn(2, t, 8, 6, c, device="cuda", dtype=torch.bfloat16)
             previous = (
-                torch.randn(2 * p * 8 * 6 * c + 1, device="cuda", dtype=x.dtype)[
-                    1:
-                ].view(2, p, 8, 6, c)
-                if p
-                else None
+                torch.randn(2 * p * 8 * 6 * c + 1, device="cuda", dtype=x.dtype)[1:].view(2, p, 8, 6, c) if p else None
             )
             bias = None if ncthw else torch.randn(c, device="cuda", dtype=x.dtype)
             current = x if bias is None else x + bias
-            joined = (
-                current if previous is None else torch.cat((previous, current), dim=1)
-            )
+            joined = current if previous is None else torch.cat((previous, current), dim=1)
             pt, ph, pw = pad
-            expected = torch.nn.functional.pad(
-                joined.permute(0, 4, 1, 2, 3), (pw, pw, ph, ph, pt - p, 0)
-            )
+            expected = torch.nn.functional.pad(joined.permute(0, 4, 1, 2, 3), (pw, pw, ph, ph, pt - p, 0))
             packed = pack_history(
                 x.permute(0, 4, 1, 2, 3).contiguous() if ncthw else x,
                 previous,
@@ -498,9 +430,7 @@ def verify() -> None:
             if ncthw and c == 12:
                 expected = torch.nn.functional.pad(expected, (0, 4))
             torch.testing.assert_close(packed.padded, expected, atol=0, rtol=0)
-            torch.testing.assert_close(
-                packed.cache, joined[:, -history:], atol=0, rtol=0
-            )
+            torch.testing.assert_close(packed.cache, joined[:, -history:], atol=0, rtol=0)
             if ncthw:
                 for layout in (torch.contiguous_format, torch.channels_last_3d):
                     storage = torch.full(
@@ -520,17 +450,11 @@ def verify() -> None:
                         input_ncthw=True,
                     )
                     torch.testing.assert_close(strided.padded, expected, atol=0, rtol=0)
-                    torch.testing.assert_close(
-                        strided.cache, joined[:, -history:], atol=0, rtol=0
-                    )
+                    torch.testing.assert_close(strided.cache, joined[:, -history:], atol=0, rtol=0)
     # Offset/strided views and partial CTAs exercise both initial specializations.
     for c in (320, 640, 7):
-        x = torch.randn(3 * 3 * 5 * c + 1, device="cuda", dtype=torch.bfloat16)[
-            1:
-        ].view(1, 3, 3, 5, c)
-        previous = torch.randn(3 * 5 * c + 1, device="cuda", dtype=x.dtype)[1:].view(
-            1, 1, 3, 5, c
-        )
+        x = torch.randn(3 * 3 * 5 * c + 1, device="cuda", dtype=torch.bfloat16)[1:].view(1, 3, 3, 5, c)
+        previous = torch.randn(3 * 5 * c + 1, device="cuda", dtype=x.dtype)[1:].view(1, 1, 3, 5, c)
         bias = torch.randn(c + 1, device="cuda", dtype=x.dtype)[1:]
         packed = pack_history(x, previous, bias, padding=(2, 1, 1))
         joined = torch.cat((previous, x + bias), dim=1)
@@ -542,9 +466,7 @@ def verify() -> None:
         )
         torch.testing.assert_close(packed.cache, joined[:, -2:], atol=0, rtol=0)
     for n, h, w in ((1, 3, 5), (2, 8, 6)):
-        storage = torch.randn(
-            n, 12, 7, h, w * 2 + 1, device="cuda", dtype=torch.bfloat16
-        )
+        storage = torch.randn(n, 12, 7, h, w * 2 + 1, device="cuda", dtype=torch.bfloat16)
         x = storage[:, :, 2:3, :, 1 : 1 + 2 * w : 2]
         packed = pack_history(x, input_ncthw=True)
         graph = torch.cuda.CUDAGraph()
@@ -560,9 +482,7 @@ def verify() -> None:
             torch.testing.assert_close(replayed.padded, expected, atol=0, rtol=0)
             torch.testing.assert_close(replayed.cache, expected_cache, atol=0, rtol=0)
         for c in (320, 640):
-            x = torch.randn(n * h * w * c + 1, device="cuda", dtype=torch.bfloat16)[
-                1:
-            ].view(n, 1, h, w, c)
+            x = torch.randn(n * h * w * c + 1, device="cuda", dtype=torch.bfloat16)[1:].view(n, 1, h, w, c)
             bias = torch.randn(c + 1, device="cuda", dtype=x.dtype)[1:]
             saved_input = x.clone()
             packed = pack_history(x, bias=bias, padding=(0, 0, 0), cache_frames=1)
@@ -581,8 +501,7 @@ def verify() -> None:
                 torch.testing.assert_close(replayed.padded, x + bias, atol=0, rtol=0)
                 assert replayed.padded.data_ptr() == replayed.cache.data_ptr()
     print(
-        "Causal pack/bias/cache vs Torch: PASS "
-        "(including initial paths and graph replay)",
+        "Causal pack/bias/cache vs Torch: PASS (including initial paths and graph replay)",
         flush=True,
     )
 
@@ -630,9 +549,7 @@ def benchmark_production() -> None:
             x = torch.randn(n, t, h, w, c, device="cuda", dtype=torch.bfloat16)
         pad = (2, 1, 1) if ncthw else (p, 0, 0)
         cache_frames = 2 if ncthw else 1
-        previous = (
-            torch.randn(n, p, h, w, c, device="cuda", dtype=x.dtype) if p else None
-        )
+        previous = torch.randn(n, p, h, w, c, device="cuda", dtype=x.dtype) if p else None
         bias = None if ncthw else torch.randn(c, device="cuda", dtype=x.dtype)
 
         def reference(
@@ -646,16 +563,10 @@ def benchmark_production() -> None:
             cache_frames=cache_frames,
         ) -> PackedHistory:
             current = x.permute(0, 2, 3, 4, 1) if ncthw else x + bias
-            joined = (
-                current if previous is None else torch.cat((previous, current), dim=1)
-            )
+            joined = current if previous is None else torch.cat((previous, current), dim=1)
             pt, ph, pw = pad
             torch_padding = (0, 4 if c == 12 else 0, pw, pw, ph, ph, pt - p, 0)
-            padded = (
-                torch.nn.functional.pad(joined, torch_padding)
-                if any(torch_padding)
-                else joined
-            )
+            padded = torch.nn.functional.pad(joined, torch_padding) if any(torch_padding) else joined
             return PackedHistory(padded, joined[:, -cache_frames:].contiguous())
 
         def custom(
@@ -680,9 +591,7 @@ def benchmark_production() -> None:
         torch.testing.assert_close(actual.cache, expected.cache, atol=0, rtol=0)
         del actual, expected
         operation = "Latent pack" if c == 48 else "Input pack" if ncthw else "Downsample pack"
-        results.append(
-            measure(f"{operation} ({n},{t},{h},{w},{c}) history={p}", reference, custom)
-        )
+        results.append(measure(f"{operation} ({n},{t},{h},{w},{c}) history={p}", reference, custom))
     print_benchmark_table(results)
     print("Production pack/cache correctness: PASS", flush=True)
 

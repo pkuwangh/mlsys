@@ -20,9 +20,7 @@ def patchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
 
     batch_size, channels, frames, height, width = x.shape
     if height % patch_size != 0 or width % patch_size != 0:
-        raise ValueError(
-            f"Height ({height}) and width ({width}) must be divisible by patch_size ({patch_size})."
-        )
+        raise ValueError(f"Height ({height}) and width ({width}) must be divisible by patch_size ({patch_size}).")
 
     x = x.view(
         batch_size,
@@ -46,9 +44,7 @@ def patchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
 def validate_frame_count(frames: int) -> None:
     """Require one initial frame followed by complete four-frame chunks."""
     if frames != 1 and (frames - 1) % 4 != 0:
-        raise ValueError(
-            f"Input video frames must be 1 or 4n+1 for Wan VAE temporal chunking, got {frames}."
-        )
+        raise ValueError(f"Input video frames must be 1 or 4n+1 for Wan VAE temporal chunking, got {frames}.")
 
 
 def update_cache(feat_cache: FeatCache, idx: int, value: CacheEntry) -> FeatCache:
@@ -64,9 +60,7 @@ def canonicalize_cache(
 ) -> FeatCache:
     """Densify cache views in the owning encoder's storage layout."""
     return tuple(
-        entry.contiguous(memory_format=memory_format)
-        if isinstance(entry, torch.Tensor)
-        else entry
+        entry.contiguous(memory_format=memory_format) if isinstance(entry, torch.Tensor) else entry
         for entry in feat_cache
     )
 
@@ -81,11 +75,7 @@ def with_channels_last_weights(module: ModuleT) -> ModuleT:
     """
     if all(
         layer.weight.is_contiguous(
-            memory_format=(
-                torch.channels_last_3d
-                if isinstance(layer, torch.nn.Conv3d)
-                else torch.channels_last
-            )
+            memory_format=(torch.channels_last_3d if isinstance(layer, torch.nn.Conv3d) else torch.channels_last)
         )
         for layer in module.modules()
         if isinstance(layer, (torch.nn.Conv2d, torch.nn.Conv3d))

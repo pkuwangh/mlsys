@@ -250,6 +250,7 @@ def main() -> None:
     )
     # warmup
     _ = llm.generate(requests, params, use_tqdm=False)
+    print("\nWarmup complete. Starting benchmark...")
 
     metrics_before = (
         read_spec_decode_metrics(llm, num_speculative_tokens)

@@ -96,9 +96,7 @@ class BenchmarkCase:
         return f"{self.height}x{self.width}, T={self.frames}, N={self.batch_size}"
 
 
-def scaled_batch_size(
-    base_batch_size: int, frames: int, height: int, width: int
-) -> int:
+def scaled_batch_size(base_batch_size: int, frames: int, height: int, width: int) -> int:
     """Choose a spatial batch, then scale it down for videos longer than 17 frames.
 
     Spatial scaling is capped at twice the 720p batch, giving default 17-frame
@@ -180,12 +178,8 @@ def parse_args() -> argparse.Namespace:
         metavar="HEIGHTxWIDTH",
         help="Spatial resolutions to sweep.",
     )
-    parser.add_argument(
-        "--height", type=int, help="Single-resolution height; requires --width."
-    )
-    parser.add_argument(
-        "--width", type=int, help="Single-resolution width; requires --height."
-    )
+    parser.add_argument("--height", type=int, help="Single-resolution height; requires --width.")
+    parser.add_argument("--width", type=int, help="Single-resolution width; requires --height.")
     parser.add_argument(
         "--seed",
         type=int,
@@ -202,14 +196,9 @@ def parse_args() -> argparse.Namespace:
         "--profile-mega-only",
         "--profile-custom-only",
         action="store_true",
-        help=(
-            "Capture only Mega; keep baseline runs and validation "
-            "outside the CUDA profiler range."
-        ),
+        help=("Capture only Mega; keep baseline runs and validation outside the CUDA profiler range."),
     )
-    parser.add_argument(
-        "--benchmark-repeats", type=int, default=4, help="benchmark iters"
-    )
+    parser.add_argument("--benchmark-repeats", type=int, default=4, help="benchmark iters")
     args = parser.parse_args()
     if args.benchmark_repeats < 1:
         parser.error("--benchmark-repeats must be positive")
@@ -253,9 +242,7 @@ def nvtx_range(device: torch.device, name: str) -> Iterator[None]:
 
 
 @contextmanager
-def cuda_profiler_range(
-    device: torch.device, *, enabled: bool = True
-) -> Iterator[None]:
+def cuda_profiler_range(device: torch.device, *, enabled: bool = True) -> Iterator[None]:
     """Bound a CUDA capture, or leave an enclosing capture untouched if disabled."""
     if not enabled or device.type != "cuda" or not torch.cuda.is_available():
         yield
@@ -270,9 +257,7 @@ def cuda_profiler_range(
         torch.cuda.cudart().cudaProfilerStop()
 
 
-def compare_tensors(
-    name: str, actual: torch.Tensor, expected: torch.Tensor, *, atol: float, rtol: float
-) -> bool:
+def compare_tensors(name: str, actual: torch.Tensor, expected: torch.Tensor, *, atol: float, rtol: float) -> bool:
     diff = (actual.detach().float() - expected.detach().float()).abs()
     max_abs = float(diff.max().item())
     mean_abs = float(diff.mean().item())
@@ -287,8 +272,7 @@ def compare_tensors(
         failed = ~torch.isclose(actual, expected, atol=atol, rtol=rtol)
         count = int(failed.sum().item())
         print(
-            f"    outside tolerance: {count}/{failed.numel()} "
-            f"({100 * count / failed.numel():.4f}%)",
+            f"    outside tolerance: {count}/{failed.numel()} ({100 * count / failed.numel():.4f}%)",
             flush=True,
         )
         if actual.ndim == 5:
@@ -309,17 +293,13 @@ def compare_tensors(
 
 
 def cache_state_name(feat_cache: FeatCache) -> str:
-    first_tensor = next(
-        (entry for entry in feat_cache if isinstance(entry, torch.Tensor)), None
-    )
+    first_tensor = next((entry for entry in feat_cache if isinstance(entry, torch.Tensor)), None)
     if first_tensor is None:
         return "cache_t=0"
     return f"cache_t={first_tensor.shape[2]}"
 
 
-def tensor_error(
-    actual: torch.Tensor, expected: torch.Tensor
-) -> tuple[float, float, float]:
+def tensor_error(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float, float]:
     diff = (actual.detach().float() - expected.detach().float()).abs()
     return (
         float(diff.max().item()),
@@ -342,8 +322,7 @@ def debug_compiled_chunk_mismatch(
         x = raw_patchify(x, patch_size=int(torch_encoder.patch_size))
 
     if torch_encoder.use_tiling and (
-        width > torch_encoder.tile_sample_min_width
-        or height > torch_encoder.tile_sample_min_height
+        width > torch_encoder.tile_sample_min_width or height > torch_encoder.tile_sample_min_height
     ):
         print("  rejected: tiling is enabled.")
         return False
@@ -358,9 +337,7 @@ def debug_compiled_chunk_mismatch(
 
         cache_in = raw_canonicalize_cache(feat_cache)
         eager_out, eager_cache = torch_encoder.encode_chunk(chunk, cache_in)
-        compiled_out, compiled_cache = compiled_torch_encoder.chunk_encoder(
-            chunk, cache_in
-        )
+        compiled_out, compiled_cache = compiled_torch_encoder.chunk_encoder(chunk, cache_in)
 
         if not torch.allclose(compiled_out, eager_out, atol=atol, rtol=rtol):
             max_abs, mean_abs, rms_abs = tensor_error(compiled_out, eager_out)
@@ -378,9 +355,7 @@ def debug_compiled_chunk_mismatch(
             )
             return False
 
-        for cache_idx, (actual, expected) in enumerate(
-            zip(compiled_cache, eager_cache)
-        ):
+        for cache_idx, (actual, expected) in enumerate(zip(compiled_cache, eager_cache)):
             if isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor):
                 if not torch.allclose(actual, expected, atol=atol, rtol=rtol):
                     max_abs, mean_abs, rms_abs = tensor_error(actual, expected)
@@ -431,9 +406,7 @@ def make_synthetic_video(
     CUDA tensor, using the batch size selected for this case.
     """
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    video = torch.empty(
-        batch_size, channels, frames, height, width, device=device, dtype=dtype
-    )
+    video = torch.empty(batch_size, channels, frames, height, width, device=device, dtype=dtype)
     y = torch.linspace(-1.0, 1.0, height).view(1, 1, height, 1)
     x = torch.linspace(-1.0, 1.0, width).view(1, 1, 1, width)
     for index, t in enumerate(torch.linspace(0.0, 1.0, frames)):
@@ -451,25 +424,19 @@ def make_synthetic_video(
     return video
 
 
-def load_vae(
-    args: argparse.Namespace, device: torch.device, dtype: torch.dtype
-) -> AutoencoderKLWan:
+def load_vae(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> AutoencoderKLWan:
     if args.model is None:
         torch.manual_seed(args.seed)
         vae = AutoencoderKLWan(**SYNTHETIC_WAN22_CONFIG)
     else:
-        vae = AutoencoderKLWan.from_pretrained(
-            args.model, subfolder="vae", torch_dtype=dtype
-        )
+        vae = AutoencoderKLWan.from_pretrained(args.model, subfolder="vae", torch_dtype=dtype)
     # Prepare the single reference in place; do not retain an alternate layout.
     torch.nn.utils.convert_conv3d_weight_memory_format(vae, torch.channels_last_3d)
     torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
     return vae.to(device=device, dtype=dtype).eval()
 
 
-def median_timings(
-    paths: dict[str, Callable[[], torch.Tensor]], repeats: int
-) -> dict[str, float]:
+def median_timings(paths: dict[str, Callable[[], torch.Tensor]], repeats: int) -> dict[str, float]:
     """Alternate variant order; time full encodes, including ordinary launches."""
     samples: dict[str, list[float]] = {name: [] for name in paths}
     for repeat in range(repeats):
@@ -561,9 +528,7 @@ def run_case(
             status.append(f"{name} FAIL")
     if compiled is not None and "Compiled" in outputs:
         # Diagnostic only: stay quiet on success; failures print their location.
-        chunks_match = debug_compiled_chunk_mismatch(
-            eager, compiled, video, atol=COMPARE_ATOL, rtol=COMPARE_RTOL
-        )
+        chunks_match = debug_compiled_chunk_mismatch(eager, compiled, video, atol=COMPARE_ATOL, rtol=COMPARE_RTOL)
         if not chunks_match:
             print("  FAIL Torch compiled chunk outputs/caches", flush=True)
             status.append("Compiled cache FAIL")
@@ -612,14 +577,10 @@ def print_summary(results: list[BenchmarkResult], repeats: int) -> None:
                     for name in ("Mega", "Diffusers", "Torch", "Compiled")
                 ],
                 *[
-                    f"{times[name] / mega_ms:.3f}x"
-                    if mega_ms and name in times
-                    else "-"
+                    f"{times[name] / mega_ms:.3f}x" if mega_ms and name in times else "-"
                     for name in ("Torch", "Compiled")
                 ],
-                f"{result.case.batch_size * result.case.frames * 1000 / mega_ms:.1f}"
-                if mega_ms
-                else "-",
+                f"{result.case.batch_size * result.case.frames * 1000 / mega_ms:.1f}" if mega_ms else "-",
                 result.status,
             ]
         )
@@ -629,10 +590,7 @@ def print_summary(results: list[BenchmarkResult], repeats: int) -> None:
         f"median of {repeats} full-encode CUDA-event samples.",
         flush=True,
     )
-    print(
-        "Speedup=baseline/Mega. Input generation, warmup, compilation "
-        "and validation excluded."
-    )
+    print("Speedup=baseline/Mega. Input generation, warmup, compilation and validation excluded.")
     for index, row in enumerate([headers, *rows]):
         print(
             " | ".join(
@@ -649,14 +607,10 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda")
     batch_label = (
-        "auto batch (reference N=16, T=17, HxW=720x1280)"
-        if args.batch_size is None
-        else f"fixed N={args.batch_size}"
+        "auto batch (reference N=16, T=17, HxW=720x1280)" if args.batch_size is None else f"fixed N={args.batch_size}"
     )
     print(
-        f"Wan2.2 VAE | {torch.cuda.get_device_name(device)} | "
-        f"{batch_label} "
-        f"| BF16 | repeats={args.benchmark_repeats}",
+        f"Wan2.2 VAE | {torch.cuda.get_device_name(device)} | {batch_label} | BF16 | repeats={args.benchmark_repeats}",
         flush=True,
     )
     if args.model is None:
@@ -674,9 +628,7 @@ def main() -> None:
             height,
             width,
             frames,
-            args.batch_size
-            if args.batch_size is not None
-            else scaled_batch_size(16, frames, height, width),
+            args.batch_size if args.batch_size is not None else scaled_batch_size(16, frames, height, width),
         )
         for height, width in args.resolutions
         for frames in args.frames
@@ -692,9 +644,7 @@ def main() -> None:
             ),
         ):
             if factor and (case.height % int(factor) or case.width % int(factor)):
-                raise ValueError(
-                    f"{case.label}: resolution must be divisible by {factor}"
-                )
+                raise ValueError(f"{case.label}: resolution must be divisible by {factor}")
     print(
         "Validation: Mega, Torch eager and compiled vs channels-last Diffusers.\n"
         f"Tolerances: atol={COMPARE_ATOL}, rtol={COMPARE_RTOL}.",
@@ -708,9 +658,7 @@ def main() -> None:
                 results.append(run_case(args, case, vae, device))
             except torch.cuda.OutOfMemoryError:
                 # Record the planned batch; never silently shrink it after OOM.
-                print(
-                    "  CUDA OOM: workload does not fit; continuing sweep.", flush=True
-                )
+                print("  CUDA OOM: workload does not fit; continuing sweep.", flush=True)
                 results.append(BenchmarkResult(case, {}, "OOM"))
             finally:
                 # Drop compiled graphs and cached allocations between workloads.

@@ -30,7 +30,12 @@ class BenchmarkResult:
 
 
 def measure(
-    label: str, reference: Callable, custom: Callable, *, samples: int = 3, replays: int = 5
+    label: str,
+    reference: Callable,
+    custom: Callable,
+    *,
+    samples: int = 3,
+    replays: int = 5,
 ) -> BenchmarkResult:
     """Measure paired median GPU times, excluding Python and JIT compilation.
 
@@ -63,9 +68,7 @@ def measure(
     return BenchmarkResult(label, custom_ms, ref_ms)
 
 
-def print_benchmark_table(
-    results: list[BenchmarkResult], reference_name: str = "Torch reference"
-) -> None:
+def print_benchmark_table(results: list[BenchmarkResult], reference_name: str = "Torch reference") -> None:
     """Print aligned timing columns; name non-Torch references explicitly."""
     headers = ("Operation", "Custom (ms)", f"{reference_name} (ms)", "Speedup")
     rows = [
