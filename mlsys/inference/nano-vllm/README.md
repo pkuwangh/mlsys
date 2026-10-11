@@ -25,6 +25,12 @@ pip install -e .
 ## Quick start
 
 ```bash
+mkdir -p ~/huggingface
+hf download --local-dir ../models/Qwen/Qwen3-0.6B Qwen/Qwen3-0.6B
+hf download --local-dir ../models/Qwen/Qwen3-14B Qwen/Qwen3-14B
+ln -s "$(realpath ../models/Qwen/Qwen3-0.6B)" ~/huggingface/Qwen3-0.6B
+ln -s "$(realpath ../models/Qwen/Qwen3-14B)" ~/huggingface/Qwen3-14B
+
 python example.py
 ```
 

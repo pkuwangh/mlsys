@@ -28,3 +28,6 @@
 [submodule "mlsys/gpu/backends/cudnn-frontend"]
 	path = mlsys/gpu/backends/cudnn-frontend
 	url = https://github.com/pkuwangh/cudnn-frontend.git
+[submodule "mlsys/gpu/backends/flash-attention"]
+	path = mlsys/gpu/backends/flash-attention
+	url = https://github.com/pkuwangh/flash-attention.git
