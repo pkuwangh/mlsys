@@ -56,7 +56,7 @@ uv pip install "diffusers==0.40.0"
 uv pip install "accelerate==1.14.0"
 
 # cutlass-dsl
-uv pip install "nvidia-cutlass-dsl==4.7.1" "apache-tvm-ffi==0.1.12"
+uv pip install "nvidia-cutlass-dsl[cu13]==4.8.0" "apache-tvm-ffi==0.1.12"
 
 python "${CURR_DIR}/check_cuda.py"
 
