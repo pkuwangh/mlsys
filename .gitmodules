@@ -31,3 +31,6 @@
 [submodule "mlsys/gpu/backends/flash-attention"]
 	path = mlsys/gpu/backends/flash-attention
 	url = https://github.com/pkuwangh/flash-attention.git
+[submodule "mlsys/gpu/backends/flashinfer"]
+	path = mlsys/gpu/backends/flashinfer
+	url = https://github.com/pkuwangh/flashinfer.git
