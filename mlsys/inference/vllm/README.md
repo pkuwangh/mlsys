@@ -35,8 +35,6 @@ uv pip install --no-build-isolation -e .[bench] --config-settings editable_mode=
 
 
 # install vllm-omni
-micromamba install -y -c conda-forge "libgl"
-uv pip install "setuptools-scm==10.2.1"
 VLLM_OMNI_TARGET_DEVICE=cuda uv pip install -e '.[demo]' --no-build-isolation
 ```
 

@@ -20,6 +20,7 @@ else
         "cmake=4.4.2" \
         "gcc=14.3.0" \
         "gxx=14.3.0" \
+        "libgl=1.7.0" \
         "ninja=1.13.1" \
         || return 1
 fi
@@ -31,7 +32,7 @@ splitLine
 cleanupCondaBackEnvs
 
 # python deps
-uv pip install black loguru ruff "huggingface_hub[cli]" "cuda-python==13.2.0" || return 1
+uv pip install black loguru ruff huggingface_hub "cuda-python==13.2.0" || return 1
 
 # cuda env
 source "${CURR_DIR}/../../../scripts/source_cuda_env.sh" || return 1
@@ -56,6 +57,6 @@ uv pip install --pre "torch==2.13.0" "torchaudio>2.11.0.dev0,<=2.11.0" "torchvis
 # uv pip install "torch==2.13.0" "torchaudio==2.11.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
 
 # other deps
-uv pip install "av==18.1.0" openai
+uv pip install "av==18.1.0" "openai==3.16.2" "setuptools-scm==10.2.1"
 
 python "${CURR_DIR}/check_cuda.py"

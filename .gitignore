@@ -14,7 +14,7 @@ slurm-*.out
 
 /micromamba/
 
-/run_cute_dsl_kernel.py
-/allocate_gpu_node.py
+/run_*.py
+/allocate_*.py
 
 /tmp/
