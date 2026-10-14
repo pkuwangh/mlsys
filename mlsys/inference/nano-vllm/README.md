@@ -3,6 +3,7 @@
 - [nano-vllm](#nano-vllm)
   - [Install nano-vllm](#install-nano-vllm)
   - [Quick start](#quick-start)
+  - [Concurrent Prefill and Decode Prototype](#concurrent-prefill-and-decode-prototype)
   - [Walk through](#walk-through)
     - [Engine workflow](#engine-workflow)
     - [Scheduling](#scheduling)
@@ -19,6 +20,7 @@ source source_me_install_deps.sh
 
 # install nano-vllm
 cd nano-vllm
+FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=16 uv pip install --no-cache --no-build-isolation --no-deps ../../../gpu/backends/flash-attention
 pip install -e .
 ```
 
@@ -33,6 +35,76 @@ ln -s "$(realpath ../models/Qwen/Qwen3-14B)" ~/huggingface/Qwen3-14B
 
 python example.py
 ```
+
+## Concurrent Prefill and Decode Prototype
+
+Prototype complete: aggregated prefill/decode disaggregation with shared weights
+and KV cache, independent execution queues, and a fixed tunable SM split.
+The measured B200 result and scheduling trace are in
+[output/concurrent/README.md](output/concurrent/README.md).
+
+From the repository root, using the existing `mlsys-nano` environment:
+
+```bash
+# Alternate serial/concurrent execution on the same disjoint SM partitions.
+./run_nano.py mlsys/inference/nano-vllm/benchmark_concurrent.py --prefill-sm-fraction 0.5
+
+# Give decode more SMs (the actual counts are printed).
+./run_nano.py mlsys/inference/nano-vllm/benchmark_concurrent.py --mode concurrent --prefill-sm-fraction 0.45
+
+# Full-GPU serialized baseline, with the same requests and greedy sampling.
+./run_nano.py mlsys/inference/nano-vllm/benchmark_concurrent.py --mode full
+
+# Separate warmed capture, including GPU metrics.
+./run_nano.py --nsys mlsys/inference/nano-vllm/benchmark_concurrent.py --mode concurrent --profile
+```
+
+Defaults: Qwen3-14B, 512 distinct requests, 1,024 input / 128 output tokens,
+64 active requests, up to 32 sequences per path, and a 16,384-token prefill budget. `--help` lists
+overrides. CUDA rounds the requested split; the benchmark prints actual counts.
+Both contexts come from one resource split, with decode using the remainder.
+
+Requests are replenished as earlier requests finish, keeping at most
+`--active-requests` outstanding. This is a closed-loop load, not a fixed arrival rate.
+Steady-state throughput counts tokens delivered between the 25% and 75%
+request-completion boundaries; whole-run throughput is reported separately.
+Use at least four times as many requests as active slots to exclude startup/drain.
+TTFT is measured from admission, not from the start of the entire workload.
+
+One model and KV allocation are shared. Prefill and decode have independent
+completion events, so many decode steps can run during one prefill submission.
+Completed prefills hand their existing cache blocks and first output token to
+the decode queue. A single CPU thread submits work; token readback is asynchronous.
+
+This is an opt-in benchmark executor, not a replacement for `LLM.generate()`.
+It supports TP1 Qwen3 dense models, uses greedy, fixed-length generation,
+disables prefix reuse/preemption, and reserves each admitted request's full
+cache requirement. Prefill runs eager;
+decode uses CUDA graphs. A long eager host submission can still delay decode
+submission. The reported stream-interval overlap includes such host gaps;
+use the trace to distinguish actual overlapping kernels.
+
+JSON results are saved under `output/concurrent/`; traces go to the repository's
+`tmp/` directory. Timings exclude model loading, warmup, and validation.
+The runner captures CUDA graphs as whole graph launches, with GPU metrics.
+Each result filename includes a timestamp. Splits are fixed for a run: changing
+them requires new green contexts/streams and decode graphs captured for those
+contexts, after draining work on the previous split.
+For the default workload on B200, the best tested split was 72/76 SMs
+(`--prefill-sm-fraction 0.45`); see `output/concurrent/README.md` for the sweep.
+
+Code locations:
+
+- `benchmark_green_context.py`: isolated full-GPU versus partitioned measurements using the normal scheduler.
+- `benchmark_concurrent.py`: sustained-load comparison, validation, and profiling.
+- `nanovllm/engine/concurrent.py`: independent submission/completion queues and shared-cache handoff.
+- `nanovllm/utils/green_context.py`: disjoint SM resources and stream lifetime.
+
+Related work: [SGLang PD-Multiplexing](https://www.lmsys.org/blog/2025-09-28-pdmux/),
+[PegaInfer](https://pegainfer.org/blog/green-ctx/), and
+[DuetServe](https://pages.cs.wisc.edu/~markhill/papers/icml2026_DuetServe.pdf).
+Dynamic repartitioning, full-GPU fallback, and production-serving integration
+are outside this completed prototype's scope.
 
 ## Walk through
 

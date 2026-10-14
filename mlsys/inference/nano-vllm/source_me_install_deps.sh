@@ -45,10 +45,9 @@ splitLine
 uv pip install "torch==2.14.1" "torchvision==0.29.1" --index-url https://download.pytorch.org/whl/cu132 || return 1
 
 # flash_attn
-# Build the local submodule against installed torch
 export FLASH_ATTN_CUDA_ARCHS="100;103"
-FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=16 \
-    uv pip install --no-cache --no-build-isolation --no-deps \
-    "${CURR_DIR}/../../gpu/backends/flash-attention" || return 1
+# Build the local submodule against installed torch
+# FLASH_ATTN_DIR="$(realpath "${CURR_DIR}/../../gpu/backends/flash-attention")"
+# FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=16 uv pip install --no-cache --no-build-isolation --no-deps $FLASH_ATTN_DIR || return 1
 
 python "${CURR_DIR}/check_cuda.py"
