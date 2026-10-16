@@ -12,49 +12,49 @@ if micromamba env list | grep -q "${MY_VENV}"; then
     debugMsg "Virtual env ${MY_VENV} already exists."
 else
     micromamba create -n "${MY_VENV}" -c conda-forge "python=3.12" "pip=25.0" "setuptools>=80.0.0" -y
+    # conda-forge only
+    micromamba install -n "${MY_VENV}" -y \
+        -c conda-forge \
+        "cuda-toolkit=13.2.2" \
+        "ccache=4.13.6" \
+        "cmake=4.4.2" \
+        "gcc=15.3.0" \
+        "gxx=15.3.0" \
+        "libgl=1.7.0" \
+        "ninja=1.13.1" \
+        "rust=1.92.0" \
+        || return 1
 fi
 micromamba activate "${MY_VENV}"
 
 splitLine
-# For whatever reason, installing CUDA adds e.g. $CONDA_BACKUP_CFLAGS back up $CFLAGS
-cleanupCondaBackEnvs
-micromamba install -n "${MY_VENV}" -y \
-    -c nvidia/label/cuda-13.0.2 \
-    cuda cuda-nvcc cuda-toolkit cuda-runtime cuda-nvtx-dev \
-    -c conda-forge \
-    nvtx=0.2.14 \
-    --strict-channel-priority
 
-pip install black loguru ruff
+# system deps
+cleanupCondaBackEnvs
+
+# python deps
+uv pip install black loguru ruff huggingface_hub "cuda-python==13.2.0" || return 1
+
+# cuda env
+source "${CURR_DIR}/../../../scripts/source_cuda_env.sh" || return 1
 
 splitLine
 infoMsg "Checking nvcc"
-which nvcc
-nvcc --version
+which gcc || return 1
+gcc --version || return 1
+which nvcc || return 1
+nvcc --version || return 1
 
 splitLine
-infoMsg "Set various environment variables for sglang build"
 
-# for cmake find_package
-export CUDA_HOME="${CONDA_PREFIX}"
-export CUDA_PATH="${CUDA_HOME}"
-export CUDACXX="${CUDA_HOME}/bin/nvcc"
+# torch
+uv pip install "torch==2.13.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
+# Note: stable cu132 index https://download.pytorch.org/whl/cu132/torchaudio/ does not have 2.11.0 release
+# Installing from pypi does not guarantee the correct CUDA version is used.
+# So use the nightly-build index
+uv pip install --pre "torchaudio>2.11.0.dev0,<=2.11.0" --index-url https://download.pytorch.org/whl/nightly/cu132 || return 1
 
-# for conda-installed CUDA, real home is under /targets/$(uname -m)-linux
-_SCATTERED_CUDA_HOME="${CUDA_HOME}/targets/$(uname -m)-linux"
+# other deps
+uv pip install "setuptools-scm==10.2.1"
 
-# link critical header files
-_HEADERS=("cuda.h" "cuda_runtime.h" "cuda_runtime_api.h" "device_functions.h")
-for header in "${_HEADERS[@]}"; do
-    if [ ! -f "${CUDA_HOME}/include/${header}" ]; then
-        ln -s "${_SCATTERED_CUDA_HOME}/include/${header}" "${CUDA_HOME}/include/${header}"
-    fi
-done
-
-# cuda.h etc. are under /targets/x86_64-linux/include
-export CPATH="${_SCATTERED_CUDA_HOME}/include:${CPATH}"
-
-# libcudart.so is under /targets/x86_64-linux/lib, but is linked to /lib
-# libcuda.so is under /targets/x86_64-linux/lib/stub
-export LIBRARY_PATH="${_SCATTERED_CUDA_HOME}/lib:${_SCATTERED_CUDA_HOME}/lib/stub:${LIBRARY_PATH}"
-export LD_LIBRARY_PATH="${_SCATTERED_CUDA_HOME}/lib:${_SCATTERED_CUDA_HOME}/lib/stub:${LD_LIBRARY_PATH}"
+python "${CURR_DIR}/check_cuda.py"

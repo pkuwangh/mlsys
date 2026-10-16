@@ -24,7 +24,8 @@ source source_me_install_deps.sh
 
 # install vllm
 # python install
-VLLM_USE_PRECOMPILED=1 uv pip install -e '.[bench]' --torch-backend=auto
+uv pip freeze | grep -E '^(torch|torchvision|torchaudio)==' | tee /tmp/vllm-torch-overrides.txt
+VLLM_USE_PRECOMPILED=1 uv pip install -e '.[bench]' --override /tmp/vllm-torch-overrides.txt
 
 # vllm full build
 uv pip install -r requirements/build.txt
@@ -35,7 +36,7 @@ uv pip install --no-build-isolation -e .[bench] --config-settings editable_mode=
 
 
 # install vllm-omni
-VLLM_OMNI_TARGET_DEVICE=cuda uv pip install -e '.[demo]' --no-build-isolation
+VLLM_OMNI_TARGET_DEVICE=cuda uv pip install -e '.[demo]' --no-build-isolation --override /tmp/vllm-torch-overrides.txt
 ```
 
 ## Download Model

@@ -11,7 +11,7 @@ micromamba deactivate
 if micromamba env list | grep -q "${MY_VENV}"; then
     debugMsg "Virtual env ${MY_VENV} already exists."
 else
-    micromamba create -n "${MY_VENV}" -c conda-forge python=3.12 pip=25.0 "setuptools<80.0.0" -y
+    micromamba create -n "${MY_VENV}" -c conda-forge "python=3.12" "pip=25.0" "setuptools<80.0.0" -y
     # conda-forge only
     micromamba install -n "${MY_VENV}" -y \
         -c conda-forge \
@@ -50,11 +50,11 @@ export CCACHE_NOHASHDIR="true"
 export CCACHE_DIR="${CURR_DIR}/.ccache"
 
 # torch
+uv pip install "torch==2.13.0" torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
 # Note: stable cu132 index https://download.pytorch.org/whl/cu132/torchaudio/ does not have 2.11.0 release
 # Installing from pypi does not guarantee the correct CUDA version is used.
 # So use the nightly-build index
-uv pip install --pre "torch==2.13.0" "torchaudio>2.11.0.dev0,<=2.11.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/nightly/cu132 || return 1
-# uv pip install "torch==2.13.0" "torchaudio==2.11.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
+uv pip install --pre "torchaudio>2.11.0.dev0,<=2.11.0" --index-url https://download.pytorch.org/whl/nightly/cu132 || return 1
 
 # other deps
 uv pip install "av==18.1.0" "openai==3.16.2" "setuptools-scm==10.2.1"

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
 import sglang as sgl
+from utils import get_model_path
 
 
 def main():
-    llm = sgl.Engine(model_path="../models/Qwen/Qwen3-30B-A3B-Instruct-2507")
+    model_path = get_model_path("Qwen/Qwen3.8-27B")
+    llm = sgl.Engine(model_path=model_path)
 
     prompts = [
         "Hello, my name is",

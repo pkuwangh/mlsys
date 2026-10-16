@@ -67,6 +67,9 @@ else
     micromamba activate "${MY_VENV}" || return 1
 fi
 
+# deps
+uv pip install setuptools-scm
+
 splitLine
 debugMsg "Listing all virtual envs ..."
 micromamba env list

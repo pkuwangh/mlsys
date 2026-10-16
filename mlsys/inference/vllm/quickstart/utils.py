@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
-
 import pathlib
+
 
 # get current directory
 def _get_current_path():
@@ -14,4 +13,3 @@ def get_model_path(model_name: str) -> str:
 
 if __name__ == "__main__":
     print(get_model_path("nvidia/Cosmos3-Super"))
-
