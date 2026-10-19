@@ -57,10 +57,11 @@ The kernel uses cooperative four-CTA clusters, with eight warps per CTA:
 Gate/up does not split K. Warps 0-3 stage output/down operands; warps 4-7
 issue WGMMA. Output projection has two K256 stages and down has two K384
 stages. These use distinct buffers, so neither needs an empty-buffer handshake.
-Gate/up weights occupy 128 KiB of SMEM per tile: four independently ready K256
-stages at N16, or one full-K TMA transfer at N32. N32 prefetches the first tile
-while waiting for normalization inputs and the next tile during SiLU processing.
-Its extra weight storage aliases the output/down operand buffers.
+Gate/up weights occupy 128 KiB of SMEM per tile, loaded in one full-K TMA
+transfer before normalization. N16 also preloads residuals and gamma into
+registers before reducing the norm statistics. N32 prefetches its second weight
+tile during SiLU processing. Extra weight storage aliases the output/down
+operand buffers.
 
 Normalized inputs remain in WGMMA layout. Split-K partials and gate/up epilogues
 use different shared-memory swizzles to suit their different read patterns.
@@ -115,9 +116,19 @@ each round uses three samples of five replays. Per complete fused block:
 | 16 | 27.19 us | 18.69 us | 16.22 us | 1.68x | 13.3% |
 | 32 | 27.86 us | 23.54 us | 19.49 us | 1.43x | 17.2% |
 
-Original is commit `f0a74e6`. These are standalone-block results, not whole-TTS
+Original is commit `f0a74e6`; optimized is `c03b2bc`. These are standalone-block results, not whole-TTS
 speedups. The initial H100 results were 20.87/25.87 us for the original kernel;
 do not compare those directly with H200 timings.
+
+Follow-up on H200 (`viking-prod-260`), with the same interleaved protocol:
+
+| Batch | Compiled Torch | `c03b2bc` | Earlier weight/norm prefetch | Speedup vs Torch |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 27.11 us | 16.24 us | 14.64 us | 1.85x |
+| 32 | 27.81 us | 19.49 us | 19.54 us | 1.42x |
+
+B16 latency falls another 9.9%; B32 is effectively unchanged. The CTA roles,
+math, and cross-CTA publication protocol are unchanged.
 
 Real-checkpoint full-talker replay, 23-token prefix plus 32 captured decode
 inputs, timing the last step at a fixed KV position:

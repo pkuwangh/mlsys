@@ -17,6 +17,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import torch
 from cutlass import cute
+from cutlass.cute.experimental import iket
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.experimental import cuda as tensor_map
 from cutlass.experimental import primitives as p
@@ -47,26 +48,18 @@ def wait_barrier(barrier, phase):
 
 
 @cute.jit
-def prefetch_gate_up(weights, bars, weight_map, tile, tid, N: cutlass.Constexpr):
-    """Load a complete gate/up tile, with independently ready K256 stages at N16."""
-    stages = 4 if N == 16 else 1
-    slabs = 4 if N == 16 else 16
+def prefetch_gate_up(weights, bars, weight_map, tile, tid):
+    """Prefetch a resident 128-KiB gate/up tile."""
+    iket.range_push("gate_up_weight_prefetch")
     if tid == 0:
-        for stage in cutlass.range_constexpr(stages):
-            p.mbarrier_init(bars.subview(stage), 1)
+        p.mbarrier_init(bars, 1)
     p.fence_mbarrier_init()
     p.barrier_cta_sync()
     if tid == 0:
-        for stage in cutlass.range_constexpr(stages):
-            p.mbarrier_expect_tx(bars.subview(stage), slabs * 8192)
-            p.cp_async_bulk_tensor_shared_cluster_global(
-                weights.subview(stage * slabs * 4096),
-                weight_map.get_ptr(),
-                [0, 0, stage * slabs, tile],
-                bars.subview(stage),
-                [],
-            )
-            p.mbarrier_arrive(bars.subview(stage))
+        p.mbarrier_expect_tx(bars, 131072)
+        p.cp_async_bulk_tensor_shared_cluster_global(weights, weight_map.get_ptr(), [0, 0, 0, tile], bars, [])
+        p.mbarrier_arrive(bars)
+    iket.range_pop()
 
 
 @cute.jit
@@ -90,21 +83,29 @@ def gemm(
     N: cutlass.Constexpr,
 ):
     """Consume resident gate/up operands or stage two split-projection operands."""
+    if cutlass.const_expr(MODE == 0):
+        iket.range_push("output_projection")
+    elif cutlass.const_expr(MODE == 1):
+        iket.range_push("gate_up_projection", tile)
+    else:
+        iket.range_push("down_projection")
     if cutlass.const_expr(MODE == 1):
-        if cutlass.const_expr(N == 16):
-            prefetch_gate_up(weights, bars, weight_map, tile, tid, N)
         if tid >= 128:
             p.wgmma_fence_aligned()
-            for stage in range(4 if N == 16 else 1):
-                wait_barrier(bars.subview(stage), 0)
-                for slab in cutlass.range_constexpr(4 if N == 16 else 16):
-                    offset = stage * 4 + slab
-                    da = descriptor(weights, offset * 4096)
-                    db = descriptor(normalized, offset * N * 64)
-                    for k in cutlass.range_constexpr(4):
-                        mma(acc, da + 2 * k, db + 2 * k, N)
-                p.wgmma_commit_group_sync_aligned()
-                p.wgmma_wait_group_sync_aligned(0)
+            iket.range_push("operand_wait", cutlass.Int32(0))
+            wait_barrier(bars, 0)
+            iket.range_pop()
+            iket.range_push("mma_issue", cutlass.Int32(0))
+            for slab in cutlass.range_constexpr(16):
+                da = descriptor(weights, slab * 4096)
+                db = descriptor(normalized, slab * N * 64)
+                for k in cutlass.range_constexpr(4):
+                    mma(acc, da + 2 * k, db + 2 * k, N)
+            p.wgmma_commit_group_sync_aligned()
+            iket.range_pop()
+            iket.range_push("mma_drain", cutlass.Int32(0))
+            p.wgmma_wait_group_sync_aligned(0)
+            iket.range_pop()
         p.barrier_cta_sync()
     else:
         if tid == 0:
@@ -128,10 +129,13 @@ def gemm(
                         bars.subview(stage),
                         [],
                     )
+                iket.range_push("activation_wait", stage)
                 if cutlass.const_expr(MODE == 2):  # noqa: SIM102 - keep the compile-time branch.
                     if tid < 12:
                         wait_flag(flags, 64 + kbase // 32 + tid, epoch)
                 p.barrier_cta_sync(barrier_id=1, thread_count=128)
+                iket.range_pop()
+                iket.range_push("operand_copy", stage)
                 for j in cutlass.range_constexpr(group * N // 16):
                     idx = (tid + j * 128) * 8
                     slab, row, k = idx // (N * 64), (idx // 64) % N, idx % 64
@@ -150,18 +154,27 @@ def gemm(
                 p.barrier_cta_sync(barrier_id=1, thread_count=128)
                 if tid == 0:
                     p.mbarrier_arrive(bars.subview(stage))
+                iket.range_pop()
         else:
             p.wgmma_fence_aligned()
             for stage in range(2):
+                iket.range_push("operand_wait", stage)
                 wait_barrier(bars.subview(stage), 0)
+                iket.range_pop()
+                iket.range_push("mma_issue", stage)
                 for slab in cutlass.range_constexpr(group):
                     da = descriptor(weights, (stage * group + slab) * 4096)
                     db = descriptor(operands, (stage * group + slab) * N * 64)
                     for k in cutlass.range_constexpr(4):
                         mma(acc, da + 2 * k, db + 2 * k, N)
                 p.wgmma_commit_group_sync_aligned()
+                iket.range_pop()
+                iket.range_push("mma_drain", stage)
                 p.wgmma_wait_group_sync_aligned(0)
+                iket.range_pop()
         p.barrier_cta_sync()
+
+    iket.range_pop()
 
 
 @cute.jit
@@ -181,13 +194,17 @@ def gate_up_index(row, col, N: cutlass.Constexpr):
 
 @cute.jit
 def scatter_partial(acc, partial, tid, N: cutlass.Constexpr):
+    iket.range_push("splitk_store")
     if tid >= 128:
         for i in cutlass.range_constexpr(N // 2):
             row = fragment_row(tid - 128, i)
             col = fragment_column(tid - 128, i)
             partial.store(acc[i], idx=partial_index(row, col))
+    iket.range_pop()
+    iket.range_push("splitk_cluster_sync")
     p.barrier_cluster_arrive()
     p.barrier_cluster_wait()
+    iket.range_pop()
 
 
 @cute.jit
@@ -225,7 +242,7 @@ def fused_kernel(
         cutlass.BFloat16, max(65536, 49152 + 12 * N * 64), space=cutlass.AddressSpace.smem, alignment=1024
     )
     operands = weights.subview(49152)
-    bars = cutlass.Array(cutlass.Int64, 4, space=cutlass.AddressSpace.smem, alignment=8)
+    bars = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
     normalized = cutlass.Array(cutlass.BFloat16, N * 1024, space=cutlass.AddressSpace.smem, alignment=1024)
     partial = cutlass.Array(cutlass.Float32, 64 * N, space=cutlass.AddressSpace.smem, alignment=128)
     inverse = cutlass.Array(cutlass.Float32, N, space=cutlass.AddressSpace.smem, alignment=128)
@@ -267,7 +284,10 @@ def fused_kernel(
             idx = tid + j * 256
             batch, channel = idx // 16, idx % 16
             row = rank * 16 + channel
+            iket.range_push("output_reduce", j)
             projected = cutlass.BFloat16(reduce_partial(partial, row, batch, N))
+            iket.range_pop()
+            iket.range_push("output_residual_stats", j)
             value = cutlass.BFloat16(0)
             if batch < B:
                 value = cutlass.BFloat16(
@@ -279,19 +299,42 @@ def fused_kernel(
                 square_sum += cute.arch.shuffle_sync_bfly(square_sum, 1 << delta)
             if channel == 0:
                 stats[bid, batch] = square_sum
+            iket.range_pop()
+        iket.range_push("output_cta_sync")
         p.barrier_cta_sync()
+        iket.range_pop()
+        iket.range_push("output_release")
         if tid == 0:
             publish(flags, bid, epoch)
+        iket.range_pop()
+        iket.range_push("output_cluster_release")
         p.barrier_cluster_arrive()
         p.barrier_cluster_wait()
+        iket.range_pop()
 
     # At N16 all 96 CTAs produce one tile; at N32 only the 48 dedicated CTAs do so twice.
     if N == 16 or cluster >= 16:
-        if cutlass.const_expr(N == 32):
-            prefetch_gate_up(weights, bars, wgu, bid - 64, tid, N)
+        prefetch_gate_up(weights, bars, wgu, bid if N == 16 else bid - 64, tid)
+        iket.range_push("normalization_input_wait")
         if tid < 64:
             wait_flag(flags, tid, epoch)
         p.barrier_cta_sync()
+        iket.range_pop()
+        # At N16, overlap residual/gamma loads with the statistics reduction.
+        if cutlass.const_expr(N == 16):
+            norm_inputs = cute.make_rmem_tensor((8, N // 2), cutlass.BFloat16)
+            norm_scales = cute.make_rmem_tensor((8, N // 2), cutlass.BFloat16)
+            iket.range_push("norm_prefetch")
+            for j in cutlass.range_constexpr(N // 2):
+                idx = (tid + j * 256) * 8
+                col = idx % 1024
+                values = (r.iterator.raw_ptr() + idx).load(count=8, alignment=16)
+                scales = (gamma.iterator.raw_ptr() + col).load(count=8, alignment=16)
+                for k in cutlass.range_constexpr(8):
+                    norm_inputs[k, j] = values[k]
+                    norm_scales[k, j] = scales[k]
+            iket.range_pop()
+        iket.range_push("norm_stats_reduce")
         if tid < N * 8:
             batch, part = tid // 8, tid % 8
             total = cutlass.Float32(0)
@@ -302,17 +345,24 @@ def fused_kernel(
             if part == 0:
                 inverse.store(cute.math.rsqrt(total / 1024 + EPS), idx=batch)
         p.barrier_cta_sync()
+        iket.range_pop()
+        iket.range_push("norm_apply")
         for j in cutlass.range_constexpr(N // 2):
             idx = (tid + j * 256) * 8
             row, col = idx // 1024, idx % 1024
-            norm_value = (r.iterator.raw_ptr() + idx).load(count=8, alignment=16).to(cutlass.Float32)
-            scale = (gamma.iterator.raw_ptr() + col).load(count=8, alignment=16).to(cutlass.Float32)
+            if cutlass.const_expr(N == 16):
+                norm_value = norm_inputs[None, j].load().to(cutlass.Float32)
+                scale = norm_scales[None, j].load().to(cutlass.Float32)
+            else:
+                norm_value = (r.iterator.raw_ptr() + idx).load(count=8, alignment=16).to(cutlass.Float32)
+                scale = (gamma.iterator.raw_ptr() + col).load(count=8, alignment=16).to(cutlass.Float32)
             unit = (norm_value * inverse.load(idx=row)).to(cutlass.BFloat16).to(cutlass.Float32)
             # Gate/up reads this resident WGMMA layout directly.
             offset = (col // 64) * N * 64 + swizzle(row, col % 64)
             normalized.store((unit * scale).to(cutlass.BFloat16), idx=offset, alignment=16)
         p.fence_proxy("async_shared", space=p.SharedSpace.shared_cta)
         p.barrier_cta_sync()
+        iket.range_pop()
         for wave in range(1 if N == 16 else 2):
             tile = bid if N == 16 else wave * 48 + bid - 64
             acc.fill(0)
@@ -338,13 +388,16 @@ def fused_kernel(
             if cutlass.const_expr(N == 32):  # noqa: SIM102 - keep the compile-time branch.
                 if wave == 0:
                     # The accumulator no longer needs these weights; overlap the next load with SiLU.
-                    prefetch_gate_up(weights, bars, wgu, tile + 48, tid, N)
+                    prefetch_gate_up(weights, bars, wgu, tile + 48, tid)
+            iket.range_push("gate_up_accumulator_store")
             if tid >= 128:
                 for j in cutlass.range_constexpr(N // 2):
                     row = fragment_row(tid - 128, j)
                     col = fragment_column(tid - 128, j)
                     partial.store(cutlass.Float32(cutlass.BFloat16(acc[j])), idx=gate_up_index(row, col, N))
             p.barrier_cta_sync()
+            iket.range_pop()
+            iket.range_push("silu_and_gate")
             for j in cutlass.range_constexpr(N // 8):
                 idx = tid + j * 256
                 channel, batch = idx // N, idx % N
@@ -352,10 +405,17 @@ def fused_kernel(
                 up = partial.load(idx=gate_up_index(channel + 32, batch, N))
                 silu = cutlass.BFloat16(gate / (1 + cute.math.exp(-gate)))
                 activation[tile, batch, channel] = cutlass.BFloat16(cutlass.Float32(silu) * up)
+            iket.range_pop()
+            iket.range_push("activation_sync", 0)
             p.barrier_cta_sync()
+            iket.range_pop()
+            iket.range_push("activation_release")
             if tid == 0:
                 publish(flags, 64 + tile, epoch)
+            iket.range_pop()
+            iket.range_push("activation_sync", 1)
             p.barrier_cta_sync()
+            iket.range_pop()
 
     if cluster < 16:
         acc.fill(0)
@@ -384,13 +444,19 @@ def fused_kernel(
         for j in cutlass.range_constexpr(N // 16):
             idx = tid + j * 256
             row, col = rank * 16 + idx % 16, idx // 16
+            iket.range_push("down_reduce", j)
             value = cutlass.BFloat16(reduce_partial(partial, row, col, N))
+            iket.range_pop()
+            iket.range_push("down_residual_store", j)
             if col < B:
                 output[col, cluster * 64 + row] = cutlass.BFloat16(
                     cutlass.Float32(value) + cutlass.Float32(r[col, cluster * 64 + row])
                 )
+            iket.range_pop()
+        iket.range_push("down_cluster_release")
         p.barrier_cluster_arrive()
         p.barrier_cluster_wait()
+        iket.range_pop()
 
 
 @cute.jit
@@ -414,7 +480,7 @@ def fused_host(
 ):
     wo_map = tensor_map.create_tensor_map_tiled_from_view(wo, (1, 4, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b)
     wgu_map = tensor_map.create_tensor_map_tiled_from_view(
-        wgu, (1, 4 if N == 16 else 16, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
+        wgu, (1, 16, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
     )
     wd_map = tensor_map.create_tensor_map_tiled_from_view(wd, (1, 6, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b)
     fused_kernel(
@@ -523,6 +589,21 @@ class FusedPostAttention(nn.Module):
 
 
 @torch.inference_mode()
+def trace_once(batch):
+    """Launch one fused block without reference GEMMs or benchmark replays."""
+    from qwen3_tts_reference import TalkerConfig, TorchPostAttention
+
+    torch.manual_seed(42)
+    reference = TorchPostAttention(TalkerConfig()).to(device="cuda", dtype=torch.bfloat16).eval()
+    fused = FusedPostAttention(reference)
+    attention = torch.randn(batch, 2048, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(batch, 1024, device="cuda", dtype=torch.bfloat16)
+    fused(attention, residual)
+    torch.cuda.synchronize()
+    print(f"B={batch}: one fused block completed")
+
+
+@torch.inference_mode()
 def benchmark(batch, layers, profile=False):
     from qwen3_tts_reference import TalkerConfig, TorchPostAttention, post_attention
 
@@ -602,8 +683,13 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, nargs="+", default=[16, 32], help="Decode batches")
     parser.add_argument("--layers", type=int, default=1, help="Distinct weight sets to rotate through")
     parser.add_argument("--profile", action="store_true", help="Capture named CUDA-graph replays")
+    parser.add_argument("--trace-only", action="store_true", help="Launch only one custom block per batch for IKET")
     args = parser.parse_args()
     if args.layers < 1 or any(not 1 <= b <= 32 for b in args.batch_size):
         parser.error("Expected layers >= 1 and 1 <= batch size <= 32")
-    results = [(batch, benchmark(batch, args.layers, args.profile)) for batch in args.batch_size]
-    print_summary(results, args.layers)
+    if args.trace_only:
+        for batch in args.batch_size:
+            trace_once(batch)
+    else:
+        results = [(batch, benchmark(batch, args.layers, args.profile)) for batch in args.batch_size]
+        print_summary(results, args.layers)

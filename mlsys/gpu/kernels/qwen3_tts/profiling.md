@@ -2,6 +2,8 @@
 
 H200, 2026-10-19. Baseline: `f0a74e6`. See the [README](README.md#performance)
 for unprofiled block timings and the full-backbone validation caveat.
+The initial comparison below ends at `c03b2bc`; the follow-up describes the
+current prefetch schedule.
 
 ## What Was Limiting It
 
@@ -22,7 +24,7 @@ This supports optimizing internal staging, publication, and epilogues as well
 as GEMM. It does **not** establish a fixed 1,000-cycle cost at every CUDA kernel
 boundary. The measured barriers here are inside the fused kernel.
 
-## Retained Changes
+## First-Round Changes
 
 1. **Batch-dependent CTA roles.** B<=16 reuses 96 CTAs for one gate/up wave;
    B>16 keeps 64 output/down CTAs and 48 gate/up CTAs, preserving overlap.
@@ -41,7 +43,7 @@ Math, BF16 rounding boundaries, weight packing, and split-K reduction order are
 unchanged. The optimized implementation matches the original bit-for-bit in
 the tested block and real-checkpoint backbone replays.
 
-## NCU Comparison
+## First-Round NCU
 
 Identical collection settings: kernel replay, cache flush before each pass,
 full metric set, unlocked clocks. These are single-launch profiled results,
@@ -71,9 +73,9 @@ shared-store conflict in the kernel.
 ## IKET Phase Traces
 
 [IKET](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/guides/iket_profiling.html)
-adds per-warp timestamp ranges inside a kernel. Instrumented scratch copies
-mark GEMM, operand waits, TMA issue/prefetch, normalization, split-K exchange,
-and gate/up epilogues. Production has no IKET dependency or instrumentation.
+adds per-warp timestamp ranges inside a kernel. The initial traces used
+instrumented scratch copies. The kernel now includes named ranges, which are
+removed when compiling without IKET profiling.
 
 The traces make the pipeline behavior visible:
 
@@ -88,6 +90,98 @@ The traces make the pipeline behavior visible:
 Those numbers describe instrumented traces, not exact uninstrumented phase
 latencies. Instrumentation can change registers and scheduling; nested and
 overlapping warp ranges cannot be added to obtain kernel time.
+
+### Detailed Markers
+
+| Marker | Work included |
+| --- | --- |
+| `output_projection`, `gate_up_projection`, `down_projection` | Projection source region, with operand-wait and WGMMA subranges |
+| `operand_wait`, `mma_issue`, `mma_drain` | Wait for operands, issue WGMMA, wait for completion |
+| `activation_wait`, `operand_copy` | Input readiness and global-to-shared operand staging |
+| `splitk_store`, `splitk_cluster_sync` | Write partials, then cluster rendezvous; **not** the reduction itself |
+| `output_reduce`, `down_reduce` | Load and sum DSMEM partials |
+| `output_residual_stats` | Residual addition, BF16 rounding, squared sums |
+| `output_cta_sync`, `output_release`, `output_cluster_release` | CTA rendezvous, ready-flag publication, cluster rendezvous |
+| `normalization_input_wait` | Wait for all residual/statistics producers |
+| `norm_prefetch`, `norm_stats_reduce`, `norm_apply` | Load residual/gamma, reduce statistics, apply RMSNorm |
+| `gate_up_weight_prefetch` | Issue weight TMA; does not wait for its completion |
+| `gate_up_accumulator_store`, `silu_and_gate` | Accumulator staging and BF16 SwiGLU |
+| `activation_sync`, `activation_release` | CTA rendezvous before/after ready-flag publication, and publication itself |
+| `down_residual_store`, `down_cluster_release` | Final residual addition/store and DSMEM lifetime rendezvous |
+
+Stage payloads are 0/1 for output/down; `gate_up_projection` carries the tile
+index. `activation_sync` payload 0 is before publication, 1 after it. A loader
+warp finishing a projection range does not mean the compute warps have finished.
+Barrier stalls can appear as gaps between ranges; markers are not additional
+hardware completion fences. Keep each event name's payload type consistent:
+mixing payload/no-payload uses caused missing and incorrectly paired ranges in
+this IKET build.
+
+From `mlsys/gpu/kernels/qwen3_tts`, capture one B16 block without reference
+GEMMs or timing loops:
+
+```bash
+run-iket --output-dir /path/to/trace profile --postprocess all \
+  --max-ts-cnt-per-warp 256 --keep -- \
+  python mega_qwen3_tts/kernels/post_attention.py --batch-size 16 --trace-only
+```
+
+### Prefetch Follow-Up
+
+H200 `viking-prod-260`, 28 rotating weight sets, interleaved CUDA graphs:
+
+| Batch | Compiled Torch | `c03b2bc` | Current |
+| --- | ---: | ---: | ---: |
+| 16 | 27.11 us | 16.24 us | 14.64 us |
+| 32 | 27.81 us | 19.49 us | 19.54 us |
+
+The retained change starts the full gate/up weight TMA **before normalization**,
+so that transfer can overlap the input-readiness wait and normalization. B16
+also loads residual/gamma into registers before the statistics reduction.
+The B32 normalization path is unchanged: applying the same register prefetch
+there regressed slightly. One full-K transfer replaces B16's four K256
+transfers and removes their intermediate WGMMA drains. CTA roles, arithmetic,
+rounding, DSMEM reduction order, and release/acquire synchronization remain intact.
+
+Isolated B16 trials, in microseconds:
+
+| Experiment | Time | Decision |
+| --- | ---: | --- |
+| Normalization-input prefetch alone | 15.85 | Keep at B<=16 |
+| Also start four gate/up transfers before normalization | 14.87 | Improvement |
+| One full-tile gate/up transfer plus cleanup | 14.64 | Keep |
+| Two-wave warp-specialized gate/up epilogue, with norm prefetch | 15.97 | No advantage over the simpler one-wave schedule |
+| Pack BF16 payload and epoch into each activation word | 24.55 | Reject; per-vector polling and extra traffic are expensive |
+
+Removing the post-output cluster barrier or retaining residuals in registers
+also regressed B16. A long synchronization range is a useful investigation
+target, not proof that removing that barrier will make the complete kernel faster.
+
+The new B16 trace separates the previously ambiguous split-K-to-normalization
+gap. For CTA 0 / warp 0, it shows DSMEM reduction, residual/statistics stores,
+ready-flag release, and the cluster rendezvous before normalization. Gate/up
+weights are ready when compute starts: CTA 0 / warp 4 spends about 0.03 us in
+its gate/up operand wait. These are instrumented single-block observations,
+not the rotating-weight benchmark timings above.
+
+Memcheck and racecheck pass B=1/8/16/17/32 with zero/new-input graph replays;
+results are bitwise identical to the original fused implementation.
+NCU reports 60 registers/thread at B16 (previously 40), unchanged 169,028-byte
+dynamic SMEM, and zero local-memory load/store traffic. Cold-cache profiled
+duration is 16.74 us; it is not the unprofiled graph latency.
+SASS retains 128-bit operand loads/stores and has no local load/store instructions.
+
+A same-node real-checkpoint replay also matches `c03b2bc` bit-for-bit across all
+32 decode steps and KV caches at B16/B32. Diagnostic full-talker medians:
+
+| Batch | Compiled Torch | `c03b2bc` fused path | Current fused path |
+| --- | ---: | ---: | ---: |
+| 16 | 1.715 ms | 1.450 ms | 1.393 ms |
+| 32 | 2.010 ms | 1.731 ms | 1.724 ms |
+
+Both fused versions and compiled Torch still fail the existing strict
+pointwise comparison against eager Torch. The prefetch change does not alter
+that numerical behavior; it is not a generation-quality validation.
 
 ## Experiments Not Retained
 
@@ -125,6 +219,18 @@ They are measurement artifacts, not dependencies of the implementation.
 - SASS: `qwen3_tts_h200_b{16,32}_{original,optimized}.sass`.
 - IKET: `qwen_iket_qwen_post_{iket,optimized_iket}_b{16,32}_final/` contains
   Perfetto traces, JSON, and HTML viewers.
+
+Prefetch follow-up artifacts on `viking-prod-260`:
+
+- A/B: `sglang_qwen_variant_ab_20261019_151133_352279.log`.
+- Memcheck/racecheck: `sglang_qwen_variant_sanitize_20261019_151233_502975.log`
+  and `sglang_qwen_variant_sanitize_20261019_151624_078030.log`.
+- Detailed B16 IKET: `qwen3_tts_0p6b_h200_b16_prefetch_iket.pftrace`
+  (matching `.trace.json` and `.html` beside it).
+- NCU: `qwen_ncu_mega_qwen3_tts.kernels.post_attention_b16_prefetch.ncu-repz`.
+- SASS: `qwen3_tts_h200_b16_prefetch.sass`.
+- Real-checkpoint replay: `sglang_qwen_backbone_ab_20261019_151842_873156.log`
+  (`Original` in this log means `c03b2bc`).
 
 Tools: Nsight Systems 2026.5.1.97 and Nsight Compute 2026.4.0.6. The latter
 handled this compiler's generated code; older NCU builds failed to profile it.
