@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """Generate one WAV file with SGLang-Omni's Qwen3-TTS CustomVoice pipeline."""
 
 import argparse

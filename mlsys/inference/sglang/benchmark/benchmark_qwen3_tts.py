@@ -5,6 +5,7 @@ import asyncio
 import os
 import sys
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 OMNI_DIR = Path(__file__).resolve().parents[1] / "sglang-omni"
@@ -31,7 +32,7 @@ async def profile_requests(config, concurrencies):
             raise RuntimeError("Warmup failed; see speed_results.json")
         print(f"Starting benchmark NVTX range: concurrency={concurrency}", flush=True)
         with torch.cuda.nvtx.range("benchmark"):
-            result = await run_tts_seedtts_benchmark(point, samples=samples[: 2 * concurrency])
+            result = await run_tts_seedtts_benchmark(point, samples=samples[: 2 * concurrency], save_audio=False)
         print_speed_summary(result["summary"], config.model, concurrency=concurrency)
         if result["summary"]["failed_requests"]:
             raise RuntimeError("Some profiled requests failed; see speed_results.json")
@@ -39,8 +40,10 @@ async def profile_requests(config, concurrencies):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--concurrencies", type=int, nargs="+", default=[1, 8], help="Concurrency levels to profile")
+    parser.add_argument("--concurrencies", type=int, nargs="+", default=[16], help="Concurrency levels to profile")
     parser.add_argument("--model", default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", help="CustomVoice checkpoint")
+    parser.add_argument("--stream", action="store_true", help="Use streaming audio responses")
+    parser.add_argument("--seed", type=int, default=None, help="Sampling seed for paired profiling runs")
     args = parser.parse_args()
     if min(args.concurrencies) < 1:
         parser.error("concurrency must be positive")
@@ -48,7 +51,9 @@ def main():
     from benchmarks.benchmarker.utils import managed_omni_server
     from benchmarks.eval.benchmark_tts_seedtts import TtsSeedttsBenchmarkConfig
 
-    output = REPO_ROOT / "tmp" / "qwen3_tts_profile"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output = REPO_ROOT / "tmp" / f"qwen3_tts_profile_{Path(args.model).name}_{timestamp}"
+    print(f"Results: {output}", flush=True)
     config = TtsSeedttsBenchmarkConfig(
         model=args.model,
         meta="zhaochenyang20/seed-tts-eval-arrow",
@@ -56,9 +61,9 @@ def main():
         voice="Ryan",
         task_type="CustomVoice",
         voice_clone=False,
-        stream=True,
-        response_format="pcm",
-        seed=42,
+        stream=args.stream,
+        response_format="pcm" if args.stream else "wav",
+        seed=args.seed,
         warmup=0,
         output_dir=str(output),
     )
@@ -66,7 +71,6 @@ def main():
         model_path=config.model,
         port=config.port,
         host=config.host,
-        server_config=str(OMNI_DIR / "examples/configs/qwen3_tts_1_7b_customvoice.yaml"),
         max_running_requests=config.max_running_requests,
         cuda_graph_max_bs=config.cuda_graph_max_bs,
         log_file=output / "tts_server.log",
