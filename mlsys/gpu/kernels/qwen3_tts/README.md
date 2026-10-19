@@ -20,7 +20,7 @@ python mega_qwen3_tts/kernels/post_attention.py --layers 28
 python bench_qwen3_tts.py --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice
 ```
 
-Defaults: BF16, B=16/32, 28 layers, 128 prefix tokens. The custom path uses
+Backbone defaults: BF16, B=16/32, 28 layers, 128 prefix tokens. The custom path uses
 compiled Torch for the remaining decode operations and eager Torch for prefill.
 `--no-fused` tests the Torch scaffold; `--layers 2` shortens development runs.
 Inputs are synthetic embeddings even when real checkpoint weights are loaded.
@@ -47,17 +47,23 @@ between normalization and gamma multiplication, and between SiLU and gating.
 The compiled baseline enables `emulate_precision_casts` for the same reason.
 Matmuls accumulate in FP32, but their reduction order can differ from cuBLAS.
 
-The kernel launches 28 cooperative four-CTA clusters, with eight warps per CTA:
+The kernel uses cooperative four-CTA clusters, with eight warps per CTA:
 
-| Clusters | Work |
-| --- | --- |
-| 0-15 | Split-K output projection, DSMEM reduce-scatter, publish residual/statistics, then split-K down projection |
-| 16-27 | Normalize the published residual, then produce two waves of gate/up activation tiles |
+| Batch | Output projection | Gate/up | Down projection |
+| --- | --- | --- | --- |
+| 1-16 | First 64 CTAs, four-way split-K | All 96 CTAs, one tile each | First 64 CTAs, four-way split-K |
+| 17-32 | First 64 CTAs, four-way split-K | Last 48 of 112 CTAs, two tiles each | First 64 CTAs, overlapping the second gate/up wave |
 
-Warps 0-3 load operands; warps 4-7 issue WGMMA. Double-buffered TMA loads
-packed weights. Projection and gate/up use K256 stages; down uses K384 stages,
-one per activation wave. Twelve loader threads acquire that wave's tile flags
-in parallel. Normalized inputs remain in WGMMA layout for both gate/up waves.
+Gate/up does not split K. Warps 0-3 stage output/down operands; warps 4-7
+issue WGMMA. Output projection has two K256 stages and down has two K384
+stages. These use distinct buffers, so neither needs an empty-buffer handshake.
+Gate/up weights occupy 128 KiB of SMEM per tile: four independently ready K256
+stages at N16, or one full-K TMA transfer at N32. N32 prefetches the first tile
+while waiting for normalization inputs and the next tile during SiLU processing.
+Its extra weight storage aliases the output/down operand buffers.
+
+Normalized inputs remain in WGMMA layout. Split-K partials and gate/up epilogues
+use different shared-memory swizzles to suit their different read patterns.
 Epoch-tagged GPU release/acquire flags connect the cluster groups. Each instance
 owns its workspace, which must not be used concurrently on different streams.
 The cooperative launch is required for cross-cluster forward progress.
@@ -69,14 +75,19 @@ dimensions, training, and non-Hopper GPUs are not supported by this kernel.
 
 ## Validation Status
 
-Tested on H100 (`s4124-0130`):
+The initial implementation was tested on H100; these optimizations were tested
+on H200:
 
 - Two-layer reference matches upstream decoder-layer code exactly, including
   prefill and three decode steps with real checkpoint weights and KV caches.
 - Fused block passes random inputs, non-unit gamma, zero inputs, changed inputs
   under graph replay, and layer-local checks using all 28 checkpoint layers.
-- Compute Sanitizer: memcheck reports zero errors; racecheck reports zero hazards
-  for B=1/17/32 with graph replay.
+- After the scheduling/layout changes, Compute Sanitizer reports zero memcheck
+  errors and zero racecheck hazards for B=1/8/16/17/32 with changed-input graph
+  replay. Results match the original fused kernel bit-for-bit.
+- A real-checkpoint 32-step backbone replay at B=16/32 also produces bitwise
+  identical old/new logits and KV caches. B=32 repeats the same captured inputs;
+  this checks the optimization, not diverse-request quality.
 
 **Full-backbone numerical validation is not yet passing the strict pointwise
 tolerance.** Small matmul rounding differences can amplify through 28 layers;
@@ -93,33 +104,36 @@ timings, then exits unsuccessfully. It does not relax the tolerance or claim a
 validated end-to-end speedup. Real-request replay and generation-quality checks
 remain necessary before integrating this kernel into a serving engine.
 
-## Initial Performance
+## Performance
 
-H100, BF16, 28 rotating weight sets, interleaved graph timing. Per fused block:
+H200 (`s4124-0042`), BF16, 28 rotating weight sets (616 MiB), interleaved
+CUDA-graph timing without profiling. Median of three measurement rounds;
+each round uses three samples of five replays. Per complete fused block:
 
-| Batch | Compiled Torch | Custom | Speedup |
+| Batch | Compiled Torch | Original fused | Optimized fused | Speedup vs Torch | Latency reduction vs original |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 27.19 us | 18.69 us | 16.22 us | 1.68x | 13.3% |
+| 32 | 27.86 us | 23.54 us | 19.49 us | 1.43x | 17.2% |
+
+Original is commit `f0a74e6`. These are standalone-block results, not whole-TTS
+speedups. The initial H100 results were 20.87/25.87 us for the original kernel;
+do not compare those directly with H200 timings.
+
+Real-checkpoint full-talker replay, 23-token prefix plus 32 captured decode
+inputs, timing the last step at a fixed KV position:
+
+| Batch | Compiled Torch | Original fused path | Optimized fused path |
 | --- | ---: | ---: | ---: |
-| 16 | 28.50 us | 20.87 us | 1.37x |
-| 32 | 29.16 us | 25.87 us | 1.13x |
+| 16 | 1.786 ms | 1.593 ms | 1.514 ms |
+| 32 | 2.077 ms | 1.994 ms | 1.862 ms |
 
-Increasing down stages from K128 to K384 reduced latency by approximately
-2.4 us at B=16 and 2.0 us at B=32 in the same A/B run. Early gate/up weight
-prefetch regressed B=32 and was not retained. These are standalone-block
-results, not whole-TTS speedups.
+These remain **diagnostic timings**: both compiled Torch and the fused path
+fail the strict full-backbone pointwise tolerance described above. This excludes
+the code predictor, sampling, and vocoder.
 
-The B=16 captured-input backbone replay measured 1.676 ms custom versus 1.845 ms
-compiled Torch without profiling (1.10x). This remains a diagnostic timing:
-both paths fail the strict full-backbone pointwise test described above.
+See [profiling notes](profiling.md) for NCU/IKET findings, rejected experiments,
+and trace paths. To reproduce the current standalone measurement:
 
-The traces report 44/60 registers per thread and 160836/222340 bytes of dynamic
-SMEM for B=16/32, with zero per-thread local memory. Active-cluster capacity is
-30 for both, exceeding the cooperative grid's 28 clusters.
-
-Local traces with GPU metrics (Nsight Systems 2026.5):
-
-- `tmp/nsys_qwen3_tts_0p6b_h100_post_attention_b16_k384.1.nsys-rep`
-- `tmp/nsys_qwen3_tts_0p6b_h100_post_attention_b32_k384.1.nsys-rep`
-- `tmp/nsys_qwen3_tts_0p6b_h100_talker_b16_real_replay.1.nsys-rep`
-
-These paths are relative to the repository root. Each report contains named
-Torch, Compiled, and Fused/Custom ranges; full-talker results remain diagnostic.
+```bash
+python mega_qwen3_tts/kernels/post_attention.py --layers 28
+```

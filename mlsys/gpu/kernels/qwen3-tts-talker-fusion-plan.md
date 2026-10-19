@@ -6,6 +6,16 @@ This is a full-block design, not a sequence of independently fused operators.
 Implementation and measured validation status: [qwen3_tts](qwen3_tts/README.md).
 The standalone block passes, but full-backbone numerical validation remains open.
 
+**Schedule update (2026-10-19):** the sections below record the initial design.
+The implemented kernel now reuses 96 CTAs for B<=16; B>16 keeps the original
+64 output/down plus 48 gate/up CTA roles. Gate/up holds a complete weight tile
+in SMEM, output/down use two non-reused stage buffers, and the two epilogues
+have separate shared-memory swizzles. The math, four-way output/down split-K,
+and release/acquire protocol are unchanged. See the
+[current schedule and results](qwen3_tts/README.md#fused-block) and
+[profiling notes](qwen3_tts/profiling.md) rather than the initial resource table
+for implementation details.
+
 Use the CTA specialization, split-K reduction, and producer/consumer ideas in
 [gpu-mega-fusion.md](gpu-mega-fusion.md). On Hopper, use WGMMA and register
 accumulators, **not Blackwell TCGEN05/TMEM**. Attention stays outside this kernel.

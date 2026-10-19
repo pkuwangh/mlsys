@@ -1,9 +1,9 @@
 """Fused output projection, residual, RMSNorm, SwiGLU, and down projection.
 
 Hopper, BF16, hidden=1024, FFN=3072, attention width=2048, B<=32.
-Clusters 0..15 split projection/down reduction across four CTAs. Clusters
-16..27 produce gate/up tiles in two waves. GPU release/acquire flags connect
-the two groups, while DSMEM reduces partial projections inside each cluster.
+B<=16 reuses 96 CTAs across the three projections. Larger batches dedicate
+64 CTAs to output/down and 48 to gate/up. DSMEM reduces split-K partials;
+GPU release/acquire flags publish residuals and activated gate/up tiles.
 
 Run this file to validate and benchmark the complete fused operation.
 """
@@ -47,6 +47,29 @@ def wait_barrier(barrier, phase):
 
 
 @cute.jit
+def prefetch_gate_up(weights, bars, weight_map, tile, tid, N: cutlass.Constexpr):
+    """Load a complete gate/up tile, with independently ready K256 stages at N16."""
+    stages = 4 if N == 16 else 1
+    slabs = 4 if N == 16 else 16
+    if tid == 0:
+        for stage in cutlass.range_constexpr(stages):
+            p.mbarrier_init(bars.subview(stage), 1)
+    p.fence_mbarrier_init()
+    p.barrier_cta_sync()
+    if tid == 0:
+        for stage in cutlass.range_constexpr(stages):
+            p.mbarrier_expect_tx(bars.subview(stage), slabs * 8192)
+            p.cp_async_bulk_tensor_shared_cluster_global(
+                weights.subview(stage * slabs * 4096),
+                weight_map.get_ptr(),
+                [0, 0, stage * slabs, tile],
+                bars.subview(stage),
+                [],
+            )
+            p.mbarrier_arrive(bars.subview(stage))
+
+
+@cute.jit
 def gemm(
     acc,
     weights,
@@ -66,76 +89,94 @@ def gemm(
     B: cutlass.Constexpr,
     N: cutlass.Constexpr,
 ):
-    """Double-buffer TMA weights and published activations against WGMMA."""
-    if tid == 0:
-        for i in cutlass.range_constexpr(4):
-            p.mbarrier_init(bars.subview(i), 1)
-    p.fence_mbarrier_init()
-    p.barrier_cta_sync()
-    group = 6 if MODE == 2 else 4
-    stages = 4 if MODE == 1 else 2
-    if tid < 128:
-        for stage in range(stages):
-            slot = stage % 2
-            if stage >= 2:
-                wait_barrier(bars.subview(2 + slot), (stage // 2 - 1) % 2)
-            if cutlass.const_expr(MODE == 0):
-                kbase = rank * 512 + stage * 256
-            elif cutlass.const_expr(MODE == 1):
-                kbase = stage * 256
-            else:
-                kbase = stage * 1536 + rank * 384
-            if tid == 0:
-                p.mbarrier_expect_tx(bars.subview(slot), group * 8192)
-                output_tile = tile if MODE == 1 else cluster
-                p.cp_async_bulk_tensor_shared_cluster_global(
-                    weights.subview(slot * group * 4096),
-                    weight_map.get_ptr(),
-                    [0, 0, kbase // 64, output_tile],
-                    bars.subview(slot),
-                    [],
-                )
-            if cutlass.const_expr(MODE == 2):  # noqa: SIM102 - preserve the compile-time branch.
-                if tid < 12:
-                    wait_flag(flags, 64 + kbase // 32 + tid, epoch)
-            p.barrier_cta_sync(barrier_id=1, thread_count=128)
-            for j in cutlass.range_constexpr(0 if MODE == 1 else group * N // 16):
-                idx = (tid + j * 128) * 8
-                slab, row, k = idx // (N * 64), (idx // 64) % N, idx % 64
-                if cutlass.const_expr(MODE == 0):
-                    value = cutlass.full((8,), 0, cutlass.BFloat16)
-                    if row < B:
-                        value = (attention.iterator.raw_ptr() + row * 2048 + kbase + slab * 64 + k).load(
-                            count=8, alignment=16
-                        )
-                else:
-                    first = kbase // 32
-                    offset = ((first + slab * 2 + k // 32) * N + row) * 32 + k % 32
-                    value = (activation.iterator.raw_ptr() + offset).load(count=8, alignment=16)
-                operands.store(value, idx=(slot * group + slab) * N * 64 + swizzle(row, k), alignment=16)
-            p.fence_proxy("async_shared", space=p.SharedSpace.shared_cta)
-            p.barrier_cta_sync(barrier_id=1, thread_count=128)
-            if tid == 0:
-                p.mbarrier_arrive(bars.subview(slot))
+    """Consume resident gate/up operands or stage two split-projection operands."""
+    if cutlass.const_expr(MODE == 1):
+        if cutlass.const_expr(N == 16):
+            prefetch_gate_up(weights, bars, weight_map, tile, tid, N)
+        if tid >= 128:
+            p.wgmma_fence_aligned()
+            for stage in range(4 if N == 16 else 1):
+                wait_barrier(bars.subview(stage), 0)
+                for slab in cutlass.range_constexpr(4 if N == 16 else 16):
+                    offset = stage * 4 + slab
+                    da = descriptor(weights, offset * 4096)
+                    db = descriptor(normalized, offset * N * 64)
+                    for k in cutlass.range_constexpr(4):
+                        mma(acc, da + 2 * k, db + 2 * k, N)
+                p.wgmma_commit_group_sync_aligned()
+                p.wgmma_wait_group_sync_aligned(0)
+        p.barrier_cta_sync()
     else:
-        p.wgmma_fence_aligned()
-        for stage in range(stages):
-            slot = stage % 2
-            wait_barrier(bars.subview(slot), (stage // 2) % 2)
-            for slab in cutlass.range_constexpr(group):
-                da = descriptor(weights, (slot * group + slab) * 4096)
-                if cutlass.const_expr(MODE == 1):
-                    db = descriptor(normalized, (stage * group + slab) * N * 64)
+        if tid == 0:
+            for stage in cutlass.range_constexpr(2):
+                p.mbarrier_init(bars.subview(stage), 1)
+        p.fence_mbarrier_init()
+        p.barrier_cta_sync()
+        group = 6 if MODE == 2 else 4
+        if tid < 128:
+            for stage in range(2):
+                if cutlass.const_expr(MODE == 0):
+                    kbase = rank * 512 + stage * 256
                 else:
-                    db = descriptor(operands, (slot * group + slab) * N * 64)
-                for k in cutlass.range_constexpr(4):
-                    mma(acc, da + 2 * k, db + 2 * k, N)
-            p.wgmma_commit_group_sync_aligned()
-            p.wgmma_wait_group_sync_aligned(0)
-            p.barrier_cta_sync(barrier_id=2, thread_count=128)
-            if tid == 128:
-                p.mbarrier_arrive(bars.subview(2 + slot))
-    p.barrier_cta_sync()
+                    kbase = stage * 1536 + rank * 384
+                if tid == 0:
+                    p.mbarrier_expect_tx(bars.subview(stage), group * 8192)
+                    p.cp_async_bulk_tensor_shared_cluster_global(
+                        weights.subview(stage * group * 4096),
+                        weight_map.get_ptr(),
+                        [0, 0, kbase // 64, cluster],
+                        bars.subview(stage),
+                        [],
+                    )
+                if cutlass.const_expr(MODE == 2):  # noqa: SIM102 - keep the compile-time branch.
+                    if tid < 12:
+                        wait_flag(flags, 64 + kbase // 32 + tid, epoch)
+                p.barrier_cta_sync(barrier_id=1, thread_count=128)
+                for j in cutlass.range_constexpr(group * N // 16):
+                    idx = (tid + j * 128) * 8
+                    slab, row, k = idx // (N * 64), (idx // 64) % N, idx % 64
+                    if cutlass.const_expr(MODE == 0):
+                        value = cutlass.full((8,), 0, cutlass.BFloat16)
+                        if row < B:
+                            value = (attention.iterator.raw_ptr() + row * 2048 + kbase + slab * 64 + k).load(
+                                count=8, alignment=16
+                            )
+                    else:
+                        first = kbase // 32
+                        offset = ((first + slab * 2 + k // 32) * N + row) * 32 + k % 32
+                        value = (activation.iterator.raw_ptr() + offset).load(count=8, alignment=16)
+                    operands.store(value, idx=(stage * group + slab) * N * 64 + swizzle(row, k), alignment=16)
+                p.fence_proxy("async_shared", space=p.SharedSpace.shared_cta)
+                p.barrier_cta_sync(barrier_id=1, thread_count=128)
+                if tid == 0:
+                    p.mbarrier_arrive(bars.subview(stage))
+        else:
+            p.wgmma_fence_aligned()
+            for stage in range(2):
+                wait_barrier(bars.subview(stage), 0)
+                for slab in cutlass.range_constexpr(group):
+                    da = descriptor(weights, (stage * group + slab) * 4096)
+                    db = descriptor(operands, (stage * group + slab) * N * 64)
+                    for k in cutlass.range_constexpr(4):
+                        mma(acc, da + 2 * k, db + 2 * k, N)
+                p.wgmma_commit_group_sync_aligned()
+                p.wgmma_wait_group_sync_aligned(0)
+        p.barrier_cta_sync()
+
+
+@cute.jit
+def partial_index(row, col):
+    """Swizzle WGMMA stores and 16-channel DSMEM reduction reads across banks."""
+    row_swizzle = ((col // 2) * 8 + (col % 2) * 16) % 64
+    return col * 64 + (row ^ row_swizzle)
+
+
+@cute.jit
+def gate_up_index(row, col, N: cutlass.Constexpr):
+    """Keep accumulator pairs adjacent and batch-row epilogue reads conflict-free."""
+    rows_per_bank_group = 32 // N
+    batch_swizzle = ((row // rows_per_bank_group) * 8) % N
+    return row * N + (col ^ batch_swizzle)
 
 
 @cute.jit
@@ -144,7 +185,7 @@ def scatter_partial(acc, partial, tid, N: cutlass.Constexpr):
         for i in cutlass.range_constexpr(N // 2):
             row = fragment_row(tid - 128, i)
             col = fragment_column(tid - 128, i)
-            partial.store(acc[i], idx=row * N + col)
+            partial.store(acc[i], idx=partial_index(row, col))
     p.barrier_cluster_arrive()
     p.barrier_cluster_wait()
 
@@ -153,7 +194,7 @@ def scatter_partial(acc, partial, tid, N: cutlass.Constexpr):
 def reduce_partial(partial, row, col, N: cutlass.Constexpr):
     value = cutlass.Float32(0)
     for peer in cutlass.range_constexpr(4):
-        remote = p.mapa(partial.subview(row * N + col), peer)
+        remote = p.mapa(partial.subview(partial_index(row, col)), peer)
         value += remote.load()
     return value
 
@@ -179,8 +220,11 @@ def fused_kernel(
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     cluster, rank = bid // 4, bid % 4
-    weights = cutlass.Array(cutlass.BFloat16, 49152, space=cutlass.AddressSpace.smem, alignment=1024)
-    operands = cutlass.Array(cutlass.BFloat16, 12 * N * 64, space=cutlass.AddressSpace.smem, alignment=1024)
+    # Gate/up needs 128 KiB of weights but no staged operands; alias that unused space.
+    weights = cutlass.Array(
+        cutlass.BFloat16, max(65536, 49152 + 12 * N * 64), space=cutlass.AddressSpace.smem, alignment=1024
+    )
+    operands = weights.subview(49152)
     bars = cutlass.Array(cutlass.Int64, 4, space=cutlass.AddressSpace.smem, alignment=8)
     normalized = cutlass.Array(cutlass.BFloat16, N * 1024, space=cutlass.AddressSpace.smem, alignment=1024)
     partial = cutlass.Array(cutlass.Float32, 64 * N, space=cutlass.AddressSpace.smem, alignment=128)
@@ -240,9 +284,83 @@ def fused_kernel(
             publish(flags, bid, epoch)
         p.barrier_cluster_arrive()
         p.barrier_cluster_wait()
+
+    # At N16 all 96 CTAs produce one tile; at N32 only the 48 dedicated CTAs do so twice.
+    if N == 16 or cluster >= 16:
+        if cutlass.const_expr(N == 32):
+            prefetch_gate_up(weights, bars, wgu, bid - 64, tid, N)
+        if tid < 64:
+            wait_flag(flags, tid, epoch)
+        p.barrier_cta_sync()
+        if tid < N * 8:
+            batch, part = tid // 8, tid % 8
+            total = cutlass.Float32(0)
+            for j in cutlass.range_constexpr(8):
+                total += stats[j * 8 + part, batch]
+            for delta in cutlass.range_constexpr(3):
+                total += cute.arch.shuffle_sync_bfly(total, 1 << delta)
+            if part == 0:
+                inverse.store(cute.math.rsqrt(total / 1024 + EPS), idx=batch)
+        p.barrier_cta_sync()
+        for j in cutlass.range_constexpr(N // 2):
+            idx = (tid + j * 256) * 8
+            row, col = idx // 1024, idx % 1024
+            norm_value = (r.iterator.raw_ptr() + idx).load(count=8, alignment=16).to(cutlass.Float32)
+            scale = (gamma.iterator.raw_ptr() + col).load(count=8, alignment=16).to(cutlass.Float32)
+            unit = (norm_value * inverse.load(idx=row)).to(cutlass.BFloat16).to(cutlass.Float32)
+            # Gate/up reads this resident WGMMA layout directly.
+            offset = (col // 64) * N * 64 + swizzle(row, col % 64)
+            normalized.store((unit * scale).to(cutlass.BFloat16), idx=offset, alignment=16)
+        p.fence_proxy("async_shared", space=p.SharedSpace.shared_cta)
+        p.barrier_cta_sync()
+        for wave in range(1 if N == 16 else 2):
+            tile = bid if N == 16 else wave * 48 + bid - 64
+            acc.fill(0)
+            gemm(
+                acc,
+                weights,
+                operands,
+                bars,
+                wgu,
+                attention,
+                normalized,
+                activation,
+                flags,
+                epoch,
+                tid,
+                cluster,
+                rank,
+                tile,
+                1,
+                B,
+                N,
+            )
+            if cutlass.const_expr(N == 32):  # noqa: SIM102 - keep the compile-time branch.
+                if wave == 0:
+                    # The accumulator no longer needs these weights; overlap the next load with SiLU.
+                    prefetch_gate_up(weights, bars, wgu, tile + 48, tid, N)
+            if tid >= 128:
+                for j in cutlass.range_constexpr(N // 2):
+                    row = fragment_row(tid - 128, j)
+                    col = fragment_column(tid - 128, j)
+                    partial.store(cutlass.Float32(cutlass.BFloat16(acc[j])), idx=gate_up_index(row, col, N))
+            p.barrier_cta_sync()
+            for j in cutlass.range_constexpr(N // 8):
+                idx = tid + j * 256
+                channel, batch = idx // N, idx % N
+                gate = partial.load(idx=gate_up_index(channel, batch, N))
+                up = partial.load(idx=gate_up_index(channel + 32, batch, N))
+                silu = cutlass.BFloat16(gate / (1 + cute.math.exp(-gate)))
+                activation[tile, batch, channel] = cutlass.BFloat16(cutlass.Float32(silu) * up)
+            p.barrier_cta_sync()
+            if tid == 0:
+                publish(flags, 64 + tile, epoch)
+            p.barrier_cta_sync()
+
+    if cluster < 16:
         acc.fill(0)
 
-        # Down consumes the first 1536 channels while gate/up produces wave two.
+        # Down waits only for its own activation tiles, overlapping gate/up at N32.
         gemm(
             acc,
             weights,
@@ -273,71 +391,6 @@ def fused_kernel(
                 )
         p.barrier_cluster_arrive()
         p.barrier_cluster_wait()
-    else:
-        # Each CTA forms one resident normalized input, then produces two tiles.
-        if tid < 64:
-            wait_flag(flags, tid, epoch)
-        p.barrier_cta_sync()
-        if tid < N * 8:
-            batch, part = tid // 8, tid % 8
-            total = cutlass.Float32(0)
-            for j in cutlass.range_constexpr(8):
-                total += stats[j * 8 + part, batch]
-            for delta in cutlass.range_constexpr(3):
-                total += cute.arch.shuffle_sync_bfly(total, 1 << delta)
-            if part == 0:
-                inverse.store(cute.math.rsqrt(total / 1024 + EPS), idx=batch)
-        p.barrier_cta_sync()
-        for j in cutlass.range_constexpr(N // 2):
-            idx = (tid + j * 256) * 8
-            row, col = idx // 1024, idx % 1024
-            value = (r.iterator.raw_ptr() + idx).load(count=8, alignment=16).to(cutlass.Float32)
-            scale = (gamma.iterator.raw_ptr() + col).load(count=8, alignment=16).to(cutlass.Float32)
-            unit = (value * inverse.load(idx=row)).to(cutlass.BFloat16).to(cutlass.Float32)
-            # Both gate/up waves read this resident WGMMA layout directly.
-            offset = (col // 64) * N * 64 + swizzle(row, col % 64)
-            normalized.store((unit * scale).to(cutlass.BFloat16), idx=offset, alignment=16)
-        p.fence_proxy("async_shared", space=p.SharedSpace.shared_cta)
-        p.barrier_cta_sync()
-        for wave in range(2):
-            tile = wave * 48 + bid - 64
-            acc.fill(0)
-            gemm(
-                acc,
-                weights,
-                operands,
-                bars,
-                wgu,
-                attention,
-                normalized,
-                activation,
-                flags,
-                epoch,
-                tid,
-                cluster,
-                rank,
-                tile,
-                1,
-                B,
-                N,
-            )
-            if tid >= 128:
-                for j in cutlass.range_constexpr(N // 2):
-                    row = fragment_row(tid - 128, j)
-                    col = fragment_column(tid - 128, j)
-                    partial.store(cutlass.Float32(cutlass.BFloat16(acc[j])), idx=row * N + col)
-            p.barrier_cta_sync()
-            for j in cutlass.range_constexpr(N // 8):
-                idx = tid + j * 256
-                channel, batch = idx // N, idx % N
-                gate = partial.load(idx=channel * N + batch)
-                up = partial.load(idx=(channel + 32) * N + batch)
-                silu = cutlass.BFloat16(gate / (1 + cute.math.exp(-gate)))
-                activation[tile, batch, channel] = cutlass.BFloat16(cutlass.Float32(silu) * up)
-            p.barrier_cta_sync()
-            if tid == 0:
-                publish(flags, 64 + tile, epoch)
-            p.barrier_cta_sync()
 
 
 @cute.jit
@@ -361,13 +414,13 @@ def fused_host(
 ):
     wo_map = tensor_map.create_tensor_map_tiled_from_view(wo, (1, 4, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b)
     wgu_map = tensor_map.create_tensor_map_tiled_from_view(
-        wgu, (1, 4, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
+        wgu, (1, 4 if N == 16 else 16, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
     )
     wd_map = tensor_map.create_tensor_map_tiled_from_view(wd, (1, 6, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b)
     fused_kernel(
         attention, residual, wo_map, wgu_map, wd_map, gamma, r, stats, activation, flags, epochs, output, B, N, EPS
     ).launch(
-        grid=(112, 1, 1),
+        grid=(96 if N == 16 else 112, 1, 1),
         block=(256, 1, 1),
         cluster=(4, 1, 1),
         cooperative=True,
@@ -392,7 +445,7 @@ def compile_kernel(batch, bucket, eps):
         fake(cutlass.Float32, 64, bucket),
         fake(cutlass.BFloat16, 96, bucket, 32),
         fake(cutlass.Int32, 160),
-        fake(cutlass.Int32, 112),
+        fake(cutlass.Int32, 96 if bucket == 16 else 112),
         fake(cutlass.BFloat16, batch, 1024),
         make_fake_stream(),
         batch,
@@ -451,7 +504,7 @@ class FusedPostAttention(nn.Module):
                 torch.empty(64, bucket, device=device, dtype=torch.float32),
                 torch.empty(96, bucket, 32, device=device, dtype=torch.bfloat16),
                 torch.zeros(160, device=device, dtype=torch.int32),
-                torch.zeros(112, device=device, dtype=torch.int32),
+                torch.zeros(96 if bucket == 16 else 112, device=device, dtype=torch.int32),
             )
         output = torch.empty_like(residual, memory_format=torch.contiguous_format)
         fn = compile_kernel(batch, bucket, self.reference.norm.eps)
