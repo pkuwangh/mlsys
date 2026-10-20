@@ -24,7 +24,9 @@ def run(args):
     reference = TorchQwen3TTSTalker(config).to(device="cuda", dtype=torch.bfloat16).eval()
     if args.model:
         reference.load_checkpoint(args.model)
-    custom = MegaQwen3TTSTalker(reference, fused=args.fused, fused_qkv=args.fused_qkv).eval()
+    custom = MegaQwen3TTSTalker(
+        reference, fused=args.fused, fused_qkv=args.fused_qkv, fused_mask=args.fused_mask
+    ).eval()
     if args.compile:
         custom = torch.compile(custom, options={"emulate_precision_casts": True})
     compiled = (
@@ -39,6 +41,8 @@ def run(args):
         f"Weights: {args.model or 'deterministic random'} | Custom: {custom_name if args.fused else 'Torch scaffold'}"
     )
     print(f"Inputs: {args.inputs or 'deterministic random embeddings'}")
+    if args.fused and args.fused_qkv:
+        print(f"Fused additive mask: {args.fused_mask}")
     passed = True
     for batch in args.batch_size:
         print(f"\nB={batch}: shared eager prefill and {steps}-step validation", flush=True)
@@ -102,6 +106,12 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Fuse QKV preparation as well; --no-fused-qkv isolates post-attention",
+    )
+    parser.add_argument(
+        "--fused-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write the SDPA additive mask inside fused QKV preparation",
     )
     parser.add_argument("--profile", action="store_true", help="Emit a CUDA-profiler capture range after timing")
     args = parser.parse_args()

@@ -10,17 +10,23 @@ from torch.nn import functional as F
 class _FusedTalkerLayer(nn.Module):
     """Keep SDPA between the two fused blocks; leave multi-token prefill unchanged."""
 
-    def __init__(self, layer):
+    def __init__(self, layer, *, fused_mask=True):
         super().__init__()
         from .kernels.post_attention import FusedPostAttention
         from .kernels.pre_attention import FusedPreAttention
 
         self.pre_attention = FusedPreAttention(layer.input_layernorm, layer.self_attn)
         self.post_attention = FusedPostAttention(layer.post_attention)
+        self.fused_mask = fused_mask
 
     def forward(self, x, cache, positions, cos, sin, mask):
         if x.shape[1] == 1:
-            q = self.pre_attention(x, cache, positions, cos, sin)
+            additive_mask = (
+                torch.empty((1, cache.shape[-2]), device=x.device, dtype=x.dtype) if self.fused_mask else None
+            )
+            q = self.pre_attention(x, cache, positions, cos, sin, additive_mask)
+            if self.fused_mask:
+                mask = additive_mask
             attention = F.scaled_dot_product_attention(q, cache[0], cache[1], attn_mask=mask, enable_gqa=True)
             attention = attention.transpose(1, 2).reshape(x.shape[0], 1, -1)
         else:
@@ -31,7 +37,7 @@ class _FusedTalkerLayer(nn.Module):
 class MegaQwen3TTSTalker(nn.Module):
     """Replace supported decode blocks without changing cache ownership or layout."""
 
-    def __init__(self, reference, *, fused: bool = True, fused_qkv: bool = True):
+    def __init__(self, reference, *, fused: bool = True, fused_qkv: bool = True, fused_mask: bool = True):
         super().__init__()
         self.model = deepcopy(reference)
         if fused:
@@ -39,7 +45,7 @@ class MegaQwen3TTSTalker(nn.Module):
 
             for index, layer in enumerate(self.model.layers):
                 if fused_qkv:
-                    self.model.layers[index] = _FusedTalkerLayer(layer)
+                    self.model.layers[index] = _FusedTalkerLayer(layer, fused_mask=fused_mask)
                 else:
                     layer.post_attention = FusedPostAttention(layer.post_attention)
 

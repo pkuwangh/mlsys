@@ -27,6 +27,8 @@ Backbone defaults: BF16, B=16/32, 28 layers, 128 prefix tokens. The custom path 
 compiled Torch for the remaining decode operations and eager Torch for prefill.
 `--no-fused` tests the Torch scaffold; `--no-fused-qkv` keeps only post-attention
 fusion; `--layers 2` shortens development runs.
+`--no-fused-mask` disables additive-mask generation inside fused QKV preparation
+and restores SDPA's separate boolean-mask conversion.
 Inputs are synthetic embeddings even when real checkpoint weights are loaded.
 For captured inputs, add `--inputs /path/to/inputs.pt --batch-size 16`. The file
 contains `prefix` and `decode` embedding tensors shaped `[B,T,1024]`, generated
@@ -43,6 +45,10 @@ The full-backbone timing overwrites one fixed KV slot at a fixed context length.
 `FusedPreAttention` replaces input RMSNorm, Q/K/V projections, Q/K head
 RMSNorm, RoPE, and the current KV-cache slot write in one launch. Torch SDPA
 still computes attention. Multi-token prefill uses the original Torch path.
+An optional `[1,capacity]` BF16 output holds `0` for valid cache positions and
+`-inf` for future positions. `cutlass.const_expr` removes this work when no mask
+output is supplied. The talker enables it by default; the standalone kernel
+benchmark enables it with `--write-mask`.
 
 There are 32 four-CTA clusters: one per Q/K/V head (16 Q, 8 K, 8 V).
 Within a cluster, ranks 0/1 project channels 0-63 and ranks 2/3 project
@@ -55,6 +61,7 @@ two K512 halves. Each CTA issues an M64 x N16/32 x K512 WGMMA sequence.
 | Projection | Warps 4-7 issue WGMMA and write FP32 partials to SMEM |
 | Reduction | Ranks 1-3 bulk-copy their partials to rank 0's SMEM; rank 0 writes its own partials locally |
 | Epilogue | Rank 0's 16 warps sum the two K partitions, apply Q/K RMSNorm and RoPE, and write Q or the KV-cache slot |
+| Optional mask | Rank 1 of cluster 0 writes the additive mask while rank 0 performs its epilogue |
 
 A transaction barrier counts only the three remote copies. No global scratch,
 Lamport polling, or cooperative grid launch is needed for this block.

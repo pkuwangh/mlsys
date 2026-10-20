@@ -668,7 +668,85 @@ the timed CUDA graph. This reduces the baseline from 30.14/39.69 us to
 same run. The full-talker baseline was not changed, so its speedup includes
 eliminating those cache copies.
 
-## Next: Decode Attention
+## Partitioning the QKV Input Norm
+
+H200 `viking-prod-214`, 28 rotating weight sets, three paired rounds.
+Each CTA normalizes one quarter of the tokens across all 1024 channels.
+Channels 0-511 go to ranks 0/2; channels 512-1023 go to ranks 1/3.
+Local slices use ordinary stores. A transaction barrier at each destination
+counts the other three CTAs' slices before WGMMA reads the operand.
+
+Median complete-block latency in us; each arrow is its own interleaved
+redundant-norm baseline and candidate:
+
+| Candidate | B16 baseline -> candidate | B32 baseline -> candidate |
+| --- | ---: | ---: |
+| Vector `st.async`, explicit startup CTA barrier | 6.048 -> 6.467 | 9.332 -> 9.812 |
+| Vector `st.async`, cluster rendezvous handles initialization | 6.037 -> 6.278 | 9.361 -> 9.546 |
+| Bulk DSMEM copies from staged token slices | 6.028 -> 6.609 | 9.328 -> 10.629 |
+
+All three match Q and the full KV cache bitwise against the original kernel
+across 28 random/non-unit-gamma weight sets at B16/B32. The best `st.async`
+candidate also passes changed-input/position graph replay under memcheck
+at B=1/8/16/17/32 and racecheck at B=1/16/32, with no reported errors or hazards.
+
+The first paired B16 IKET capture shows less work in the active norm warps,
+but adds remote-operand waiting: median `qkv_operand_wait` grows from
+0.032 to 0.288 us. Median first-MMA start remains 2.176 us from warp entry
+in both captures. The baseline `input_norm` range includes staging and
+synchronization, not just arithmetic. At B16 the partitioned version uses
+four norm warps per CTA instead of sixteen, so four times less total
+normalization does not imply four times lower latency.
+
+None is promoted; the original redundant-norm kernel remains in use.
+Candidates and measurement helpers are under `tmp/`:
+
+- `qwen_pre_norm_st_async.py`, `qwen_pre_norm_st_async_relaxed.py`, `qwen_pre_norm_bulk.py`.
+- Paired logs: `sglang_qwen_pre_norm_ab_20261020_103845_920764.log`,
+  `sglang_qwen_pre_norm_ab_20261020_104113_235570.log`,
+  `sglang_qwen_pre_norm_ab_20261020_104208_622727.log`.
+- Initial IKET pair: `qwen3_tts_0p6b_h200_b16_pre_norm_{redundant,partitioned}.pftrace`.
+- Best candidate: `qwen3_tts_0p6b_h200_b16_pre_norm_st_async.pftrace`.
+  Median first-MMA start is 2.144 us from warp entry, versus 2.176 us
+  in the baseline capture; operand waiting still takes 0.288 us.
+- Memcheck: `sglang_qwen_pre_norm_sanitize_20261020_104304_861704.log`.
+- Racecheck: `sglang_qwen_pre_norm_sanitize_20261020_104340_479321.log`.
+
+## Fused Additive Mask
+
+The QKV kernel optionally writes a BF16 `[1,capacity]` additive mask (`0` for
+valid positions, `-inf` for future slots). Rank 1 of cluster 0 writes it while
+rank 0 finishes the head epilogue. `cutlass.const_expr(mask is not None)` removes
+this work from the no-mask specialization. The talker enables it by default;
+`--no-fused-mask` restores the boolean-mask path.
+
+H200 (`viking-prod-214`), 28 layers, real checkpoint and 32 teacher-forced decode
+inputs after a 23-token prefix. Median of three unprofiled interleaved rounds,
+timing the final decode step:
+
+| Batch | Boolean mask | Fused additive mask | Latency reduction |
+| --- | ---: | ---: | ---: |
+| 16 | 684.6 us | 663.7 us | 3.1% |
+| 32 | 965.2 us | 945.7 us | 2.0% |
+
+Both settings produce bitwise-identical logits at every replayed step and
+identical final KV caches. This isolates the mask change; it does not change
+the earlier full-model numerical differences against upstream Torch.
+Focused graph tests also check mask, Q, and the entire cache exactly at
+`(B,capacity)=(1,1),(16,55),(32,513)`, with positions moving backward and forward.
+
+The graph-node trace confirms 28 `triton_poi_fused_scalar_tensor_where_0`
+launches in the old path and zero in the new path. The cuDNN attention kernel
+is unchanged. Average pre-attention time is 5.985 versus 6.005 us in this capture.
+
+- A/B helper: `tmp/qwen_mask_ab.py`.
+- Unprofiled log: `tmp/sglang_qwen_mask_ab_20261020_112354_785720.log`.
+- Trace with GPU metrics: `tmp/qwen3_tts_0p6b_h200_b16_fused_mask_ab.1.nsys-rep`.
+  NVTX ranges: `Boolean mask` and `Fused additive mask`.
+
+## Deferred: Decode Attention
+
+Keep cuDNN attention for now. The following describes possible future work.
 
 For each batch row and KV head, two Q heads consume the same K/V history.
 The sequence-split approach gives each CTA a history partition and computes
@@ -682,7 +760,8 @@ has 128 batch/KV-head groups, whereas B1 has only eight. Splitting a short
 history too finely can cost more in synchronization than it gains in
 parallelism. The B16 full-talker capture confirms a cuDNN SDPA grid of
 `(1,8,16)`, 128 threads/CTA, averaging 5.27 us per layer in the combined
-path. A separate mask-conversion kernel adds about 1 us per layer.
+path. Before the fused-mask change above, a separate mask-conversion kernel
+added about 1 us per layer.
 There is room to specialize for decode, but insufficient CTA count alone
 does not explain this B16 case.
 

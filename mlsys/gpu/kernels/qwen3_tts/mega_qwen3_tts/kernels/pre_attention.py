@@ -3,6 +3,7 @@
 Hopper BF16 decode, B<=32, hidden=1024, 16 Q heads, 8 KV heads, head_dim=128.
 Each four-CTA cluster projects one head: two channel halves, each with two
 K partitions. Rank 0 gathers the partials and performs the head-local epilogue.
+An optional additive-mask output eliminates SDPA's boolean-mask conversion.
 Run this file to validate and benchmark against eager and compiled Torch.
 """
 
@@ -40,6 +41,7 @@ def pre_attention_kernel(
     positions: cute.Tensor,
     kv: cute.Tensor,
     q: cute.Tensor,
+    mask: cute.Tensor | None,
     B: cutlass.Constexpr,
     N: cutlass.Constexpr,
     CAPACITY: cutlass.Constexpr,
@@ -188,6 +190,12 @@ def pre_attention_kernel(
                     offset = B * 8 * CAPACITY * 128 + ((row * 8 + head - 24) * CAPACITY + position) * 128 + channel
                     (kv.iterator.raw_ptr() + offset).store(projected, alignment=8)
         iket.range_pop()
+    if cutlass.const_expr(mask is not None):  # noqa: SIM102 - preserve DSL specialization guard
+        # Rank 1 of the first cluster is free while rank 0 finishes its epilogue.
+        if bid == 1:
+            position = positions[0]
+            for col in cutlass.range(tid, CAPACITY, 512):
+                mask[0, col] = cutlass.BFloat16(cutlass.select_(col <= position, 0.0, -float("inf")))
     p.barrier_cluster_arrive_relaxed()
     p.barrier_cluster_wait()
 
@@ -204,6 +212,7 @@ def pre_attention_host(
     positions: cute.Tensor,
     kv: cute.Tensor,
     q: cute.Tensor,
+    mask: cute.Tensor | None,
     stream: cuda.CUstream,
     B: cutlass.Constexpr,
     N: cutlass.Constexpr,
@@ -213,13 +222,13 @@ def pre_attention_host(
     weight_map = tensor_map.create_tensor_map_tiled_from_view(
         weights, (1, 8, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
     )
-    pre_attention_kernel(x, gamma, weight_map, qgamma, kgamma, cos, sin, positions, kv, q, B, N, CAPACITY, EPS).launch(
-        grid=(128, 1, 1), block=(512, 1, 1), cluster=(4, 1, 1), stream=stream
-    )
+    pre_attention_kernel(
+        x, gamma, weight_map, qgamma, kgamma, cos, sin, positions, kv, q, mask, B, N, CAPACITY, EPS
+    ).launch(grid=(128, 1, 1), block=(512, 1, 1), cluster=(4, 1, 1), stream=stream)
 
 
 @cache
-def compile_kernel(batch, bucket, capacity, eps):
+def compile_kernel(batch, bucket, capacity, eps, write_mask=False):
     """Specialize the decode bucket and contiguous KV-cache strides."""
 
     def fake(dtype, *shape):
@@ -237,6 +246,7 @@ def compile_kernel(batch, bucket, capacity, eps):
         fake(cutlass.Int64, 1),
         fake(cutlass.BFloat16, 2, batch, 8, capacity, 128),
         fake(cutlass.BFloat16, batch, 16, 1, 128),
+        fake(cutlass.BFloat16, 1, capacity) if write_mask else None,
         make_fake_stream(),
         batch,
         bucket,
@@ -266,15 +276,20 @@ class FusedPreAttention(nn.Module):
         )
 
     @torch.compiler.disable
-    def forward(self, x, kv, positions, cos, sin):
+    def forward(self, x, kv, positions, cos, sin, mask=None):
+        """Write Q/K/V and, when supplied, a BF16 additive mask of shape [1, capacity]."""
         batch = x.shape[0]
         if x.shape != (batch, 1, 1024) or not 1 <= batch <= 32:
             raise ValueError("Fused QKV supports one-token decode with 1 <= B <= 32")
         if not kv.is_contiguous() or kv.shape[:3] != (2, batch, 8) or kv.shape[-1] != 128:
             raise ValueError("Expected contiguous KV cache [2,B,8,capacity,128]")
         capacity = kv.shape[3]
+        if mask is not None and (
+            mask.shape != (1, capacity) or mask.dtype != x.dtype or not mask.is_contiguous() or mask.device != x.device
+        ):
+            raise ValueError("Expected contiguous additive mask [1,capacity] matching the input dtype/device")
         q = torch.empty((batch, 16, 1, 128), device=x.device, dtype=x.dtype)
-        compile_kernel(batch, 16 if batch <= 16 else 32, capacity, self.norm.eps)(
+        compile_kernel(batch, 16 if batch <= 16 else 32, capacity, self.norm.eps, mask is not None)(
             x.reshape(batch, 1024),
             self.norm.weight,
             self.packed_weights,
@@ -285,6 +300,7 @@ class FusedPreAttention(nn.Module):
             positions,
             kv,
             q,
+            mask,
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
         return q
@@ -309,7 +325,7 @@ def reference_args(layer, cos, sin, kv, positions):
 
 
 @torch.inference_mode()
-def trace_once(batch, capacity):
+def trace_once(batch, capacity, write_mask=False):
     """Launch one custom preparation block for IKET."""
     from qwen3_tts_reference import TalkerConfig, TalkerLayer
 
@@ -320,13 +336,14 @@ def trace_once(batch, capacity):
     kv = torch.zeros(2, batch, 8, capacity, 128, device="cuda", dtype=torch.bfloat16)
     position = torch.tensor([capacity - 1], device="cuda")
     cos = torch.ones(128, device="cuda", dtype=torch.bfloat16)
-    fused(x, kv, position, cos, torch.zeros_like(cos))
+    mask = torch.empty((1, capacity), device="cuda", dtype=torch.bfloat16) if write_mask else None
+    fused(x, kv, position, cos, torch.zeros_like(cos), mask)
     torch.cuda.synchronize()
     print(f"B={batch}: one fused preparation block completed")
 
 
 @torch.inference_mode()
-def benchmark(batch, layers, capacity, profile=False):
+def benchmark(batch, layers, capacity, profile=False, write_mask=False):
     """Compare complete preparation blocks with rotating weights and fixed cache position."""
     from unittest.mock import patch
 
@@ -349,6 +366,14 @@ def benchmark(batch, layers, capacity, profile=False):
     inv = 1.0 / 1_000_000.0 ** (torch.arange(0, 128, 2, device="cuda").float() / 128)
     angles = torch.cat((inv, inv)) * positions[0]
     cos, sin = angles.cos().bfloat16().view(1, 1, 1, 128), angles.sin().bfloat16().view(1, 1, 1, 128)
+    additive_mask = torch.empty((1, capacity), device="cuda", dtype=x.dtype) if write_mask else None
+
+    def check_mask():
+        if additive_mask is not None:
+            valid = torch.arange(capacity, device="cuda")[None, :] <= positions[:, None]
+            torch.testing.assert_close(
+                additive_mask, torch.where(valid, 0.0, -float("inf")).to(x.dtype), atol=0, rtol=0
+            )
 
     def compiled_slots(ref, kv):
         # Keep cache mutation outside Inductor's full-cache functionalization.
@@ -374,7 +399,8 @@ def benchmark(batch, layers, capacity, profile=False):
         expected, actual = [], []
         for ref, custom, kv, out_kv in zip(refs, fused, caches, custom_caches):
             expected.append(pre_attention(x, *reference_args(ref, cos, sin, kv, positions)))
-            actual.append(custom(x, out_kv, positions, cos, sin))
+            actual.append(custom(x, out_kv, positions, cos, sin, additive_mask))
+        check_mask()
         report_error(f"B={batch} seed={seed} Q", torch.stack(actual), torch.stack(expected))
         report_error(
             f"B={batch} seed={seed} KV",
@@ -390,20 +416,21 @@ def benchmark(batch, layers, capacity, profile=False):
     report_error(f"B={batch} compiled slots KV", slot_caches[0][:, :, :, -1], caches[0][:, :, :, -1])
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        replay_q = fused[0](x, custom_caches[0], positions, cos, sin)
+        replay_q = fused[0](x, custom_caches[0], positions, cos, sin, additive_mask)
     for position in (0, capacity // 2, capacity - 1):
         positions.fill_(position)
         cos.copy_((torch.cat((inv, inv)) * position).cos().view_as(cos))
         sin.copy_((torch.cat((inv, inv)) * position).sin().view_as(sin))
         x.normal_()
         graph.replay()
+        check_mask()
         expected = pre_attention(x, *reference_args(refs[0], cos, sin, caches[0], positions))
         report_error(f"graph position={position} Q", replay_q, expected)
         report_error(f"graph position={position} KV", custom_caches[0][:, :, :, position], caches[0][:, :, :, position])
     # Isolate RoPE from GEMM reduction differences: contraction must not remove a BF16 cast.
-    identity_q = fused[0](x, custom_caches[0], positions, torch.ones_like(cos), torch.zeros_like(sin))
+    identity_q = fused[0](x, custom_caches[0], positions, torch.ones_like(cos), torch.zeros_like(sin), additive_mask)
     identity_k = custom_caches[0][0, :, :, -1:].clone()
-    rotated_q = fused[0](x, custom_caches[0], positions, cos, sin)
+    rotated_q = fused[0](x, custom_caches[0], positions, cos, sin, additive_mask)
     for unrotated, rotated in ((identity_q, rotated_q), (identity_k, custom_caches[0][0, :, :, -1:])):
         partner = torch.cat((-unrotated[..., 64:], unrotated[..., :64]), dim=-1)
         torch.testing.assert_close(rotated, unrotated * cos + partner * sin, atol=0, rtol=0)
@@ -413,7 +440,7 @@ def benchmark(batch, layers, capacity, profile=False):
             compiled(x, *reference_args(r, cos, sin, kv, positions)) for r, kv in zip(refs, compiled_caches)
         ],
         "Compiled slots": lambda: [compiled_slots(r, kv) for r, kv in zip(refs, slot_caches)],
-        "Fused": lambda: [f(x, kv, positions, cos, sin) for f, kv in zip(fused, custom_caches)],
+        "Fused": lambda: [f(x, kv, positions, cos, sin, additive_mask) for f, kv in zip(fused, custom_caches)],
     }
     return {name: us / layers for name, us in measure(calls, profile=profile).items()}
 
@@ -424,17 +451,24 @@ if __name__ == "__main__":
     parser.add_argument("--layers", type=int, default=28, help="Distinct weight sets")
     parser.add_argument("--capacity", type=int, default=129, help="KV-cache capacity")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--write-mask", action="store_true", help="Also write an additive attention mask in the fused kernel"
+    )
     parser.add_argument("--trace-only", action="store_true", help="Launch only one custom block per batch for IKET")
     args = parser.parse_args()
     if args.layers < 1 or args.capacity < 1 or any(not 1 <= b <= 32 for b in args.batch_size):
         parser.error("Expected positive layers/capacity and 1 <= batch size <= 32")
     if args.trace_only:
         for b in args.batch_size:
-            trace_once(b, args.capacity)
+            trace_once(b, args.capacity, args.write_mask)
     else:
-        results = [(b, benchmark(b, args.layers, args.capacity, args.profile)) for b in args.batch_size]
+        results = [
+            (b, benchmark(b, args.layers, args.capacity, args.profile, args.write_mask)) for b in args.batch_size
+        ]
         print(f"\nBF16 | {args.layers} weight sets | median interleaved CUDA-graph timing per block")
         print("Compiled slots: compiled math + direct index_copy_ cache writes, all CUDA-graphed.")
+        if args.write_mask:
+            print("Fused additionally writes the SDPA additive mask; Torch baselines time QKV preparation only.")
         print("Batch | Torch (us) | Compiled (us) | Compiled slots (us) | Fused (us) | vs slots")
         print("------+------------+---------------+---------------------+------------+---------")
         for b, result in results:
