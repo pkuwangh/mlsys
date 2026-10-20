@@ -58,9 +58,11 @@ Gate/up does not split K. Warps 0-3 stage output/down operands; warps 4-7
 issue WGMMA. Output projection has two K256 stages and down has two K384
 stages. These use distinct buffers, so neither needs an empty-buffer handshake.
 Gate/up weights occupy 128 KiB of SMEM per tile, loaded in one full-K TMA
-transfer before normalization. N16 also preloads residuals and gamma into
-registers before reducing the norm statistics. N32 prefetches its second weight
-tile during SiLU processing. Extra weight storage aliases the output/down
+transfer before normalization. At N16, CTAs 64-95 wait for a producer's first
+output-projection MMA stage, then prefetch their own tiles into SMEM and the
+other 64 tiles into L2. The progress hint does not publish residual data or need
+a release fence. N32 waits for an existing residual word before its first TMA
+and prefetches its second weight tile during SiLU processing. Extra weight storage aliases the output/down
 operand buffers.
 
 Normalized inputs remain in WGMMA layout. Split-K partials are pushed into each
@@ -70,10 +72,13 @@ alias the incoming down-projection mailbox: peers can reach that phase earlier.
 
 Both residuals and gate/up activations use packed BF16 sentinel polling:
 consumers use the words they polled, without a separate flag or release fence.
-Normalization computes statistics locally from those residuals, preserving the
-reduction tree. Early consumer CTAs first poll one word with one thread to limit
-traffic, then validate every payload word. Two slots per payload alternate
-between calls; each call clears the inactive slots for the next one.
+Normalization retains residuals and gamma in registers. Each warp owns a full
+1024-channel row, reduces statistics with shuffles, and writes normalized data
+directly into the WGMMA operand layout. Only the final CTA rendezvous remains;
+there are no shared partial sums or inverse-RMS broadcasts. BF16 casts are
+unchanged, but the FP32 summation order differs from the earlier kernel.
+Every payload word is validated, regardless of the prefetch hint. Two slots per
+payload alternate between calls; each call clears the inactive slots for the next one.
 Live negative zero is canonicalized to positive zero to reserve the sentinel.
 Each instance owns its workspace, which must not be used concurrently on
 different streams. The cooperative launch ensures cross-cluster forward progress.
@@ -92,12 +97,18 @@ on H200:
   prefill and three decode steps with real checkpoint weights and KV caches.
 - Fused block passes random inputs, non-unit gamma, zero inputs, changed inputs
   under graph replay, and layer-local checks using all 28 checkpoint layers.
-- After the scheduling/layout changes, Compute Sanitizer reports zero memcheck
+- Through `465a629`, Compute Sanitizer reports zero memcheck
   errors and zero racecheck hazards for B=1/8/16/17/32 with changed-input graph
   replay. Results match the original fused kernel bit-for-bit.
-- A real-checkpoint 32-step backbone replay at B=16/32 also produces bitwise
+- At that commit, a real-checkpoint 32-step backbone replay at B=16/32 also produces bitwise
   identical old/new logits and KV caches. B=32 repeats the same captured inputs;
   this checks the optimization, not diverse-request quality.
+- The warp-local RMSNorm changes the FP32 sum order. Block tolerance checks
+  still pass, but this newer version is **not bitwise equivalent** to `465a629`:
+  the same replay changes one of 32 B16 top-token decisions (none at B32).
+  Mean relative L2 error against eager is 0.913% / 0.927% at B16/B32, versus
+  0.952% / 0.923% before. This is a numerical tradeoff, not a generation-quality
+  validation; old-order-preserving alternatives are recorded in the profiling notes.
 
 **Full-backbone numerical validation is not yet passing the strict pointwise
 tolerance.** Small matmul rounding differences can amplify through 28 layers;
@@ -157,6 +168,17 @@ additional improvement in a fresh interleaved A/B run:
 | 32 | 27.76 us | 18.27 us | 18.08 us |
 
 These include both inactive-slot resets and local norm-statistics computation.
+
+The warp-local RMSNorm and progress-triggered prefetch follow-up, against
+`465a629` on the same H200 (median of three interleaved rounds):
+
+| Batch | Compiled Torch | Before | Current | Latency reduction | Speedup vs Torch |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 27.14 us | 13.30 us | 12.22 us | 8.1% | 2.22x |
+| 32 | 27.84 us | 18.16 us | 16.64 us | 8.4% | 1.67x |
+
+No fixed delay is used. The changed norm summation order has the numerical
+tradeoff described above; these are block timings, not validated TTS speedups.
 
 Real-checkpoint full-talker replay, 23-token prefix plus 32 captured decode
 inputs, timing the last step at a fixed KV position:

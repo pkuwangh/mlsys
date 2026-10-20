@@ -67,8 +67,9 @@ def activation_words(activation, kbase, tid, j: cutlass.Constexpr, slot, N: cutl
 
 @cute.jit
 def residual_words(residual, tid, j: cutlass.Constexpr, slot, N: cutlass.Constexpr):
-    """Load eight residual values from the current sentinel-protected slot."""
-    offset = slot * N * 512 + (tid + j * 256) * 4
+    """Load one of four 8-value groups per lane; each warp owns a full row."""
+    row, col = tid // 32 + (j // 4) * 8, (tid % 32) * 8 + (j % 4) * 256
+    offset = (slot * N + row) * 512 + col // 2
     return p.load_ext(residual.iterator.raw_ptr() + offset, dtype=cutlass.Int32, count=4, order="volatile")
 
 
@@ -82,6 +83,7 @@ def gemm(
     attention,
     normalized,
     activation,
+    epochs,
     epoch,
     tid,
     cluster,
@@ -117,11 +119,13 @@ def gemm(
             iket.range_pop()
         p.barrier_cta_sync()
     else:
-        if tid == 0:
-            for stage in cutlass.range_constexpr(2):
-                p.mbarrier_init(bars.subview(stage), 1)
-        p.fence_mbarrier_init()
-        p.barrier_cta_sync()
+        # N16 output weights are already in flight from the kernel prologue.
+        if cutlass.const_expr(MODE == 2 or N == 32):
+            if tid == 0:
+                for stage in cutlass.range_constexpr(2):
+                    p.mbarrier_init(bars.subview(stage), 1)
+            p.fence_mbarrier_init()
+            p.barrier_cta_sync()
         group = 6 if MODE == 2 else 4
         if tid < 128:
             for stage in range(2):
@@ -129,15 +133,16 @@ def gemm(
                     kbase = rank * 512 + stage * 256
                 else:
                     kbase = stage * 1536 + rank * 384
-                if tid == 0:
-                    p.mbarrier_expect_tx(bars.subview(stage), group * 8192)
-                    p.cp_async_bulk_tensor_shared_cluster_global(
-                        weights.subview(stage * group * 4096),
-                        weight_map.get_ptr(),
-                        [0, 0, kbase // 64, cluster],
-                        bars.subview(stage),
-                        [],
-                    )
+                if cutlass.const_expr(MODE == 2 or N == 32):  # noqa: SIM102
+                    if tid == 0:
+                        p.mbarrier_expect_tx(bars.subview(stage), group * 8192)
+                        p.cp_async_bulk_tensor_shared_cluster_global(
+                            weights.subview(stage * group * 4096),
+                            weight_map.get_ptr(),
+                            [0, 0, kbase // 64, cluster],
+                            bars.subview(stage),
+                            [],
+                        )
                 p.barrier_cta_sync(barrier_id=1, thread_count=128)
                 if cutlass.const_expr(MODE == 2):
                     iket.range_push("activation_wait", stage)
@@ -196,6 +201,11 @@ def gemm(
                 iket.range_push("mma_drain", stage)
                 p.wgmma_wait_group_sync_aligned(0)
                 iket.range_pop()
+                if cutlass.const_expr(MODE == 0 and N == 16):  # noqa: SIM102 - specialize before the runtime predicate.
+                    if stage == 0 and rank == 3 and tid == 128:
+                        # Scheduling hint only: the norm still polls every
+                        # residual word. No payload ordering or release fence.
+                        p.store_ext(epoch.ir_value(), epochs.iterator.raw_ptr() + 96 + cluster, order="volatile")
         p.barrier_cta_sync()
 
     iket.range_pop()
@@ -264,6 +274,25 @@ def fused_kernel(
     )
     operands = weights.subview(49152)
     bars = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
+    # Weight loads need neither the epoch nor the DSMEM mailbox. Start both
+    # stages before that setup; the epoch CTA barrier also joins this init.
+    if cutlass.const_expr(N == 16):  # noqa: SIM102
+        if bid < 64 and tid == 0:
+            iket.range_push("output_weight_prefetch")
+            p.prefetch_tensormap(wo.get_ptr())
+            for stage in cutlass.range_constexpr(2):
+                p.mbarrier_init(bars.subview(stage), 1)
+            p.fence_mbarrier_init()
+            for stage in cutlass.range_constexpr(2):
+                p.mbarrier_expect_tx(bars.subview(stage), 32768)
+                p.cp_async_bulk_tensor_shared_cluster_global(
+                    weights.subview(stage * 16384),
+                    wo.get_ptr(),
+                    [0, 0, rank * 8 + stage * 4, cluster],
+                    bars.subview(stage),
+                    [],
+                )
+            iket.range_pop()
     normalized = cutlass.Array(cutlass.BFloat16, N * 1024, space=cutlass.AddressSpace.smem, alignment=1024)
     partial = cutlass.Array(cutlass.Float32, 64 * N, space=cutlass.AddressSpace.smem, alignment=128)
     # At N16 a peer may start down while this CTA still reads gate/up partials.
@@ -272,7 +301,6 @@ def fused_kernel(
         mailbox = cutlass.Array(cutlass.Float32, 64 * N, space=cutlass.AddressSpace.smem, alignment=128)
     else:
         mailbox = partial
-    inverse = cutlass.Array(cutlass.Float32, N, space=cutlass.AddressSpace.smem, alignment=128)
     epoch_s = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4)
     if tid == 0:
         epoch_s.store(epochs[bid] + 1)
@@ -319,6 +347,7 @@ def fused_kernel(
             attention,
             normalized,
             activation,
+            epochs,
             epoch,
             tid,
             cluster,
@@ -361,20 +390,37 @@ def fused_kernel(
 
     # At N16 all 96 CTAs produce one tile; at N32 only the 48 dedicated CTAs do so twice.
     if N == 16 or cluster >= 16:
-        prefetch_gate_up(weights, bars, wgu, bid if N == 16 else bid - 64, tid)
         if cluster >= 16:
-            iket.range_push("normalization_start_wait")
-            # Early CTAs poll one word first to reduce traffic. This does not
-            # establish readiness of other words: validate every payload below.
+            iket.range_push("gate_up_prefetch_wait")
             if tid == 0:
-                ptr = r.iterator.raw_ptr() + ((epoch & 1) + 1) * N * 512 - 1
-                while p.load_ext(ptr, dtype=cutlass.Int32, order="volatile") == PAYLOAD_EMPTY:
-                    p.nanosleep(32)
-            p.barrier_cta_sync()
+                if cutlass.const_expr(N == 16):
+                    # Start prefetch once a producer finishes its first MMA
+                    # stage, rather than competing with its initial loads.
+                    ptr = epochs.iterator.raw_ptr() + 96 + (bid - 64) % 16
+                    while p.load_ext(ptr, dtype=cutlass.Int32, order="volatile") != epoch:
+                        p.nanosleep(32)
+                else:
+                    ptr = r.iterator.raw_ptr() + ((epoch & 1) + 1) * N * 512 - 1
+                    while p.load_ext(ptr, dtype=cutlass.Int32, order="volatile") == PAYLOAD_EMPTY:
+                        p.nanosleep(32)
+            # prefetch_gate_up's initialization barrier also joins this wait.
             iket.range_pop()
+            if cutlass.const_expr(N == 16):  # noqa: SIM102 - specialize before the runtime predicate.
+                if tid == 0:
+                    iket.range_push("gate_up_l2_prefetch")
+                    # These 32 CTAs warm the other 64 tiles for the CTAs still
+                    # doing output projection. Their own tiles go to SMEM below.
+                    for tile_offset in cutlass.range_constexpr(2):
+                        p.cp_async_bulk_tensor_prefetch(wgu.get_ptr(), [0, 0, 0, bid - 64 + tile_offset * 32], [])
+                    iket.range_pop()
+        prefetch_gate_up(weights, bars, wgu, bid if N == 16 else bid - 64, tid)
         norm_inputs = cute.make_rmem_tensor((4, N // 2), cutlass.Int32)
         iket.range_push("norm_prefetch")
-        norm_scales = (gamma.iterator.raw_ptr() + tid * 8 % 1024).load(count=8, alignment=16)
+        norm_scales = cute.make_rmem_tensor((8, 4), cutlass.BFloat16)
+        for group in cutlass.range_constexpr(4):
+            values = (gamma.iterator.raw_ptr() + (tid % 32) * 8 + group * 256).load(count=8, alignment=16)
+            for k in cutlass.range_constexpr(8):
+                norm_scales[k, group] = values[k]
         for j in cutlass.range_constexpr(N // 2):
             values = residual_words(r, tid, j, epoch & 1, N)
             for k in cutlass.range_constexpr(4):
@@ -395,48 +441,34 @@ def fused_kernel(
                 norm_ready &= cutlass.all_(norm_inputs[None, j].load().to_vector() != PAYLOAD_EMPTY)
         iket.range_pop()
         iket.range_push("norm_local_stats")
-        # Preserve the original 16-channel butterfly tree using the polled
-        # residuals. Row-major scratch avoids bank conflicts and is unused
-        # until the gate/up epilogue.
-        for j in cutlass.range_constexpr(N // 2):
-            idx = (tid + j * 256) * 8
-            row, col = idx // 1024, idx % 1024
-            values = norm_inputs[None, j].load().to_vector().bitcast(cutlass.BFloat16).to(cutlass.Float32)
-            squares = values * values
-            left = (squares[0] + squares[1]) + (squares[2] + squares[3])
-            right = (squares[4] + squares[5]) + (squares[6] + squares[7])
-            total = left + right
-            total += cute.arch.shuffle_sync_bfly(total, 1)
-            if tid % 2 == 0:
-                partial.store(total, idx=row * 64 + col // 16)
-        iket.range_pop()
-        iket.range_push("norm_partials_ready")
-        p.barrier_cta_sync()
-        iket.range_pop()
-        iket.range_push("norm_stats_reduce")
-        if tid < N * 8:
-            batch, part = tid // 8, tid % 8
+        # Retain polled inputs in registers. Each warp reduces its own rows,
+        # with no shared partials or cross-warp inverse-RMS broadcast.
+        norm_inverse = cute.make_rmem_tensor((N // 8,), cutlass.Float32)
+        for token in cutlass.range_constexpr(N // 8):
             total = cutlass.Float32(0)
-            for j in cutlass.range_constexpr(8):
-                total += partial.load(idx=batch * 64 + j * 8 + part)
-            for delta in cutlass.range_constexpr(3):
+            for group in cutlass.range_constexpr(4):
+                words = norm_inputs[None, token * 4 + group].load().to_vector()
+                values = words.bitcast(cutlass.BFloat16).to(cutlass.Float32)
+                squares = values * values
+                left = (squares[0] + squares[1]) + (squares[2] + squares[3])
+                right = (squares[4] + squares[5]) + (squares[6] + squares[7])
+                total += left + right
+            for delta in cutlass.range_constexpr(5):
                 total += cute.arch.shuffle_sync_bfly(total, 1 << delta)
-            if part == 0:
-                inverse.store(cute.math.rsqrt(total / 1024 + EPS), idx=batch)
-        iket.range_pop()
-        iket.range_push("norm_inverse_ready")
-        p.barrier_cta_sync()
+            norm_inverse[token] = cute.math.rsqrt(total / 1024 + EPS)
         iket.range_pop()
         iket.range_push("norm_apply")
         for j in cutlass.range_constexpr(N // 2):
-            idx = (tid + j * 256) * 8
-            row, col = idx // 1024, idx % 1024
-            norm_value = norm_inputs[None, j].load().to_vector().bitcast(cutlass.BFloat16).to(cutlass.Float32)
-            scale = norm_scales.to(cutlass.Float32)
-            unit = (norm_value * inverse.load(idx=row)).to(cutlass.BFloat16).to(cutlass.Float32)
-            # Gate/up reads this resident WGMMA layout directly.
+            row, col = tid // 32 + (j // 4) * 8, (tid % 32) * 8 + (j % 4) * 256
+            values = norm_inputs[None, j].load().to_vector().bitcast(cutlass.BFloat16).to(cutlass.Float32)
+            scale = norm_scales[None, j % 4].load().to_vector().to(cutlass.Float32)
+            unit = (values * norm_inverse[j // 4]).to(cutlass.BFloat16).to(cutlass.Float32)
             offset = (col // 64) * N * 64 + swizzle(row, col % 64)
             normalized.store((unit * scale).to(cutlass.BFloat16), idx=offset, alignment=16)
+        iket.range_pop()
+        iket.range_push("norm_publish")
+        # The only norm CTA rendezvous: all operand rows must reach SMEM
+        # before the consumer warpgroup issues WGMMA.
         p.fence_proxy("async_shared", space=p.SharedSpace.shared_cta)
         p.barrier_cta_sync()
         iket.range_pop()
@@ -452,6 +484,7 @@ def fused_kernel(
                 attention,
                 normalized,
                 activation,
+                epochs,
                 epoch,
                 tid,
                 cluster,
@@ -509,6 +542,7 @@ def fused_kernel(
             attention,
             normalized,
             activation,
+            epochs,
             epoch,
             tid,
             cluster,
@@ -585,7 +619,7 @@ def compile_kernel(batch, bucket, eps):
         fake(cutlass.BFloat16, 1024),
         fake(cutlass.Int32, 2, bucket, 512),
         fake(cutlass.Int32, 2, 96, bucket, 16),
-        fake(cutlass.Int32, 96 if bucket == 16 else 112),
+        fake(cutlass.Int32, 112),
         fake(cutlass.BFloat16, batch, 1024),
         make_fake_stream(),
         batch,
@@ -642,7 +676,8 @@ class FusedPostAttention(nn.Module):
             self.workspaces[batch] = (
                 torch.full((2, bucket, 512), PAYLOAD_EMPTY, device=device, dtype=torch.int32),
                 torch.full((2, 96, bucket, 16), PAYLOAD_EMPTY, device=device, dtype=torch.int32),
-                torch.zeros(96 if bucket == 16 else 112, device=device, dtype=torch.int32),
+                # N16: 96 CTA epochs + 16 prefetch hints. N32: 112 CTA epochs.
+                torch.zeros(112, device=device, dtype=torch.int32),
             )
         output = torch.empty_like(residual, memory_format=torch.contiguous_format)
         fn = compile_kernel(batch, bucket, self.reference.norm.eps)

@@ -102,11 +102,11 @@ overlapping warp ranges cannot be added to obtain kernel time.
 | `output_reduce`, `down_reduce` | Load and sum the four sender slots in local SMEM |
 | `output_residual` | Residual addition, BF16 rounding, packed sentinel-safe publication |
 | `output_cta_sync` | CTA rendezvous after residual publication |
-| `normalization_start_wait` | Early consumer CTAs poll one word with one thread to limit traffic |
+| `gate_up_prefetch_wait` | Early consumers wait for the first-MMA progress hint (N16) or one residual word (N32) |
 | `normalization_input_wait` | Validate every residual payload word, retrying incomplete vectors |
-| `norm_prefetch`, `norm_local_stats` | Load residual/gamma, compute 16-channel squared-sum partials |
-| `norm_partials_ready`, `norm_inverse_ready` | CTA rendezvous before the final reduction and before using its result |
-| `norm_stats_reduce`, `norm_apply` | Reduce the 64 partials and compute inverse RMS, then apply RMSNorm |
+| `norm_prefetch`, `norm_local_stats` | Load residual/gamma, then compute the full sum and inverse RMS within each warp |
+| `norm_apply`, `norm_publish` | Apply RMSNorm into SMEM, then proxy fence and the final CTA rendezvous |
+| `gate_up_l2_prefetch` | N16 early consumers prefetch the other 64 gate/up weight tiles into L2 |
 | `gate_up_weight_prefetch` | Issue weight TMA; does not wait for its completion |
 | `gate_up_accumulator_store`, `silu_and_gate` | Accumulator staging and BF16 SwiGLU |
 | `activation_sync` | CTA rendezvous after packed activation publication |
@@ -120,6 +120,10 @@ Barrier stalls can appear as gaps between ranges; markers are not additional
 hardware completion fences. Keep each event name's payload type consistent:
 mixing payload/no-payload uses caused missing and incorrectly paired ranges in
 this IKET build.
+
+Older captures contain `normalization_start_wait`, `norm_partials_ready`,
+`norm_stats_reduce`, and `norm_inverse_ready`. The warp-per-row norm removes
+the latter three; `norm_apply` no longer includes the final CTA rendezvous.
 
 From `mlsys/gpu/kernels/qwen3_tts`, capture one B16 block without reference
 GEMMs or timing loops:
@@ -350,6 +354,81 @@ loads. Swizzling their row layout removes the conflict pattern by construction;
 the isolated timing trial improves about 0.15 us, much less than the full long
 range. Neither that layout nor the diagnostic warp sync was made the default.
 
+## Norm and Prefetch Scheduling
+
+Baseline for this round: `465a629`. All timings below are unprofiled,
+interleaved CUDA graphs on H200, rotating 28 weight sets. The fixed delays
+and alternative signals were scratch experiments, not public kernel options.
+
+Final reversed-order A/B: B16 **13.30 -> 12.22 us**, B32 **18.16 -> 16.64 us**,
+median of three rounds. Compiled Torch: 27.14 / 27.84 us. The source changes
+preserve the block tolerance, not bitwise equivalence to the previous kernel.
+
+With the original norm, B16 scheduling experiments gave:
+
+| Scheduling change | us/block |
+| --- | ---: |
+| Baseline | 13.35 |
+| Delay weight prefetch by 2 / 4 / 6 us | 13.39 / 12.74 / 13.40 |
+| Delay polling by 4 us, but leave weight TMA early | 13.29 |
+| Prefetch the other gate/up tiles into L2 immediately | 14.11 |
+| Delay 4 us, then prefetch own tile plus other tiles into L2 | 12.44 |
+| Signal after output GEMM, before split-K, then prefetch own tile | 13.91 |
+| Same signal, also prefetch other tiles into L2 | 13.06 |
+| Signal after the first output MMA stage, with L2 prefetch | 12.60 |
+| Wait for an existing residual word, with L2 prefetch | 12.69 |
+
+The delay sweep suggests that early weight traffic matters, not just polling.
+It does not establish a universally optimal delay. The retained N16 schedule
+uses actual producer progress: rank 3 of each output cluster publishes an epoch
+hint after its first MMA stage. CTAs 64-95 wait on these hints, prefetch the
+other 64 gate/up tiles into L2, and load their own tiles into SMEM. The hint
+uses a volatile word, not a release/acquire payload protocol. Every residual
+word is still independently polled before use. N32 instead waits for an existing
+residual word before weight TMA; the early-MMA signal was slower there.
+
+For RMSNorm, reducing four warp sums and computing inverse RMS independently
+removed a barrier but regressed B16 from 13.33 to 15.13 us. Neither that version
+nor the baseline spilled; the four-warp version generated substantially more
+shuffle/inverse-RMS instructions. Computing inverse RMS immediately before
+applying it did not recover the loss.
+
+The retained norm assigns a full 1024-channel row to one warp. Each lane keeps
+four 8-value groups in registers; eight warps cover two rows each at N16 and
+four at N32. The reduction uses warp shuffles, with no shared partials or inverse
+broadcast. Only the final SMEM-to-WGMMA publication rendezvous remains. This
+alone measured 12.87 / 17.20 us at B16/B32, versus 13.33 / 18.00 us. Upstream
+BF16 cast boundaries are unchanged; the FP32 sum order changes.
+
+Preserving the previous summation order with warp gathers restored bitwise
+identity in the 32-step checkpoint replay, but cost about 1 us/block at B16
+(13.23 us combined). Eight lanes per row reduced that cost to 12.94 us at B16
+but regressed B32 to 18.10 us. Neither is the current default.
+
+The faster norm changes the full-model result starting at replay step 14.
+Mean relative L2 logit error against eager was 0.913% / 0.927% at B16/B32,
+versus 0.952% / 0.923% before; maximum error stayed 2.242% in both cases.
+Top-token agreement was 31/32 steps at B16 and 32/32 at B32, versus 32/32 before.
+The old/new pointwise comparison fails from step 14 onward. The block still
+passes its existing tolerance; do not describe this as bitwise-preserving or
+as a validated free-running generation improvement.
+
+Removing the prefetch-wait CTA barrier is safe because the immediately
+following TMA initialization barrier already joins the waiting thread. It
+left B16 effectively unchanged and saved about 0.2 us at B32. The norm's final
+WGMMA publication barrier remains.
+
+Final SASS has 122 / 218 registers per thread at B16/B32, no local-memory
+loads/stores, and no `MEMBAR.ALL.GPU`. Vectorized operand loads/stores remain.
+Memcheck and racecheck pass B=1/8/16/17/32, including changed-input graph replays.
+
+In the new B16 IKET pair, the median interval from the first `norm_local_stats`
+timestamp to `gate_up_projection` starts falls from 2.000 to 0.704 us for CTAs
+0-63, and from 2.144 to 1.824 us for CTAs 64-95. This includes inter-marker
+waiting, not just arithmetic. Divergent polling can still split ranges; do not
+sum their displayed durations as independent compute operations. The final
+publication rendezvous is now explicitly labeled `norm_publish`.
+
 ## Local Artifacts
 
 All paths below are relative to the repository root, under ignored `tmp/`.
@@ -416,6 +495,102 @@ Early-consumer experiments (B16):
 - Retained redundant GEMM IKET: `qwen3_tts_0p6b_h200_b16_full_redundant_projection_iket.pftrace`.
 - Diagnostic warp-sync IKET: `qwen3_tts_0p6b_h200_b16_norm_lane_sync_iket.pftrace`.
   Matching JSON/HTML files are directly beside each trace in `tmp/`.
+
+Norm/scheduling follow-up on `viking-prod-260` (baseline `465a629`):
+
+- Scheduling sweeps: `sglang_qwen_variant_ab_20261019_172712_660938.log`
+  and `sglang_qwen_variant_ab_20261019_172908_059917.log`.
+- Norm variants: `sglang_qwen_variant_ab_20261019_172813_634941.log`.
+- Combined candidates: `sglang_qwen_variant_ab_20261019_173103_113821.log`.
+- B=1/8/16/17/32: `sglang_qwen_variant_ab_20261019_173243_810378.log`.
+- Final reversed-order A/B: `sglang_qwen_variant_ab_20261019_174702_286202.log`.
+- Order-preserving alternatives: `sglang_qwen_variant_ab_20261019_173856_920946.log`
+  and `sglang_qwen_variant_ab_20261019_174232_345634.log`.
+- Checkpoint replay: `sglang_qwen_norm_backbone_20261019_174017_152932.log`;
+  old-order control: `sglang_qwen_norm_backbone_20261019_174122_667800.log`.
+- Final sanitizers and SASS resources: `sglang_qwen_norm_finish_20261019_174344_800808.log`
+  (profiling was retried separately after an output-directory error).
+- SASS: `qwen3_tts_0p6b_h200_b{16,32}_after_norm_schedule.sass`.
+- IKET: `qwen3_tts_0p6b_h200_b16_{before,after}_norm_schedule_iket.pftrace`;
+  the slower four-warp trial is `qwen3_tts_0p6b_h200_b16_four_warp_norm_iket.pftrace`.
+  Matching JSON/HTML files are directly under `tmp/`.
+
+## Residual Resume-Scan Experiment
+
+H200 `viking-prod-321`, B16/B32, rotating 28 weight sets, interleaved CUDA
+graphs. Times below are median microseconds per block across three rounds.
+All candidates preserve the current kernel's output bit-for-bit across three
+random seeds and pass zero/changed-input graph replay checks.
+
+| Polling implementation | B16 | B32 |
+| --- | ---: | ---: |
+| Current loop (first run) | 12.160 | 16.476 |
+| Resume scan, sentinel-initialized registers | 12.798 | 17.534 |
+| Resume scan with persistent completion mask and initial bulk loads | 13.772 | 17.423 |
+| Current loop (control run) | 12.167 | 16.509 |
+| Resume scan retaining initial bulk loads | 12.401 | 16.866 |
+
+The direct resume scan checks saved groups and reloads only unfinished ones,
+checking the newly loaded values on the next pass. The completion-mask variant
+also skips checking groups already known to be complete. Neither beats the
+current loop. Keeping the initial loads issued together recovers most of the
+direct scan's regression, but the changed retry loop still loses about 2%.
+No candidate was promoted; normalization arithmetic and the main kernel remain
+unchanged by this experiment.
+
+Artifacts directly under `tmp/`:
+
+- `qwen_norm_resume.py`, `qwen_norm_resume_mask.py`, `qwen_norm_resume_prefetch.py`.
+- First run: `sglang_qwen_variant_ab_20261019_235416_712812.log`.
+- Control run: `sglang_qwen_variant_ab_20261019_235507_188235.log`.
+
+## Earlier Output-Projection TMA
+
+The previous prologue loaded the epoch, synchronized the CTA, initialized
+DSMEM mailboxes, synchronized the cluster, and reset inactive payload slots
+before issuing the first weight TMA. These operations do not produce the
+output-projection weights.
+
+For N16, thread 0 now initializes the two output operand barriers, prefetches
+the weight tensor map, and issues both weight TMAs before the epoch setup.
+The existing epoch CTA barrier also joins the earlier barrier initialization.
+Operand-loader threads still publish their SMEM stores through the proxy
+fence and barrier arrival; MMA still waits for both operands. N32 and the
+down projection keep their previous staged weight-loading schedule.
+
+On H200 `viking-prod-321`, with 28 rotating weight sets and interleaved graph
+timing, B16 improves from 12.149 to 11.711 us/block (3.6% lower latency).
+Applying early TMA to B32 did not give a clear improvement (16.515 versus
+16.541 us), so it was not retained for that bucket.
+
+Fresh B16 IKET captures show the following medians relative to each warp's
+recorded entry, not the host launch timestamp:
+
+| Event | Before (us) | Early TMA (us) |
+| --- | ---: | ---: |
+| Weight-prefetch range starts | Not separately marked | 0.096 |
+| First output MMA issue starts | 1.408 | 1.312 |
+| Second output MMA issue starts | 1.984 | 1.760 |
+| Output projection completes, MMA warps | 2.240 | 2.016 |
+
+The prefetch marker includes descriptor prefetch and barrier initialization;
+it is not the exact timestamp of the TMA instruction. This follows the
+guide's "start independent work before waiting" technique. Remaining startup
+work includes epoch handling, mailbox setup, resets, and activation staging.
+
+Validation: B16/B32 candidates matched the prior kernel bit-for-bit across
+three seeds and 28 weight sets. B16 racecheck reported zero hazards. The
+retained implementation passed memcheck and zero/changed-input graph replay
+at B=1/8/16/17/32.
+
+Artifacts directly under `tmp/`:
+
+- Baseline source: `qwen_startup_before.py`; candidate: `qwen_startup_early_tma.py`.
+- A/B: `sglang_qwen_variant_ab_20261020_001036_999073.log`.
+- IKET: `qwen3_tts_0p6b_h200_b16_startup_{before,early_tma}_iket.pftrace`,
+  with matching JSON/HTML files.
+- Racecheck: `sglang_qwen_norm_sanitize_20261020_001254_146677.log`.
+- Memcheck: `sglang_qwen_norm_sanitize_20261020_001353_732512.log`.
 
 ## Remaining Opportunities
 
