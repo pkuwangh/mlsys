@@ -250,7 +250,7 @@ def reduce_partial(partial, row, col, N: cutlass.Constexpr):
 
 
 @cute.kernel
-def fused_kernel(
+def post_attention_kernel(
     attention: cute.Tensor,
     residual: cute.Tensor,
     wo: cutlass.GridConstant[tensor_map.TensorMap],
@@ -575,7 +575,7 @@ def fused_kernel(
 
 
 @cute.jit
-def fused_host(
+def post_attention_host(
     attention: cute.Tensor,
     residual: cute.Tensor,
     wo: cute.Tensor,
@@ -596,7 +596,9 @@ def fused_host(
         wgu, (1, 16, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
     )
     wd_map = tensor_map.create_tensor_map_tiled_from_view(wd, (1, 6, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b)
-    fused_kernel(attention, residual, wo_map, wgu_map, wd_map, gamma, r, activation, epochs, output, B, N, EPS).launch(
+    post_attention_kernel(
+        attention, residual, wo_map, wgu_map, wd_map, gamma, r, activation, epochs, output, B, N, EPS
+    ).launch(
         grid=(96 if N == 16 else 112, 1, 1),
         block=(256, 1, 1),
         cluster=(4, 1, 1),
@@ -611,7 +613,7 @@ def compile_kernel(batch, bucket, eps):
         return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))))
 
     return cute.compile(
-        fused_host,
+        post_attention_host,
         fake(cutlass.BFloat16, batch, 2048),
         fake(cutlass.BFloat16, batch, 1024),
         fake(cutlass.BFloat16, 16, 32, 64, 64),

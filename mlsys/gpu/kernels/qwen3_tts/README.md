@@ -1,9 +1,12 @@
-# Qwen3-TTS Talker
+# Qwen3-TTS Talker and Code Predictor
 
 Standalone 0.6B talker backbone: prepared embeddings -> 28 transformer layers
 -> codec logits. This excludes text preprocessing, the code predictor, sampling,
 and waveform decoding. See [design.md](design.md) for the math, CTA/warp schedules,
 memory handoffs, and retained design decisions.
+
+The standalone [code predictor](#code-predictor) reuses the same fused blocks
+to generate the remaining 15 codec codes for each audio frame.
 
 ## Run
 
@@ -44,7 +47,50 @@ three samples of five replays; compilation, packing, allocation, and cache setup
 are excluded. Backbone timing repeatedly overwrites the final fixed KV slot,
 not a growing-context generation loop.
 
-## Validation
+## Code Predictor
+
+```bash
+python bench_qwen3_tts_predictor.py --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice
+```
+
+The predictor has five layers with the same 1024/3072 widths and 16 Q / 8 KV
+heads as the talker. Each frame runs a two-token prefix followed by 14 single-token
+steps, producing 15 codes with group-specific heads and embeddings. The custom
+path reuses both fused decode blocks; multi-token prefix operations remain Torch.
+No new kernel or serving-framework dependency is introduced.
+
+Both paths precompute RoPE and additive masks during cache setup. Steps use table
+views, avoiding repeated setup kernels while retaining a fixed-capacity KV cache.
+
+The benchmark compares eager, compiled, and fused **complete frame generation**:
+prefix, decode, greedy selection, embedding lookup, and the final embedding sum.
+All three use interleaved CUDA graphs. Defaults are B=16/32; `--profile` captures
+one frame per variant. Optional `--inputs` loads a `.pt` with `hidden [B,1,1024]`
+and `first_code [B,1]` from the matching talker. Otherwise inputs are synthetic.
+
+H200, real 0.6B checkpoint, 16/32 distinct frames from one captured prompt:
+
+| Batch | Torch | Compiled Torch | Fused | Compiled/Fused |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 10.064 ms | 4.740 ms | 2.346 ms | 2.02x |
+| 32 | 10.225 ms | 4.689 ms | 2.861 ms | 1.64x |
+
+The eager reference matches upstream logits, KV, and feedback exactly at
+B=1/16/32 with matching static caches and math SDPA. Changed-input, stale-cache,
+and repeated-frame CUDA-graph checks pass at B=1/16/17/32. On this captured input,
+fused teacher-forced top-code agreement is 96.7%/95.8%; free-running greedy code
+agreement is 81.3%/81.0%.
+
+Stage-by-stage checks attribute the observed differences primarily to projection
+reduction/rounding order, with rare Q/K head-normalization rounding differences;
+no indexing, cache-write, or BF16-boundary mismatch was found in the tested cases.
+Eager Torch is not an exact-arithmetic oracle: using FP64 projection reductions
+with the same BF16 output boundaries also changes codes (81.25% agreement at B32).
+The benchmark reports numerical differences without a tolerance-based failure;
+shape, finiteness, and exact feedback checks still raise errors. Speech quality
+has not been evaluated. See [numerical attribution](design.md#predictor-numerical-attribution).
+
+## Talker Validation
 
 The Torch reference follows upstream Qwen-TTS BF16 rounding; the compiled
 baseline enables `emulate_precision_casts`. Two-layer prefill/decode checks
@@ -109,6 +155,11 @@ numbers are **diagnostic timings, not validated generation speedups**.
 For scheduling analysis use graph-level Nsight capture; for kernel attribution
 use graph-node capture. Keep traces directly under repository `tmp/`, with model,
 GPU, batch, and variant in the filename.
+
+Graph-node tracing can substantially inflate predictor timings and introduce GPU
+gaps during `cudaGraphLaunch`. In a B16 comparison, graph-level tracing measured
+5.24-5.48 ms compiled / 2.59 ms fused, versus 7.31-8.03 / 3.03-3.37 ms with
+node tracing. Use unprofiled interleaved CUDA-event timings for speedup claims.
 
 Pre/post kernels have IKET per-warp markers; `--trace-only --batch-size 16`
 launches one custom block without reference GEMMs or timing loops:

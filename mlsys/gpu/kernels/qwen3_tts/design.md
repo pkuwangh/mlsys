@@ -221,6 +221,65 @@ with PDL) took 694.9 us. Phased fusion still read Q/K/V through global memory
 and was slower. Removing a launch or overlapping kernels was not sufficient
 to offset the attention cost. No custom attention kernel or PDL option is shipped.
 
+## Code Predictor Reuse
+
+The 0.6B code predictor has five layers with the same projection, normalization,
+and head dimensions as the talker. It directly reuses the pre-/post-attention
+kernels and Torch SDPA; no predictor-specific kernel schedule is needed initially.
+
+For each audio frame:
+
+1. Process `[talker_hidden, embedding(code_0)]` as a two-token causal prefix.
+2. Apply output head 0 to the last hidden state to choose code 1.
+3. Feed each chosen code's group-specific embedding through the five layers,
+   using the next output head, until code 15 is generated.
+4. Sum all 16 code embeddings in one reduction to produce talker feedback.
+
+This is one prefix pass plus 14 decode passes, or 75 layer executions per frame.
+The cache holds only positions 0..15 and is logically restarted for each frame.
+Masks exclude stale slots until they are overwritten, so no cache clearing or
+allocation is required between frames. Calls on one fused instance remain serial.
+The two-token prefix uses Torch operations; only one-token steps use custom kernels.
+
+Cache allocation also prepares RoPE and additive-mask tables on the final device.
+Every step passes views of these tables to the transformer; neither the Torch nor
+custom path rebuilds them. Unlike SGLang's valid-length KV views, the cache shape
+stays fixed to avoid length-specific compiled graphs. No runtime mask conversion
+or mask-writing kernel is needed.
+
+`qwen3_tts_predictor_reference.py` follows upstream residual/normalization rounding,
+including one final embedding reduction rather than sequential BF16 additions.
+The benchmark compiles a transformer pass with the output-head weight as a tensor
+argument, avoiding a separate specialization for every code group. A CUDA graph
+captures the complete greedy generation loop. Teacher-forced logits isolate
+numerical drift; free-running code agreement measures its propagation, not audio
+quality. No text processing, waveform decoding, or serving integration is included.
+
+### Predictor Numerical Attribution
+
+Checks used all five checkpoint layers at decode positions 2 and 15, B=16/32,
+on captured talker inputs. Instrumented copies matched the retained kernels
+bit-for-bit. Each stage was then compared on identical inputs, separating its
+local arithmetic difference from errors propagated by earlier stages.
+
+- Input/post RMSNorm, gate/up BF16 outputs, and SiLU/gating matched eager exactly
+  on these stage-local inputs. Q/K head norms differed in at most 0.00041% of values.
+- QKV, output, and down projections differed in 0.045%, 0.141%, and 0.122% of BF16
+  values. Their FP32 accumulators differed from FP64 dot products by relative L2
+  errors of 4.5e-7 to 8.3e-7, consistent with accumulation-order effects. After
+  BF16 rounding, these fused projections were closer to the FP64-rounded result
+  than eager BF16 GEMMs in this sample.
+- Residual additions, RoPE, cache writes, and activation publication matched
+  their expected operations exactly given the recorded intermediate values.
+
+As a separate check, replacing only reference projection reductions with FP64,
+while retaining BF16 outputs, gave 91.25%/81.25% free-running code agreement with
+eager at B16/B32. Greedy decisions can amplify small arithmetic differences;
+neither eager agreement nor higher local precision establishes speech quality.
+These checks found no semantic mismatch in the sampled stages, not a proof for
+every input. Full-predictor error metrics are numerical measurements rather than
+a pass/fail tolerance gate; isolated kernel correctness assertions remain intact.
+
 ## Open Work
 
 The blocking issue for serving integration is full-backbone numerical and
