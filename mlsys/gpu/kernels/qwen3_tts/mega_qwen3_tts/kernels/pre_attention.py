@@ -345,8 +345,6 @@ def trace_once(batch, capacity, write_mask=False):
 @torch.inference_mode()
 def benchmark(batch, layers, capacity, profile=False, write_mask=False):
     """Compare complete preparation blocks with rotating weights and fixed cache position."""
-    from unittest.mock import patch
-
     from qwen3_tts_reference import TalkerConfig, TalkerLayer, pre_attention, prepare_qkv
 
     torch.manual_seed(42)
@@ -384,15 +382,6 @@ def benchmark(batch, layers, capacity, profile=False, write_mask=False):
         kv[1].index_copy_(2, positions, v)
         return q
 
-    # Verify the extracted block against the original attention module.
-    module_cache = caches[0].clone()
-    mask = torch.arange(capacity, device="cuda")[None, :] <= positions[:, None]
-    with patch("torch.nn.functional.scaled_dot_product_attention", side_effect=lambda q, *a, **kw: q):
-        original = refs[0].self_attn(refs[0].input_layernorm(x), module_cache, positions, cos, sin, mask)
-    q = pre_attention(x, *reference_args(refs[0], cos, sin, caches[0], positions))
-    extracted = q.transpose(1, 2).reshape(batch, 1, 2048)
-    torch.testing.assert_close(extracted, original, atol=0, rtol=0)
-    torch.testing.assert_close(caches[0], module_cache, atol=0, rtol=0)
     for seed in range(3):
         torch.manual_seed(seed)
         x.zero_() if seed == 0 else x.normal_()

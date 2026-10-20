@@ -33,6 +33,8 @@ Implementation: [pre_attention.py](mega_qwen3_tts/kernels/pre_attention.py),
 Follow upstream Qwen-TTS eager BF16 semantics, not SGLang's deferred-residual
 and fused-add-normalization rounding. GEMMs accumulate in FP32, but split-K
 and warp reductions can change accumulation order: agreement is tolerance-based.
+The Torch backbone and standalone baselines share RMSNorm, QKV projection,
+and RoPE functions so their rounding rules cannot drift independently.
 `bf16` and `fp32` below denote explicit casts; weights use `[out,in]` orientation.
 
 ```python

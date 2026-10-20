@@ -94,13 +94,13 @@ def gemm(
     N: cutlass.Constexpr,
 ):
     """Consume resident gate/up operands or stage two split-projection operands."""
-    if cutlass.const_expr(MODE == 0):
+    if cutlass.const_expr(MODE == "output"):
         iket.range_push("output_projection")
-    elif cutlass.const_expr(MODE == 1):
+    elif cutlass.const_expr(MODE == "gate_up"):
         iket.range_push("gate_up_projection", tile)
     else:
         iket.range_push("down_projection")
-    if cutlass.const_expr(MODE == 1):
+    if cutlass.const_expr(MODE == "gate_up"):
         if tid >= 128:
             p.wgmma_fence_aligned()
             iket.range_push("operand_wait", cutlass.Int32(0))
@@ -120,20 +120,20 @@ def gemm(
         p.barrier_cta_sync()
     else:
         # N16 output weights are already in flight from the kernel prologue.
-        if cutlass.const_expr(MODE == 2 or N == 32):
+        if cutlass.const_expr(MODE == "down" or N == 32):
             if tid == 0:
                 for stage in cutlass.range_constexpr(2):
                     p.mbarrier_init(bars.subview(stage), 1)
             p.fence_mbarrier_init()
             p.barrier_cta_sync()
-        group = 6 if MODE == 2 else 4
+        group = 6 if MODE == "down" else 4
         if tid < 128:
             for stage in range(2):
-                if cutlass.const_expr(MODE == 0):
+                if cutlass.const_expr(MODE == "output"):
                     kbase = rank * 512 + stage * 256
                 else:
                     kbase = stage * 1536 + rank * 384
-                if cutlass.const_expr(MODE == 2 or N == 32):  # noqa: SIM102
+                if cutlass.const_expr(MODE == "down" or N == 32):  # noqa: SIM102
                     if tid == 0:
                         p.mbarrier_expect_tx(bars.subview(stage), group * 8192)
                         p.cp_async_bulk_tensor_shared_cluster_global(
@@ -144,7 +144,7 @@ def gemm(
                             [],
                         )
                 p.barrier_cta_sync(barrier_id=1, thread_count=128)
-                if cutlass.const_expr(MODE == 2):
+                if cutlass.const_expr(MODE == "down"):
                     iket.range_push("activation_wait", stage)
                     # Issue all loads before testing them. Polling each vector
                     # separately serializes L2 latency. Retain completed words.
@@ -170,7 +170,7 @@ def gemm(
                 for j in cutlass.range_constexpr(group * N // 16):
                     idx = (tid + j * 128) * 8
                     slab, row, k = idx // (N * 64), (idx // 64) % N, idx % 64
-                    if cutlass.const_expr(MODE == 0):
+                    if cutlass.const_expr(MODE == "output"):
                         value = cutlass.full((8,), 0, cutlass.BFloat16)
                         if row < B:
                             value = (attention.iterator.raw_ptr() + row * 2048 + kbase + slab * 64 + k).load(
@@ -201,7 +201,7 @@ def gemm(
                 iket.range_push("mma_drain", stage)
                 p.wgmma_wait_group_sync_aligned(0)
                 iket.range_pop()
-                if cutlass.const_expr(MODE == 0 and N == 16):  # noqa: SIM102 - specialize before the runtime predicate.
+                if cutlass.const_expr(MODE == "output" and N == 16):  # noqa: SIM102
                     if stage == 0 and rank == 3 and tid == 128:
                         # Scheduling hint only: the norm still polls every
                         # residual word. No payload ordering or release fence.
@@ -303,8 +303,9 @@ def fused_kernel(
         mailbox = partial
     epoch_s = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4)
     if tid == 0:
-        epoch_s.store(epochs[bid] + 1)
-        epochs[bid] = epochs[bid] + 1
+        next_epoch = epochs[bid] + 1
+        epoch_s.store(next_epoch)
+        epochs[bid] = next_epoch
     p.barrier_cta_sync()
     epoch = epoch_s.load()
     ready = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
@@ -353,9 +354,9 @@ def fused_kernel(
             cluster,
             rank,
             0,
-            0,
-            B,
-            N,
+            MODE="output",
+            B=B,
+            N=N,
         )
         scatter_partial(acc, mailbox, ready, 0, tid, rank, N)
 
@@ -490,9 +491,9 @@ def fused_kernel(
                 cluster,
                 rank,
                 tile,
-                1,
-                B,
-                N,
+                MODE="gate_up",
+                B=B,
+                N=N,
             )
             if cutlass.const_expr(N == 32):  # noqa: SIM102 - keep the compile-time branch.
                 if wave == 0:
@@ -548,9 +549,9 @@ def fused_kernel(
             cluster,
             rank,
             0,
-            2,
-            B,
-            N,
+            MODE="down",
+            B=B,
+            N=N,
         )
         scatter_partial(acc, mailbox, ready, 1, tid, rank, N)
         for j in cutlass.range_constexpr(N // 16):
@@ -644,14 +645,10 @@ class FusedPostAttention(nn.Module):
         if torch.cuda.get_device_capability(reference.o_proj.weight.device)[0] != 9:
             raise ValueError("This WGMMA implementation targets Hopper")
         self.reference = reference
-        packed = (
-            torch.cat(
-                (reference.gate_proj.weight.reshape(96, 32, 1024), reference.up_proj.weight.reshape(96, 32, 1024)),
-                dim=1,
-            )
-            .detach()
-            .contiguous()
-        )
+        packed = torch.cat(
+            (reference.gate_proj.weight.reshape(96, 32, 1024), reference.up_proj.weight.reshape(96, 32, 1024)),
+            dim=1,
+        ).detach()
         self.register_buffer("packed_gate_up", packed.reshape(96, 64, 16, 64).permute(0, 2, 1, 3).contiguous())
         self.register_buffer(
             "packed_o", reference.o_proj.weight.detach().reshape(16, 64, 32, 64).permute(0, 2, 1, 3).contiguous()

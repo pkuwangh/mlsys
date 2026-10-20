@@ -34,6 +34,13 @@ class TalkerConfig:
         return cls(**{field.name: data[field.name] for field in fields(cls)})
 
 
+def rms_norm(x, weight, eps):
+    """Upstream rounding: FP32 normalization, cast to input dtype, then scale."""
+    xf = x.float()
+    normalized = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
+    return normalized.to(x.dtype) * weight
+
+
 class RMSNorm(nn.Module):
     """Normalize in FP32, round, then multiply by the BF16 weight."""
 
@@ -43,9 +50,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x):
-        xf = x.float()
-        normalized = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
-        return normalized.to(x.dtype) * self.weight
+        return rms_norm(x, self.weight, self.eps)
 
 
 class TorchPostAttention(nn.Module):
@@ -76,8 +81,7 @@ class TorchPostAttention(nn.Module):
 def post_attention(attention, residual, wo, gamma, gate, up, down, eps):
     """Upstream BF16 boundaries, with explicit weights for rotating-weight timing."""
     residual = F.linear(attention, wo) + residual
-    rf = residual.float()
-    normalized = (rf * torch.rsqrt(rf.square().mean(-1, keepdim=True) + eps)).to(residual.dtype) * gamma
+    normalized = rms_norm(residual, gamma, eps)
     activated = F.silu(F.linear(normalized, gate)) * F.linear(normalized, up)
     return F.linear(activated, down) + residual
 
@@ -97,14 +101,17 @@ class TalkerAttention(nn.Module):
 
     def forward(self, x, cache, positions, cos, sin, mask):
         b, t, _ = x.shape
-        h = self.config.head_dim
-        q = self.q_norm(self.q_proj(x).view(b, t, -1, h)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(x).view(b, t, -1, h)).transpose(1, 2)
-        v = self.v_proj(x).view(b, t, -1, h).transpose(1, 2)
-        qrot = torch.cat((-q[..., h // 2 :], q[..., : h // 2]), dim=-1)
-        krot = torch.cat((-k[..., h // 2 :], k[..., : h // 2]), dim=-1)
-        q = q * cos + qrot * sin
-        k = k * cos + krot * sin
+        q, k, v = project_qkv(
+            x,
+            self.q_proj.weight,
+            self.k_proj.weight,
+            self.v_proj.weight,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos,
+            sin,
+            self.config.rms_norm_eps,
+        )
         cache[0].index_copy_(2, positions, k)
         cache[1].index_copy_(2, positions, v)
         out = F.scaled_dot_product_attention(q, cache[0], cache[1], attn_mask=mask, enable_gqa=True)
@@ -125,23 +132,29 @@ class TalkerLayer(nn.Module):
         return self.post_attention(attention, x)
 
 
-def prepare_qkv(x, gamma, wq, wk, wv, qgamma, kgamma, cos, sin, eps):
-    """Input RMSNorm, QKV projections, Q/K RMSNorm, and RoPE."""
+def apply_rope(x, cos, sin):
+    """Keep the two BF16 products rounded separately before adding."""
+    half = x.shape[-1] // 2
+    rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+    return x * cos + rotated * sin
+
+
+def project_qkv(x, wq, wk, wv, qgamma, kgamma, cos, sin, eps):
+    """Project normalized inputs, normalize Q/K heads, and apply RoPE."""
     b, t, _ = x.shape
     h = qgamma.numel()
-    xf = x.float()
-    normalized = (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)).to(x.dtype) * gamma
-    q = F.linear(normalized, wq).view(b, t, -1, h)
-    k = F.linear(normalized, wk).view(b, t, -1, h)
-    v = F.linear(normalized, wv).view(b, t, -1, h).transpose(1, 2)
-    qf, kf = q.float(), k.float()
-    q = ((qf * torch.rsqrt(qf.square().mean(-1, keepdim=True) + eps)).to(x.dtype) * qgamma).transpose(1, 2)
-    k = ((kf * torch.rsqrt(kf.square().mean(-1, keepdim=True) + eps)).to(x.dtype) * kgamma).transpose(1, 2)
-    qrot = torch.cat((-q[..., h // 2 :], q[..., : h // 2]), dim=-1)
-    krot = torch.cat((-k[..., h // 2 :], k[..., : h // 2]), dim=-1)
-    q = q * cos + qrot * sin
-    k = k * cos + krot * sin
+    q = F.linear(x, wq).view(b, t, -1, h)
+    k = F.linear(x, wk).view(b, t, -1, h)
+    v = F.linear(x, wv).view(b, t, -1, h).transpose(1, 2)
+    q = rms_norm(q, qgamma, eps).transpose(1, 2)
+    k = rms_norm(k, kgamma, eps).transpose(1, 2)
+    q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
     return q, k, v
+
+
+def prepare_qkv(x, gamma, wq, wk, wv, qgamma, kgamma, cos, sin, eps):
+    """Input RMSNorm followed by QKV projections, head norms, and RoPE."""
+    return project_qkv(rms_norm(x, gamma, eps), wq, wk, wv, qgamma, kgamma, cos, sin, eps)
 
 
 def pre_attention(x, gamma, wq, wk, wv, qgamma, kgamma, cos, sin, cache, positions, eps):

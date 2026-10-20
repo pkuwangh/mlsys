@@ -55,6 +55,9 @@ exercise cache writes and workspace reuse.
 
 H200 checks reported clean memcheck/racecheck for pre/post blocks, including
 non-bucket batches and changed-input graph replays.
+The reference cleanup was also checked with the full 28-layer checkpoint:
+before/after logits and KV caches match bitwise for eager prefill/decode at
+B1/16/17/32 and compiled Torch/fused graph replay at B16/32.
 
 **Strict full-backbone pointwise validation still fails**, including for compiled
 Torch. Preserving BF16 boundaries does not preserve FP32 reduction order, and
