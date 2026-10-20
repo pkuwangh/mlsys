@@ -125,6 +125,33 @@ class TalkerLayer(nn.Module):
         return self.post_attention(attention, x)
 
 
+def prepare_qkv(x, gamma, wq, wk, wv, qgamma, kgamma, cos, sin, eps):
+    """Input RMSNorm, QKV projections, Q/K RMSNorm, and RoPE."""
+    b, t, _ = x.shape
+    h = qgamma.numel()
+    xf = x.float()
+    normalized = (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)).to(x.dtype) * gamma
+    q = F.linear(normalized, wq).view(b, t, -1, h)
+    k = F.linear(normalized, wk).view(b, t, -1, h)
+    v = F.linear(normalized, wv).view(b, t, -1, h).transpose(1, 2)
+    qf, kf = q.float(), k.float()
+    q = ((qf * torch.rsqrt(qf.square().mean(-1, keepdim=True) + eps)).to(x.dtype) * qgamma).transpose(1, 2)
+    k = ((kf * torch.rsqrt(kf.square().mean(-1, keepdim=True) + eps)).to(x.dtype) * kgamma).transpose(1, 2)
+    qrot = torch.cat((-q[..., h // 2 :], q[..., : h // 2]), dim=-1)
+    krot = torch.cat((-k[..., h // 2 :], k[..., : h // 2]), dim=-1)
+    q = q * cos + qrot * sin
+    k = k * cos + krot * sin
+    return q, k, v
+
+
+def pre_attention(x, gamma, wq, wk, wv, qgamma, kgamma, cos, sin, cache, positions, eps):
+    """Prepare QKV and write the current cache slots."""
+    q, k, v = prepare_qkv(x, gamma, wq, wk, wv, qgamma, kgamma, cos, sin, eps)
+    cache[0].index_copy_(2, positions, k)
+    cache[1].index_copy_(2, positions, v)
+    return q
+
+
 class TorchQwen3TTSTalker(nn.Module):
     """All talker layers, final norm, and codec head; no generation framework."""
 

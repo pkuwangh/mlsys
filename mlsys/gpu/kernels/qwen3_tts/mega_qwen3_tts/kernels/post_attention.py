@@ -788,7 +788,7 @@ def print_summary(results, layers):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--batch-size", type=int, nargs="+", default=[16, 32], help="Decode batches")
-    parser.add_argument("--layers", type=int, default=1, help="Distinct weight sets to rotate through")
+    parser.add_argument("--layers", type=int, default=28, help="Distinct weight sets to rotate through")
     parser.add_argument("--profile", action="store_true", help="Capture named CUDA-graph replays")
     parser.add_argument("--trace-only", action="store_true", help="Launch only one custom block per batch for IKET")
     args = parser.parse_args()

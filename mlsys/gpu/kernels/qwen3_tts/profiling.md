@@ -592,6 +592,106 @@ Artifacts directly under `tmp/`:
 - Racecheck: `sglang_qwen_norm_sanitize_20261020_001254_146677.log`.
 - Memcheck: `sglang_qwen_norm_sanitize_20261020_001353_732512.log`.
 
+## Earlier Activation Loading
+
+H200 `viking-prod-214`, B16, 28 rotating weight sets. Median us/block from
+three interleaved rounds:
+
+| Experiment | Paired control | Candidate |
+| --- | ---: | ---: |
+| Stage both activation tiles early with vector loads/stores | 11.560 | 12.350 |
+| Early 16-byte `cp.async` with mbarrier completion | 11.560 | 11.632 |
+| Early activation TMA alongside weight TMA | 11.627 | 11.669 |
+| Activation TMA, parallel epoch update, inactive resets at the tail | 11.595 | 11.643 |
+
+The TMA experiment views the contiguous `[B,2048]` activation as
+`[32,B,64]` with strides `[64,2048,1]`. A `(4,N,64)` box lands directly in
+the K256 swizzled operand layout; no extra packing kernel is required.
+Its bytes and the weight bytes contribute to the same stage barrier.
+
+All four B16 variants preserve outputs exactly, but none improves the full
+block. The committed post-attention schedule remains unchanged. Logs:
+
+- `tmp/sglang_qwen_variant_ab_20261020_003344_527715.log`
+- `tmp/sglang_qwen_variant_ab_20261020_003815_489576.log`
+- `tmp/sglang_qwen_variant_ab_20261020_004725_649484.log`
+
+## QKV Preparation
+
+The new block covers input RMSNorm through the KV-cache write; attention
+itself is still Torch SDPA. Its 128 CTAs form 32 independent four-CTA
+clusters, with no global producer/consumer dependency.
+
+The initial IKET capture exposed two costs worth addressing:
+
+- Per-element `st.async` partial publication was slower than staging a
+  contiguous partial tile and bulk-copying it to the reducer.
+- Eight norm warps each processed two/four rows at B16/B32. Sixteen warps
+  process one/two rows, while the WGMMA group remains warps 4-7.
+
+Only ranks 1-3 issue the remote bulk copy. Memcheck caught the invalid
+self-destination case in the first prototype; rank 0 now writes directly
+into its local reduction buffer, and the barrier expects three transfers.
+The extra SMEM is one local FP32 partial tile (4/8 KiB for N16/N32).
+
+SASS also exposed BF16 FMA contraction in RoPE despite explicit casts.
+`--fmad=false` restores upstream's separately rounded products. An isolated
+RoPE test now requires bitwise agreement, rather than hiding this behind
+the GEMM tolerance. Packed RoPE shuffles were tested but not retained:
+the B16 improvement was negligible and B32 did not improve.
+
+Final validation and measurements:
+
+- Standalone, including the direct-slot-update compiled control:
+  `tmp/sglang_pre_attention_20261020_011410_740838.log`.
+- Memcheck B=1/8/16/17/32: `tmp/sglang_qwen_qkv_sanitize_20261020_010008_664356.log`.
+- Racecheck B=1/16/32: `tmp/sglang_qwen_qkv_sanitize_20261020_010117_176908.log`.
+- All checkpoint layers, actual inputs:
+  `tmp/sglang_qwen_qkv_checkpoint_20261020_010240_330214.log`.
+- Interleaved full-talker comparison:
+  `tmp/sglang_qwen_qkv_backbone_20261020_010443_149473.log`.
+- B16 Nsight comparison, with GPU metrics and graph nodes:
+  `tmp/qwen3_tts_0p6b_h200_b16_qkv_post_comparison.1.nsys-rep`.
+- Final IKET traces: `tmp/qwen3_tts_0p6b_h200_b{16,32}_pre_attention_iket.pftrace`,
+  with matching JSON/HTML.
+- SASS: `tmp/qwen3_tts_0p6b_h200_b{16,32}_pre_attention.sass`.
+  B16/B32 use 48/70 registers, zero local memory, and no spill loads/stores.
+  Input/gamma loads and normalized SMEM stores are 128-bit; Q/K/V stores are
+  64-bit. RoPE uses separate packed BF16 multiply/add instructions, not FMA.
+  The kernel has CTA fences, but no `MEMBAR.ALL.GPU`.
+
+The full-talker trace also exposes full-cache copies in the fully compiled
+Torch baseline. The standalone benchmark therefore reports a second control:
+compiled QKV arithmetic followed by direct in-place `index_copy_`, all inside
+the timed CUDA graph. This reduces the baseline from 30.14/39.69 us to
+22.57/22.88 us at B16/B32. Fused preparation measures 5.99/8.85 us in that
+same run. The full-talker baseline was not changed, so its speedup includes
+eliminating those cache copies.
+
+## Next: Decode Attention
+
+For each batch row and KV head, two Q heads consume the same K/V history.
+The sequence-split approach gives each CTA a history partition and computes
+local maximum, exponential sum, and unnormalized weighted-V sum. A cluster
+combines them by rescaling each partition to the largest maximum, summing
+the rescaled denominators/numerators, and dividing once. This avoids a
+global partial-result buffer and a second reduction launch.
+
+Choose the history split using batch size and context length: B16 already
+has 128 batch/KV-head groups, whereas B1 has only eight. Splitting a short
+history too finely can cost more in synchronization than it gains in
+parallelism. The B16 full-talker capture confirms a cuDNN SDPA grid of
+`(1,8,16)`, 128 threads/CTA, averaging 5.27 us per layer in the combined
+path. A separate mask-conversion kernel adds about 1 us per layer.
+There is room to specialize for decode, but insufficient CTA count alone
+does not explain this B16 case.
+
+The current QKV clusters own individual heads. Combining QKV and attention
+in one launch will require grouping the two Q heads with their K/V head
+and coordinating current-token readiness. Historical K/V loads can overlap
+projection, and current-token K/V can be published to both cache and
+consumer SMEM. That is a later kernel design, not implemented here.
+
 ## Remaining Opportunities
 
 The block still spends much more time waiting/staging than issuing tensor-core

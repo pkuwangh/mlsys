@@ -16,13 +16,17 @@ python mega_qwen3_tts/kernels/post_attention.py
 # Rotate 28 independent weight sets instead of keeping one block hot in L2.
 python mega_qwen3_tts/kernels/post_attention.py --layers 28
 
+# Input norm, QKV projection, head norms, RoPE, and cache writes.
+python mega_qwen3_tts/kernels/pre_attention.py
+
 # Full backbone; omit --model for deterministic random weights.
 python bench_qwen3_tts.py --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice
 ```
 
 Backbone defaults: BF16, B=16/32, 28 layers, 128 prefix tokens. The custom path uses
 compiled Torch for the remaining decode operations and eager Torch for prefill.
-`--no-fused` tests the Torch scaffold; `--layers 2` shortens development runs.
+`--no-fused` tests the Torch scaffold; `--no-fused-qkv` keeps only post-attention
+fusion; `--layers 2` shortens development runs.
 Inputs are synthetic embeddings even when real checkpoint weights are loaded.
 For captured inputs, add `--inputs /path/to/inputs.pt --batch-size 16`. The file
 contains `prefix` and `decode` embedding tensors shaped `[B,T,1024]`, generated
@@ -34,7 +38,39 @@ Compilation, allocation, weight packing, and cache initialization are excluded.
 The full-backbone timing overwrites one fixed KV slot at a fixed context length.
 `--profile` captures graph replays inside an NVTX range named `benchmark`.
 
-## Fused Block
+## Fused QKV Preparation
+
+`FusedPreAttention` replaces input RMSNorm, Q/K/V projections, Q/K head
+RMSNorm, RoPE, and the current KV-cache slot write in one launch. Torch SDPA
+still computes attention. Multi-token prefill uses the original Torch path.
+
+There are 32 four-CTA clusters: one per Q/K/V head (16 Q, 8 K, 8 V).
+Within a cluster, ranks 0/1 project channels 0-63 and ranks 2/3 project
+channels 64-127; each pair splits the 1024-channel input reduction into
+two K512 halves. Each CTA issues an M64 x N16/32 x K512 WGMMA sequence.
+
+| Phase | Work |
+| --- | --- |
+| Startup | Thread 0 starts the 64-KiB weight TMA; all 16 warps normalize input rows and stage this CTA's K512 slice |
+| Projection | Warps 4-7 issue WGMMA and write FP32 partials to SMEM |
+| Reduction | Ranks 1-3 bulk-copy their partials to rank 0's SMEM; rank 0 writes its own partials locally |
+| Epilogue | Rank 0's 16 warps sum the two K partitions, apply Q/K RMSNorm and RoPE, and write Q or the KV-cache slot |
+
+A transaction barrier counts only the three remote copies. No global scratch,
+Lamport polling, or cooperative grid launch is needed for this block.
+Input norm is deliberately recomputed per CTA to avoid a global handoff.
+
+Supported: Hopper, BF16, B=1..32, the 0.6B dimensions, one shared decode
+position across the batch, and contiguous cache `[2,B,8,capacity,128]`.
+RoPE uses the same position on all three axes, matching ordinary TTS decoding.
+Weights are packed once and must remain unchanged.
+
+FP32 GEMM/reduction order can differ from Torch, but BF16 boundaries are
+preserved. In particular, `--fmad=false` prevents RoPE's separately rounded
+products from contracting into BF16 FMA. The standalone check isolates RoPE
+and requires exact agreement there, independently of GEMM differences.
+
+## Fused Post-Attention
 
 `FusedPostAttention` replaces the whole post-attention sequence in one launch:
 
@@ -93,6 +129,11 @@ dimensions, training, and non-Hopper GPUs are not supported by this kernel.
 The initial implementation was tested on H100; these optimizations were tested
 on H200:
 
+- QKV preparation passes random/non-unit-gamma and zero-input checks, changed
+  inputs/positions under graph replay, and all 28 checkpoint layers on three
+  actual decode inputs at B16/B32. The latter has relative L2 error 0.0095%.
+  Memcheck is clean at B=1/8/16/17/32; racecheck is clean at B=1/16/32.
+  These are layer-local checks, not whole-model quality validation.
 - Two-layer reference matches upstream decoder-layer code exactly, including
   prefill and three decode steps with real checkpoint weights and KV caches.
 - Fused block passes random inputs, non-unit gamma, zero inputs, changed inputs
@@ -126,6 +167,40 @@ validated end-to-end speedup. Real-request replay and generation-quality checks
 remain necessary before integrating this kernel into a serving engine.
 
 ## Performance
+
+QKV preparation on H200 (`viking-prod-214`), BF16, 28 rotating weight sets,
+interleaved CUDA-graph timing:
+
+| Batch | Eager Torch | Compiled full | Compiled slots | Fused QKV | Speedup vs slots |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 77.47 us | 30.14 us | 22.57 us | 5.99 us | 3.77x |
+| 32 | 79.93 us | 39.69 us | 22.88 us | 8.85 us | 2.59x |
+
+The timings include both normalization stages, QKV projection, RoPE, and
+cache writes, but exclude SDPA and weight packing.
+Full compilation introduces full-cache copies when functionalizing
+`index_copy_`. The **compiled slots** control compiles the arithmetic and
+uses direct in-place Torch slot updates. Both run inside CUDA graphs, so
+Python dispatch overhead is excluded.
+
+Full-talker comparison on the same H200, using real weights and one repeated
+prompt: a 23-token prefix plus 32 captured decode inputs. Median of three interleaved rounds,
+timing the last decode step:
+
+| Batch | Compiled Torch | Post-attention fusion only | QKV + post-attention fusion |
+| --- | ---: | ---: | ---: |
+| 16 | 1.728 ms | 1.327 ms | 0.686 ms |
+| 32 | 1.995 ms | 1.643 ms | 0.972 ms |
+
+These are **diagnostic timings**, not validated generation speedups. The
+combined path has 100% top-token agreement on this teacher-forced replay,
+with mean/worst-step relative L2 logit error 0.921%/2.395%. Strict pointwise
+checks still fail, as they do for compiled Torch. B32 duplicates the B16
+inputs. Prefill logits and caches remain bitwise identical to eager.
+The full-talker Torch baseline still includes the cache copies above; part
+of the end-to-end gain comes from eliminating them, not just faster GEMMs.
+
+Post-attention optimization history follows.
 
 H200 (`s4124-0042`), BF16, 28 rotating weight sets (616 MiB), interleaved
 CUDA-graph timing without profiling. Median of three measurement rounds;

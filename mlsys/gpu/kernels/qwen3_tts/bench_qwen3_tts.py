@@ -24,7 +24,7 @@ def run(args):
     reference = TorchQwen3TTSTalker(config).to(device="cuda", dtype=torch.bfloat16).eval()
     if args.model:
         reference.load_checkpoint(args.model)
-    custom = MegaQwen3TTSTalker(reference, fused=args.fused).eval()
+    custom = MegaQwen3TTSTalker(reference, fused=args.fused, fused_qkv=args.fused_qkv).eval()
     if args.compile:
         custom = torch.compile(custom, options={"emulate_precision_casts": True})
     compiled = (
@@ -34,7 +34,10 @@ def run(args):
     context = replay["prefix"].shape[1] if replay else args.context
     steps = replay["decode"].shape[1] if replay else 3
     print(f"{torch.cuda.get_device_name()} | BF16 | layers={config.num_hidden_layers} | context={context}")
-    print(f"Weights: {args.model or 'deterministic random'} | Custom: {'fused' if args.fused else 'Torch scaffold'}")
+    custom_name = "QKV + post-attention" if args.fused_qkv else "post-attention only"
+    print(
+        f"Weights: {args.model or 'deterministic random'} | Custom: {custom_name if args.fused else 'Torch scaffold'}"
+    )
     print(f"Inputs: {args.inputs or 'deterministic random embeddings'}")
     passed = True
     for batch in args.batch_size:
@@ -93,8 +96,12 @@ def main():
     parser.add_argument("--context", type=int, default=128, help="Prefill token count")
     parser.add_argument("--layers", type=int, help="Override layer count for a short development run")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True, help="Compile Torch baseline")
+    parser.add_argument("--fused", action=argparse.BooleanOptionalAction, default=True, help="Use custom decode blocks")
     parser.add_argument(
-        "--fused", action=argparse.BooleanOptionalAction, default=True, help="Replace the full post-attention block"
+        "--fused-qkv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fuse QKV preparation as well; --no-fused-qkv isolates post-attention",
     )
     parser.add_argument("--profile", action="store_true", help="Emit a CUDA-profiler capture range after timing")
     args = parser.parse_args()
