@@ -63,11 +63,20 @@ registers before reducing the norm statistics. N32 prefetches its second weight
 tile during SiLU processing. Extra weight storage aliases the output/down
 operand buffers.
 
-Normalized inputs remain in WGMMA layout. Split-K partials and gate/up epilogues
-use different shared-memory swizzles to suit their different read patterns.
-Epoch-tagged GPU release/acquire flags connect the cluster groups. Each instance
-owns its workspace, which must not be used concurrently on different streams.
-The cooperative launch is required for cross-cluster forward progress.
+Normalized inputs remain in WGMMA layout. Split-K partials are pushed into each
+reducer's SMEM mailbox with `st.async`; a transaction barrier signals completion.
+Gate/up epilogues use a separate swizzled layout. At N16 their storage cannot
+alias the incoming down-projection mailbox: peers can reach that phase earlier.
+
+Both residuals and gate/up activations use packed BF16 sentinel polling:
+consumers use the words they polled, without a separate flag or release fence.
+Normalization computes statistics locally from those residuals, preserving the
+reduction tree. Early consumer CTAs first poll one word with one thread to limit
+traffic, then validate every payload word. Two slots per payload alternate
+between calls; each call clears the inactive slots for the next one.
+Live negative zero is canonicalized to positive zero to reserve the sentinel.
+Each instance owns its workspace, which must not be used concurrently on
+different streams. The cooperative launch ensures cross-cluster forward progress.
 
 Supported: SM90, BF16, B=1..32, hidden=1024, attention width=2048, FFN=3072,
 no projection biases. B<=16 uses an N16 MMA bucket; larger batches use N32.
@@ -127,8 +136,27 @@ Follow-up on H200 (`viking-prod-260`), with the same interleaved protocol:
 | 16 | 27.11 us | 16.24 us | 14.64 us | 1.85x |
 | 32 | 27.81 us | 19.49 us | 19.54 us | 1.42x |
 
-B16 latency falls another 9.9%; B32 is effectively unchanged. The CTA roles,
-math, and cross-CTA publication protocol are unchanged.
+B16 latency falls another 9.9%; B32 is effectively unchanged. That prefetch
+change preserved the CTA roles, math, and cross-CTA publication protocol.
+
+The subsequent mailbox/sentinel handoff change, measured on the same H200:
+
+| Batch | Compiled Torch | `9465e8b` | Current | Latency reduction |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 27.14 us | 14.59 us | 13.50 us | 7.5% |
+| 32 | 27.76 us | 19.53 us | 18.38 us | 5.9% |
+
+These timings include the inactive activation-slot reset on every invocation.
+
+Converting the remaining residual handoff to sentinel polling gives a small
+additional improvement in a fresh interleaved A/B run:
+
+| Batch | Compiled Torch | Before | Both handoffs sentinel-based |
+| --- | ---: | ---: | ---: |
+| 16 | 27.12 us | 13.48 us | 13.31 us |
+| 32 | 27.76 us | 18.27 us | 18.08 us |
+
+These include both inactive-slot resets and local norm-statistics computation.
 
 Real-checkpoint full-talker replay, 23-token prefix plus 32 captured decode
 inputs, timing the last step at a fixed KV position:
