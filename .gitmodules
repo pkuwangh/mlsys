@@ -36,4 +36,4 @@
 	url = https://github.com/pkuwangh/flashinfer.git
 [submodule "mlsys/inference/sglang/sglang-omni"]
 	path = mlsys/inference/sglang/sglang-omni
-	url = https://github.com/sgl-project/sglang-omni.git
+	url = https://github.com/pkuwangh/sglang-omni.git

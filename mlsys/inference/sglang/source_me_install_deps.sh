@@ -48,7 +48,7 @@ nvcc --version || return 1
 splitLine
 
 # torch
-uv pip install "torch==2.13.0" "torchvision==0.28.0" --index-url https://download.pytorch.org/whl/cu132 || return 1
+uv pip install "torch==2.14.1" torchvision --index-url https://download.pytorch.org/whl/cu132 || return 1
 # Note: stable cu132 index https://download.pytorch.org/whl/cu132/torchaudio/ does not have 2.11.0 release
 # Installing from pypi does not guarantee the correct CUDA version is used.
 # So use the nightly-build index
