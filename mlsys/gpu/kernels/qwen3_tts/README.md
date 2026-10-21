@@ -1,6 +1,6 @@
 # Qwen3-TTS Talker and Code Predictor
 
-Standalone 0.6B components, benchmarked separately:
+Standalone 0.6B and 1.7B components, benchmarked separately:
 
 - **Talker:** prepared embeddings -> 28 transformer layers -> codec logits.
 - **Code predictor:** talker hidden state and first code -> 15 remaining codes
@@ -23,15 +23,21 @@ python mega_qwen3_tts/kernels/post_attention.py --layers 28
 # Input norm, QKV, head norms, RoPE, cache writes, and optional additive mask.
 python mega_qwen3_tts/kernels/pre_attention.py --write-mask
 
+# 1.7B talker shapes, without loading a checkpoint.
+python mega_qwen3_tts/kernels/pre_attention.py --hidden-size 2048 --write-mask
+python mega_qwen3_tts/kernels/post_attention.py --hidden-size 2048
+
 # Full backbone; omit --model for deterministic random weights.
 python bench_qwen3_tts_talker.py --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice
+python bench_qwen3_tts_talker.py --model /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice
 ```
 
 Backbone defaults: BF16, B=16/32, 28 layers, 128 prefix tokens. Multi-token
 prefill stays eager; custom decode uses fused QKV preparation, cuDNN attention
 through Torch SDPA, fused post-attention, and compiled remaining Torch operations.
 The specialization supports B=1..32, one shared decode position, and immutable
-weights. It does not support 1.7B dimensions or training. Architecture dispatch
+weights. The checkpoint config selects hidden/MLP widths 1024/3072 or 2048/6144;
+random weights default to 0.6B dimensions. Training is not supported. Architecture dispatch
 selects SM90, SM100, or SM103 automatically; device kernels are separate under
 `mega_qwen3_tts/kernels/sm90/` and `sm100/`.
 
@@ -65,8 +71,10 @@ python bench_qwen3_tts_predictor.py --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomV
 python mega_qwen3_tts/kernels/argmax_embedding.py
 ```
 
-The predictor has five layers with the same 1024/3072 widths and 16 Q / 8 KV
-heads as the talker. Each frame runs a two-token prefix followed by 14 single-token
+Both predictors have five layers with 1024/3072 widths and 16 Q / 8 KV
+heads, matching the 0.6B talker. The 1.7B predictor additionally projects its
+2048-wide input embeddings to 1024; that projection stays in Torch.
+Each frame runs a two-token prefix followed by 14 single-token
 steps, producing 15 codes with group-specific heads and embeddings. The custom
 path reuses both fused decode blocks; multi-token prefix operations remain Torch.
 Greedy argmax and embedding lookup use one custom kernel per code. Use
@@ -213,6 +221,41 @@ logits and KV caches, plus predictor codes and feedback, are bitwise identical
 at B16/32 on both GPUs. Pre/post memcheck and racecheck pass on both GPUs with
 changed-input/position graph replays. These checks establish preservation of the
 previous fused implementation, not equivalence to eager Torch or speech quality.
+
+### 1.7B Talker
+
+Real CustomVoice checkpoint, synthetic embeddings, 28 layers, B16/B32,
+128-token prefix and three teacher-forced decode steps. Unprofiled, interleaved
+CUDA graphs time the final fixed-position decode step:
+
+| GPU | Batch | Compiled Torch | Fused | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| H200 | 16 | 2.553 ms | 1.560 ms | 1.64x |
+| H200 | 32 | 3.164 ms | 2.097 ms | 1.51x |
+| B300 | 16 | 2.232 ms | 1.374 ms | 1.62x |
+| B300 | 32 | 2.406 ms | 1.883 ms | 1.28x |
+
+QKV is faster at both batches. The staged post-attention kernel beats compiled
+Torch at B16 but remains slower at B32, particularly on B300. The full-backbone
+compiled baseline still includes its cache-copy overhead; these speedups are
+not all attributable to faster arithmetic.
+
+Random-input standalone checks pass at the existing tolerances. On H200,
+isolated post-attention blocks using all 28 checkpoint layers' decode inputs
+exceed `atol=rtol=0.02` for 48/917,504 values at B16 and 76/1,835,008 at B32;
+relative-L2 errors are 0.061%/0.058%. FP64 projection reductions with the same
+BF16 boundaries also exceed that tolerance (65 and 113 values, respectively), consistent with
+rounding sensitivity rather than establishing eager Torch as an exact oracle.
+Checkpoint QKV checks pass. Full-talker logit relative-L2 differences are about
+0.9-1.2%, with top-token agreement of 93.8-100% on these synthetic inputs.
+Real-prompt generation and speech quality remain unvalidated.
+
+Memcheck passes on H200/B300 at B1/16/17/32 with changed-input/position graph
+replays. H200 racecheck passes; isolated B300 QKV racecheck passes, but the
+wide post-attention kernel stalls under B300 racecheck and that check remains
+inconclusive. Normal execution and memcheck complete. The 0.6B QKV specialization
+remains bitwise identical to `f6c13f3` at B16/B32 with unchanged measured latency;
+its post-attention device kernels were not modified.
 
 ## Profiling
 

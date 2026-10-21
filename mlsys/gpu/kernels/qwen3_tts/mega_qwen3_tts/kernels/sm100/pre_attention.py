@@ -27,15 +27,20 @@ def pre_attention_kernel(
     N: cutlass.Constexpr,
     CAPACITY: cutlass.Constexpr,
     EPS: cutlass.Constexpr,
+    H: cutlass.Constexpr,
 ):
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     head, rank = bid // 4, bid % 4
     split = rank % 2
-    weights = cutlass.Array(cutlass.BFloat16, 32768, space=cutlass.AddressSpace.smem, alignment=1024)
-    normalized = cutlass.Array(cutlass.BFloat16, N * 512, space=cutlass.AddressSpace.smem, alignment=1024)
+    weights = cutlass.Array(cutlass.BFloat16, 64 * (H // 2), space=cutlass.AddressSpace.smem, alignment=1024)
+    normalized = cutlass.Array(cutlass.BFloat16, N * (H // 2), space=cutlass.AddressSpace.smem, alignment=1024)
     partials = cutlass.Array(cutlass.Float32, 4 * N * 64, space=cutlass.AddressSpace.smem, alignment=128)
-    local_partial = cutlass.Array(cutlass.Float32, N * 64, space=cutlass.AddressSpace.smem, alignment=128)
+    if cutlass.const_expr(H == 2048):
+        # Only rank 0 receives remote partials; senders can stage in their own mailbox.
+        local_partial = partials
+    else:
+        local_partial = cutlass.Array(cutlass.Float32, N * 64, space=cutlass.AddressSpace.smem, alignment=128)
     bars = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
     mma_done = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     tmem_address = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem)
@@ -51,9 +56,9 @@ def pre_attention_kernel(
             p.mbarrier_init(bars.subview(1), 1)
             p.mbarrier_arrive_expect_tx(bars.subview(1), 3 * N * 64 * 4)
         p.fence_mbarrier_init()
-        p.mbarrier_arrive_expect_tx(bars, 65536)
+        p.mbarrier_arrive_expect_tx(bars, 64 * H)
         p.cp_async_bulk_tensor_shared_cluster_global(
-            weights, weight_map.get_ptr(), [0, 0, split * 8, head * 2 + rank // 2], bars, []
+            weights, weight_map.get_ptr(), [0, 0, split * (H // 128), head * 2 + rank // 2], bars, []
         )
         iket.range_pop()
 
@@ -61,18 +66,18 @@ def pre_attention_kernel(
     lane, warp = tid % 32, tid // 32
     for token in cutlass.range_constexpr(N // 16):
         row = warp + token * 16
-        values = cute.make_rmem_tensor((8, 4), cutlass.BFloat16)
-        scales = cute.make_rmem_tensor((8, 4), cutlass.BFloat16)
-        for group in cutlass.range_constexpr(4):
+        values = cute.make_rmem_tensor((8, H // 256), cutlass.BFloat16)
+        scales = cute.make_rmem_tensor((8, H // 256), cutlass.BFloat16)
+        for group in cutlass.range_constexpr(H // 256):
             col = lane * 8 + group * 256
             val = cutlass.full((8,), 0, cutlass.BFloat16)
             if row < B:
-                val = (x.iterator.raw_ptr() + row * 1024 + col).load(count=8, alignment=16)
+                val = (x.iterator.raw_ptr() + row * H + col).load(count=8, alignment=16)
             scale = (gamma.iterator.raw_ptr() + col).load(count=8, alignment=16)
             for i in cutlass.range_constexpr(8):
                 values[i, group], scales[i, group] = val[i], scale[i]
         total = cutlass.Float32(0)
-        for group in cutlass.range_constexpr(4):
+        for group in cutlass.range_constexpr(H // 256):
             v = values[None, group].load().to_vector().to(cutlass.Float32)
             squares = v * v
             total += ((squares[0] + squares[1]) + (squares[2] + squares[3])) + (
@@ -80,10 +85,10 @@ def pre_attention_kernel(
             )
         for shift in cutlass.range_constexpr(5):
             total += cute.arch.shuffle_sync_bfly(total, 1 << shift)
-        inverse = cute.math.rsqrt(total / 1024 + EPS)
-        for group in cutlass.range_constexpr(4):
-            if group // 2 == split:
-                col = lane * 8 + (group % 2) * 256
+        inverse = cute.math.rsqrt(total / H + EPS)
+        for group in cutlass.range_constexpr(H // 256):
+            if group // (H // 512) == split:
+                col = lane * 8 + (group % (H // 512)) * 256
                 v = values[None, group].load().to_vector().to(cutlass.Float32)
                 norm_scale = scales[None, group].load().to_vector().to(cutlass.Float32)
                 norm_result = ((v * inverse).to(cutlass.BFloat16).to(cutlass.Float32) * norm_scale).to(cutlass.BFloat16)
@@ -107,7 +112,7 @@ def pre_attention_kernel(
             da_base = descriptor(weights)
             db_base = descriptor(normalized)
             # Advance the encoded 16-byte address instead of rebuilding each descriptor.
-            for slab in cutlass.range_constexpr(8):
+            for slab in cutlass.range_constexpr(H // 128):
                 da = da_base + slab * 512
                 db = db_base + slab * N * 8
                 for k in cutlass.range_constexpr(4):
@@ -213,10 +218,11 @@ def pre_attention_host(
     N: cutlass.Constexpr,
     CAPACITY: cutlass.Constexpr,
     EPS: cutlass.Constexpr,
+    H: cutlass.Constexpr,
 ):
     weight_map = tensor_map.create_tensor_map_tiled_from_view(
-        weights, (1, 8, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
+        weights, (1, H // 128, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
     )
     pre_attention_kernel(
-        x, gamma, weight_map, qgamma, kgamma, cos, sin, positions, kv, q, mask, B, N, CAPACITY, EPS
+        x, gamma, weight_map, qgamma, kgamma, cos, sin, positions, kv, q, mask, B, N, CAPACITY, EPS, H
     ).launch(grid=(128, 1, 1), block=(512, 1, 1), cluster=(4, 1, 1), stream=stream)

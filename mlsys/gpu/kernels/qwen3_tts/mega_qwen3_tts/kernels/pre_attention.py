@@ -1,6 +1,6 @@
 """Fused input RMSNorm, QKV projection, Q/K RMSNorm, RoPE, and KV-cache update.
 
-Hopper/Blackwell BF16 decode, B<=32, hidden=1024, 16 Q heads, 8 KV heads, head_dim=128.
+Hopper/Blackwell BF16 decode, B<=32, hidden=1024/2048, 16 Q heads, 8 KV heads, head_dim=128.
 Each four-CTA cluster projects one head: two channel halves, each with two
 K partitions. Rank 0 gathers the partials and performs the head-local epilogue.
 An optional additive-mask output eliminates SDPA's boolean-mask conversion.
@@ -26,7 +26,7 @@ from mega_qwen3_tts.kernels._utils import device_arch, measure, report_error
 
 
 @cache
-def compile_kernel(batch, bucket, capacity, eps, write_mask, arch):
+def compile_kernel(batch, bucket, capacity, eps, write_mask, arch, hidden=1024):
     """Specialize the decode bucket and contiguous KV-cache strides."""
     if arch == "sm_90a":
         from mega_qwen3_tts.kernels.sm90.pre_attention import pre_attention_host
@@ -38,9 +38,9 @@ def compile_kernel(batch, bucket, capacity, eps, write_mask, arch):
 
     return cute.compile(
         pre_attention_host,
-        fake(cutlass.BFloat16, batch, 1024),
-        fake(cutlass.BFloat16, 1024),
-        fake(cutlass.BFloat16, 64, 16, 64, 64),
+        fake(cutlass.BFloat16, batch, hidden),
+        fake(cutlass.BFloat16, hidden),
+        fake(cutlass.BFloat16, 64, hidden // 64, 64, 64),
         fake(cutlass.BFloat16, 128),
         fake(cutlass.BFloat16, 128),
         fake(cutlass.BFloat16, 128),
@@ -54,6 +54,7 @@ def compile_kernel(batch, bucket, capacity, eps, write_mask, arch):
         bucket,
         capacity,
         eps,
+        hidden,
         # Preserve the BF16 multiply rounding before the RoPE add.
         options=f"--enable-tvm-ffi --gpu-arch={arch} --ptxas-options=--fmad=false",
     )
@@ -65,22 +66,27 @@ class FusedPreAttention(nn.Module):
     def __init__(self, norm, attention):
         super().__init__()
         c = attention.config
-        if (c.hidden_size, c.num_attention_heads, c.num_key_value_heads, c.head_dim) != (1024, 16, 8, 128):
-            raise ValueError("Fused QKV supports the 0.6B talker's 1024/16/8/128 dimensions")
+        if c.hidden_size not in (1024, 2048) or (c.num_attention_heads, c.num_key_value_heads, c.head_dim) != (
+            16,
+            8,
+            128,
+        ):
+            raise ValueError("Fused QKV supports hidden=1024/2048, Q=16, KV=8, head_dim=128")
         if norm.weight.dtype != torch.bfloat16 or not norm.weight.is_cuda:
             raise ValueError("Fused QKV requires CUDA BF16 weights")
         self.arch = device_arch(norm.weight.device)
+        self.hidden = c.hidden_size
         self.norm, self.attention = norm, attention
         weights = torch.cat((attention.q_proj.weight, attention.k_proj.weight, attention.v_proj.weight))
         self.register_buffer(
-            "packed_weights", weights.detach().reshape(64, 64, 16, 64).permute(0, 2, 1, 3).contiguous()
+            "packed_weights", weights.detach().reshape(64, 64, self.hidden // 64, 64).permute(0, 2, 1, 3).contiguous()
         )
 
     @torch.compiler.disable
     def forward(self, x, kv, positions, cos, sin, mask=None):
         """Write Q/K/V and, when supplied, a BF16 additive mask of shape [1, capacity]."""
         batch = x.shape[0]
-        if x.shape != (batch, 1, 1024) or not 1 <= batch <= 32:
+        if x.shape != (batch, 1, self.hidden) or not 1 <= batch <= 32:
             raise ValueError("Fused QKV supports one-token decode with 1 <= B <= 32")
         if not kv.is_contiguous() or kv.shape[:3] != (2, batch, 8) or kv.shape[-1] != 128:
             raise ValueError("Expected contiguous KV cache [2,B,8,capacity,128]")
@@ -90,8 +96,10 @@ class FusedPreAttention(nn.Module):
         ):
             raise ValueError("Expected contiguous additive mask [1,capacity] matching the input dtype/device")
         q = torch.empty((batch, 16, 1, 128), device=x.device, dtype=x.dtype)
-        compile_kernel(batch, 16 if batch <= 16 else 32, capacity, self.norm.eps, mask is not None, self.arch)(
-            x.reshape(batch, 1024),
+        compile_kernel(
+            batch, 16 if batch <= 16 else 32, capacity, self.norm.eps, mask is not None, self.arch, self.hidden
+        )(
+            x.reshape(batch, self.hidden),
             self.norm.weight,
             self.packed_weights,
             self.attention.q_norm.weight,
@@ -126,14 +134,14 @@ def reference_args(layer, cos, sin, kv, positions):
 
 
 @torch.inference_mode()
-def trace_once(batch, capacity, write_mask=False):
+def trace_once(batch, capacity, write_mask=False, hidden=1024):
     """Launch one custom preparation block for IKET."""
     from qwen3_tts_reference import TalkerConfig, TalkerLayer
 
     torch.manual_seed(42)
-    ref = TalkerLayer(TalkerConfig()).cuda().bfloat16().eval()
+    ref = TalkerLayer(TalkerConfig(hidden_size=hidden, intermediate_size=3 * hidden)).cuda().bfloat16().eval()
     fused = FusedPreAttention(ref.input_layernorm, ref.self_attn)
-    x = torch.randn(batch, 1, 1024, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(batch, 1, hidden, device="cuda", dtype=torch.bfloat16)
     kv = torch.zeros(2, batch, 8, capacity, 128, device="cuda", dtype=torch.bfloat16)
     position = torch.tensor([capacity - 1], device="cuda")
     cos = torch.ones(128, device="cuda", dtype=torch.bfloat16)
@@ -144,17 +152,20 @@ def trace_once(batch, capacity, write_mask=False):
 
 
 @torch.inference_mode()
-def benchmark(batch, layers, capacity, profile=False, write_mask=False):
+def benchmark(batch, layers, capacity, profile=False, write_mask=False, hidden=1024):
     """Compare complete preparation blocks with rotating weights and fixed cache position."""
     from qwen3_tts_reference import TalkerConfig, TalkerLayer, pre_attention, prepare_qkv
 
     torch.manual_seed(42)
-    refs = [TalkerLayer(TalkerConfig()).cuda().bfloat16().eval() for _ in range(layers)]
+    refs = [
+        TalkerLayer(TalkerConfig(hidden_size=hidden, intermediate_size=3 * hidden)).cuda().bfloat16().eval()
+        for _ in range(layers)
+    ]
     for ref in refs:
         for norm in (ref.input_layernorm, ref.self_attn.q_norm, ref.self_attn.k_norm):
             norm.weight.uniform_(0.5, 1.5)
     fused = [FusedPreAttention(ref.input_layernorm, ref.self_attn) for ref in refs]
-    x = torch.randn(batch, 1, 1024, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(batch, 1, hidden, device="cuda", dtype=torch.bfloat16)
     caches = [torch.randn(2, batch, 8, capacity, 128, device="cuda", dtype=torch.bfloat16) for _ in refs]
     custom_caches = [kv.clone() for kv in caches]
     compiled_caches = [kv.clone() for kv in caches]
@@ -238,6 +249,7 @@ def benchmark(batch, layers, capacity, profile=False, write_mask=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--batch-size", nargs="+", type=int, default=[16, 32])
+    parser.add_argument("--hidden-size", type=int, choices=(1024, 2048), default=1024)
     parser.add_argument("--layers", type=int, default=28, help="Distinct weight sets")
     parser.add_argument("--capacity", type=int, default=129, help="KV-cache capacity")
     parser.add_argument("--profile", action="store_true")
@@ -250,12 +262,15 @@ if __name__ == "__main__":
         parser.error("Expected positive layers/capacity and 1 <= batch size <= 32")
     if args.trace_only:
         for b in args.batch_size:
-            trace_once(b, args.capacity, args.write_mask)
+            trace_once(b, args.capacity, args.write_mask, args.hidden_size)
     else:
         results = [
-            (b, benchmark(b, args.layers, args.capacity, args.profile, args.write_mask)) for b in args.batch_size
+            (b, benchmark(b, args.layers, args.capacity, args.profile, args.write_mask, args.hidden_size))
+            for b in args.batch_size
         ]
-        print(f"\nBF16 | {args.layers} weight sets | median interleaved CUDA-graph timing per block")
+        print(
+            f"\nBF16 | hidden={args.hidden_size} | {args.layers} weight sets | median interleaved CUDA-graph timing per block"
+        )
         print("Compiled slots: compiled math + direct index_copy_ cache writes, all CUDA-graphed.")
         if args.write_mask:
             print("Fused additionally writes the SDPA additive mask; Torch baselines time QKV preparation only.")

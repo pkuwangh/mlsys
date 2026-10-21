@@ -6,11 +6,13 @@ status belong in [README.md](README.md).
 
 ## Scope and Boundaries
 
-Target: **0.6B talker, Hopper/Blackwell, BF16, TP1, single-token decode, B=1..32**.
-The backbone has 28 layers, hidden width 1024, 16 query heads, 8 KV heads,
-head dimension 128, and SwiGLU width 3072. Projections have no bias.
-The five-layer code predictor reuses these blocks and adds fused greedy selection.
-The 1.7B model, training, stochastic sampling, and vocoder are outside scope.
+Target: **0.6B/1.7B talker, Hopper/Blackwell, BF16, TP1, single-token decode, B=1..32**.
+Both backbones have 28 layers, 16 query heads, 8 KV heads, and head dimension 128.
+Hidden/SwiGLU widths are 1024/3072 for 0.6B and 2048/6144 for 1.7B.
+Projections have no bias. Both five-layer code predictors retain the 1024/3072
+blocks and add fused greedy selection. Training, stochastic sampling, and
+vocoder are outside scope. The detailed schedules below describe 0.6B unless
+noted otherwise.
 
 The default layer runs:
 
@@ -48,7 +50,7 @@ layouts, but uses `tcgen05` with 32 allocated TMEM columns per CTA. Warp 4
 allocates TMEM; one thread issues MMA and commits to a completion barrier.
 Warps 4-7 read the M64 accumulator with `tcgen05.ld.16x256b` into the reduction
 epilogue. TMEM is reused between projections and freed after all readers finish.
-Its schedule can evolve independently; the Hopper WGMMA implementation is unchanged.
+Its schedule can evolve independently of the Hopper WGMMA implementation.
 
 For a future library contribution:
 
@@ -253,6 +255,41 @@ rendezvous also protects DSMEM lifetimes before reuse or exit.
   H200 and B300 and removes a separate scheduling path.
 - Warp-local norm replaced repeated shared-memory handoffs. Preserving the old
   summation order cost latency; the retained order is not bitwise-equivalent.
+
+## 1.7B Specialization
+
+QKV retains the same 32 four-CTA clusters and head epilogue. Each rank now
+reduces K1024, with a 128-KiB weight tile. Input RMSNorm covers 2048 channels.
+Non-owner ranks stage their outgoing partials in their own mailbox allocation;
+only rank 0 receives remote partials. This keeps the N32 specialization within
+shared-memory capacity without changing head reduction or cache semantics.
+
+Post-attention uses separate `sm90/post_attention_wide.py` and
+`sm100/post_attention_wide.py` schedules; the 0.6B schedule is unchanged:
+
+| Phase | CTA assignment | Work per CTA |
+| --- | --- | --- |
+| Output projection + residual | CTAs 0-63 | Two M64 output tiles per cluster; each rank reduces K512 |
+| RMSNorm | All 96 CTAs | Full 2048-channel rows, normalized once and kept in SMEM |
+| Gate/up + SiLU | All 96 CTAs | Two tiles, each producing 32 activation channels; full K2048 |
+| Down projection + residual | CTAs 0-63 | Two M64 output tiles per cluster; each rank reduces K1536 |
+
+Output/down cluster `c` owns tiles `c` and `c+16`. Gate/up CTA `b` owns tiles
+`b` and `b+96`. Output/down still use four-way DSMEM reduce-scatter; residual
+and activation handoffs still use packed Lamport payloads. Cluster rendezvous
+prevents mailbox reuse before all readers finish a wave.
+
+Warps 0-3 stream weights and stage operands; warps 4-7 consume them through
+WGMMA or `tcgen05`. Two weight buffers use K512 stages at N16 and K256 at N32.
+Ready/free transaction barriers protect buffer reuse while TMA overlaps MMA.
+Output/down operands reuse normalization storage before norm and after both
+gate/up tiles finish. Gate/up weights no longer need to fit in SMEM in full.
+The launch remains a cooperative 96-CTA grid, not a 192-CTA grid that could
+leave producers unscheduled while consumers poll.
+
+The 1.7B predictor directly reuses the 0.6B transformer kernels. Its
+2048-to-1024 input projection remains in Torch; embedding feedback stays
+2048-wide. No projected-table substitution or rounding change is introduced.
 
 ## Attention Decision
 

@@ -1,4 +1,4 @@
-"""Compare the eager, compiled, and custom 0.6B talker on prepared embeddings.
+"""Compare the eager, compiled, and custom 0.6B/1.7B talker on prepared embeddings.
 
 Prefill builds identical KV caches. Timings replay one decode step at a fixed
 context length, excluding cache restoration, model loading, and compilation.
@@ -33,7 +33,9 @@ def run(args):
     replay = torch.load(args.inputs, map_location="cpu", weights_only=True) if args.inputs else None
     context = replay["prefix"].shape[1] if replay else args.context
     steps = replay["decode"].shape[1] if replay else 3
-    print(f"{torch.cuda.get_device_name()} | BF16 | layers={config.num_hidden_layers} | context={context}")
+    print(
+        f"{torch.cuda.get_device_name()} | BF16 | hidden={config.hidden_size} | layers={config.num_hidden_layers} | context={context}"
+    )
     custom_name = "QKV + post-attention" if args.fused_qkv else "post-attention only"
     print(f"Weights: {args.model or 'deterministic random'} | Fused: {custom_name}")
     print(f"Inputs: {args.inputs or 'deterministic random embeddings'}")
