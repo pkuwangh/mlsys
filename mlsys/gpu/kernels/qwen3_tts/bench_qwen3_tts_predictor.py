@@ -11,23 +11,8 @@ from functools import partial
 
 import torch
 from mega_qwen3_tts import MegaQwen3TTSPredictor
-from mega_qwen3_tts.kernels._utils import measure
+from mega_qwen3_tts.kernels._utils import measure, print_summary, report_difference
 from qwen3_tts_predictor_reference import PredictorConfig, TorchQwen3TTSPredictor
-
-
-def report_difference(name, actual, reference):
-    """Measure agreement with eager Torch without treating it as an exact-arithmetic oracle."""
-    if actual.shape != reference.shape:
-        raise ValueError(f"{name}: shape mismatch: {actual.shape} vs {reference.shape}")
-    if not torch.isfinite(actual).all() or not torch.isfinite(reference).all():
-        raise ValueError(f"{name}: non-finite values")
-    error = (actual.float() - reference.float()).abs()
-    relative_l2 = error.norm() / reference.float().norm().clamp_min(1e-12)
-    print(
-        f"{name}: max_abs={error.max().item():.6g} mean_abs={error.mean().item():.6g} "
-        f"relative_l2={relative_l2.item():.6g}",
-        flush=True,
-    )
 
 
 @torch.inference_mode()
@@ -38,7 +23,7 @@ def run(args):
     if args.model:
         reference.load_checkpoint(args.model)
     compiled = deepcopy(reference)
-    custom = MegaQwen3TTSPredictor(reference).eval()
+    custom = MegaQwen3TTSPredictor(reference, fused_selection=args.fused_selection).eval()
     options = {"emulate_precision_casts": True}
     # Compile one transformer pass, not 15 unrolled copies. Head weights are tensor
     # arguments so changing code groups does not specialize/recompile the graph.
@@ -60,7 +45,7 @@ def run(args):
             first_code = replay["first_code"][:batch].to(device="cuda", dtype=torch.int64).contiguous()
         else:
             hidden = torch.randn(batch, 1, config.talker_hidden_size, device="cuda", dtype=torch.bfloat16) * 0.1
-            first_code = torch.randint(config.vocab_size, (batch, 1), device="cuda")
+            first_code = torch.randint(config.talker_vocab_size, (batch, 1), device="cuda")
         caches = {name: model.make_cache(batch) for name, model in models.items()}
         expected_codes, expected_feedback, expected_logits = reference.generate_frame(
             hidden, first_code, caches["Torch"], return_logits=True
@@ -86,13 +71,7 @@ def run(args):
         rows.append((batch, timings))
         print(" | ".join(f"{name}={us / 1000:.3f} ms/frame" for name, us in timings.items()), flush=True)
 
-    print("\nBatch | Torch (ms) | Compiled (ms) | Fused (ms) | Compiled/Fused")
-    print("------+------------+---------------+------------+---------------")
-    for batch, times in rows:
-        print(
-            f"{batch:5} | {times['Torch'] / 1000:10.3f} | {times['Compiled'] / 1000:13.3f} | "
-            f"{times['Fused'] / 1000:10.3f} | {times['Compiled'] / times['Fused']:13.3f}x"
-        )
+    print_summary(rows, workload="frame")
 
 
 def main():
@@ -101,6 +80,12 @@ def main():
     parser.add_argument("--inputs", help="Replay .pt with hidden [B,1,D] and first_code [B,1] from the matching talker")
     parser.add_argument("--batch-size", nargs="+", type=int, default=[16, 32], help="Frame batches")
     parser.add_argument("--profile", action="store_true", help="Capture one full-frame graph replay per variant")
+    parser.add_argument(
+        "--fused-selection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fuse greedy selection and embedding lookup in the custom path",
+    )
     args = parser.parse_args()
     if args.inputs and not args.model:
         parser.error("--inputs requires the matching --model checkpoint")

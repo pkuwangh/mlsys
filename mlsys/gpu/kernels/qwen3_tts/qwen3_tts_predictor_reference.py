@@ -75,7 +75,9 @@ class TorchQwen3TTSPredictor(nn.Module):
             x = layer(x, cache[index], positions, cos, sin, mask)
         return F.linear(self.norm(x[:, -1:]), head_weight)
 
-    def generate_frame(self, hidden, first_code, cache, *, forced_codes=None, return_logits=False, step=None):
+    def generate_frame(
+        self, hidden, first_code, cache, *, forced_codes=None, return_logits=False, step=None, select=None
+    ):
         """Generate greedily, or replay fixed codes to compare logits without sampling divergence."""
         step = self if step is None else step
         first = self.first_embedding(first_code)
@@ -92,8 +94,11 @@ class TorchQwen3TTSPredictor(nn.Module):
                 self.rope_sin[:, :, start:end],
                 self.attention_masks[start:end],
             )
-            code = prediction.argmax(-1) if forced_codes is None else forced_codes[:, group : group + 1]
-            embedding = self.codec_embedding[group](code)
+            if forced_codes is None and select is not None:
+                code, embedding = select(prediction, self.codec_embedding[group].weight)
+            else:
+                code = prediction.argmax(-1) if forced_codes is None else forced_codes[:, group : group + 1]
+                embedding = self.codec_embedding[group](code)
             codes.append(code)
             feedback.append(embedding)
             if return_logits:

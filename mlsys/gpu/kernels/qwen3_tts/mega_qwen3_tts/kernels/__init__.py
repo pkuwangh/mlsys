@@ -1,1 +1,1 @@
-"""Runnable standalone kernels for the talker."""
+"""Runnable standalone kernels for the talker and code predictor."""

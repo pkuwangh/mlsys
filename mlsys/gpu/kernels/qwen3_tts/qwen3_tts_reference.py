@@ -174,10 +174,20 @@ class TorchQwen3TTSTalker(nn.Module):
         self.layers = nn.ModuleList(TalkerLayer(config) for _ in range(config.num_hidden_layers))
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.codec_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.register_buffer("rope", None, persistent=False)
+        self.register_buffer("key_positions", None, persistent=False)
 
     def make_cache(self, batch_size: int, capacity: int):
+        """Prepare position tables on the final device before allocating the KV cache."""
         parameter = self.codec_head.weight
         c = self.config
+        if self.key_positions is None or self.key_positions.numel() < capacity:
+            self.key_positions = torch.arange(capacity, device=parameter.device)
+            # Compute in FP32 even when the model weights were cast to BF16.
+            inv = 1.0 / c.rope_theta ** (torch.arange(0, c.head_dim, 2, device=parameter.device).float() / c.head_dim)
+            angles = self.key_positions.float()[:, None] * inv[None, :]
+            angles = torch.cat((angles, angles), dim=-1)
+            self.rope = torch.stack((angles.cos(), angles.sin())).to(parameter.dtype)
         return torch.zeros(
             c.num_hidden_layers,
             2,
@@ -189,16 +199,10 @@ class TorchQwen3TTSTalker(nn.Module):
             dtype=parameter.dtype,
         )
 
-    def forward(self, embeddings, cache, positions):
-        # Compute frequencies in FP32 even when model weights were cast to BF16.
-        inv = 1.0 / self.config.rope_theta ** (
-            torch.arange(0, self.config.head_dim, 2, device=embeddings.device).float() / self.config.head_dim
-        )
-        angles = positions.float()[:, None] * inv[None, :]
-        angles = torch.cat((angles, angles), dim=-1)
-        cos = angles.cos().to(embeddings.dtype)[None, None, :, :]
-        sin = angles.sin().to(embeddings.dtype)[None, None, :, :]
-        mask = torch.arange(cache.shape[-2], device=cache.device)[None, :] <= positions[:, None]
+    def forward(self, embeddings, cache, positions, *, build_mask=True):
+        rope = self.rope.index_select(1, positions)
+        cos, sin = rope[0][None, None], rope[1][None, None]
+        mask = self.key_positions[None, : cache.shape[-2]] <= positions[:, None] if build_mask else None
         x = embeddings
         for index, layer in enumerate(self.layers):
             x = layer(x, cache[index], positions, cos, sin, mask)

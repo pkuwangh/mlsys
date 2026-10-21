@@ -1,4 +1,4 @@
-# Qwen3-TTS Talker Fusion Design
+# Qwen3-TTS Talker and Predictor Fusion Design
 
 This document describes the implemented design and the decisions we retain.
 Update it when the implementation changes; commands, results, and validation
@@ -9,7 +9,8 @@ status belong in [README.md](README.md).
 Target: **0.6B talker, Hopper, BF16, TP1, single-token decode, B=1..32**.
 The backbone has 28 layers, hidden width 1024, 16 query heads, 8 KV heads,
 head dimension 128, and SwiGLU width 3072. Projections have no bias.
-The 1.7B model, training, code predictor, sampling, and vocoder are outside scope.
+The five-layer code predictor reuses these blocks and adds fused greedy selection.
+The 1.7B model, training, stochastic sampling, and vocoder are outside scope.
 
 The default layer runs:
 
@@ -23,6 +24,11 @@ Multi-token prefill stays in eager Torch. Decode uses custom blocks and compiles
 the remaining Torch operations. The caller owns a contiguous KV cache
 `[2,B,8,capacity,128]`; all batch rows share one decode position. Packed weights
 are prepared once and must remain unchanged.
+
+Talker cache setup precomputes FP32 RoPE sin/cos, then stores them in BF16.
+Each decode step gathers the current position. The fused path omits the boolean
+mask because QKV preparation writes the additive mask; Torch prefill and the
+reference path still construct their required causal masks.
 
 Implementation: [pre_attention.py](mega_qwen3_tts/kernels/pre_attention.py),
 [post_attention.py](mega_qwen3_tts/kernels/post_attention.py), and
@@ -215,17 +221,15 @@ rendezvous also protects DSMEM lifetimes before reuse or exit.
 ## Attention Decision
 
 Keep cuDNN attention through Torch SDPA. Standalone SIMT attention, phased
-QKV+attention fusion, and PDL were tested but not retained. On H200 at B16,
-cuDNN gave 663.7 us per full-backbone step; the best custom variant (standalone
-with PDL) took 694.9 us. Phased fusion still read Q/K/V through global memory
-and was slower. Removing a launch or overlapping kernels was not sufficient
-to offset the attention cost. No custom attention kernel or PDL option is shipped.
+QKV+attention fusion, and PDL were tested but did not improve full-backbone
+latency. Phased fusion still read Q/K/V through global memory. No custom
+attention kernel or PDL option is shipped.
 
 ## Code Predictor Reuse
 
 The 0.6B code predictor has five layers with the same projection, normalization,
 and head dimensions as the talker. It directly reuses the pre-/post-attention
-kernels and Torch SDPA; no predictor-specific kernel schedule is needed initially.
+kernels and Torch SDPA; neither block needs a predictor-specific schedule.
 
 For each audio frame:
 
@@ -246,6 +250,14 @@ Every step passes views of these tables to the transformer; neither the Torch no
 custom path rebuilds them. Unlike SGLang's valid-length KV views, the cache shape
 stays fixed to avoid length-specific compiled graphs. No runtime mask conversion
 or mask-writing kernel is needed.
+
+Greedy selection uses one 128-thread CTA per batch row: threads scan logits,
+reduce value/index pairs within each warp, combine four warp winners in SMEM,
+then copy the selected embedding. Equal maxima and NaNs select the first index,
+matching Torch. The kernel accepts independent vocabulary/embedding dimensions
+(V <= 8192) and FP16/BF16/FP32 inputs. An optional second table supplies projected
+embeddings of an independent width, without a runtime projection GEMM. The
+0.6B predictor needs only the original table; feedback summation stays unchanged.
 
 `qwen3_tts_predictor_reference.py` follows upstream residual/normalization rounding,
 including one final embedding reduction rather than sequential BF16 additions.

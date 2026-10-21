@@ -1,12 +1,14 @@
 # Qwen3-TTS Talker and Code Predictor
 
-Standalone 0.6B talker backbone: prepared embeddings -> 28 transformer layers
--> codec logits. This excludes text preprocessing, the code predictor, sampling,
-and waveform decoding. See [design.md](design.md) for the math, CTA/warp schedules,
-memory handoffs, and retained design decisions.
+Standalone 0.6B components, benchmarked separately:
 
-The standalone [code predictor](#code-predictor) reuses the same fused blocks
-to generate the remaining 15 codec codes for each audio frame.
+- **Talker:** prepared embeddings -> 28 transformer layers -> codec logits.
+- **Code predictor:** talker hidden state and first code -> 15 remaining codes
+  and embedding feedback, reusing the same fused blocks.
+
+Neither benchmark includes text processing, waveform decoding, or a combined
+talker/predictor generation loop. See [design.md](design.md) for the math,
+CTA/warp schedules, memory handoffs, and retained design decisions.
 
 ## Run
 
@@ -22,7 +24,7 @@ python mega_qwen3_tts/kernels/post_attention.py --layers 28
 python mega_qwen3_tts/kernels/pre_attention.py --write-mask
 
 # Full backbone; omit --model for deterministic random weights.
-python bench_qwen3_tts.py --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice
+python bench_qwen3_tts_talker.py --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice
 ```
 
 Backbone defaults: BF16, B=16/32, 28 layers, 128 prefix tokens. Multi-token
@@ -31,9 +33,12 @@ through Torch SDPA, fused post-attention, and compiled remaining Torch operation
 The specialization supports B=1..32, one shared decode position, and immutable
 weights. It does not support 1.7B dimensions, training, or non-Hopper GPUs.
 
+Call each model's `make_cache` after moving it to the final device and dtype.
+This also precomputes RoPE; decode only gathers the current position's cos/sin.
+The fused mask path skips the unused boolean-mask preparation.
+
 Useful controls:
 
-- `--no-fused`: compiled Torch scaffold.
 - `--no-fused-qkv`: only post-attention fusion.
 - `--no-fused-mask`: restore SDPA's separate boolean-mask conversion.
 - `--layers 2`: shorten development runs.
@@ -51,13 +56,17 @@ not a growing-context generation loop.
 
 ```bash
 python bench_qwen3_tts_predictor.py --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice
+
+# Standalone greedy selection + embedding lookup, including optional projection.
+python mega_qwen3_tts/kernels/argmax_embedding.py
 ```
 
 The predictor has five layers with the same 1024/3072 widths and 16 Q / 8 KV
 heads as the talker. Each frame runs a two-token prefix followed by 14 single-token
 steps, producing 15 codes with group-specific heads and embeddings. The custom
 path reuses both fused decode blocks; multi-token prefix operations remain Torch.
-No new kernel or serving-framework dependency is introduced.
+Greedy argmax and embedding lookup use one custom kernel per code. Use
+`--no-fused-selection` to isolate that change; teacher-forced codes bypass it.
 
 Both paths precompute RoPE and additive masks during cache setup. Steps use table
 views, avoiding repeated setup kernels while retaining a fixed-capacity KV cache.
@@ -72,8 +81,14 @@ H200, real 0.6B checkpoint, 16/32 distinct frames from one captured prompt:
 
 | Batch | Torch | Compiled Torch | Fused | Compiled/Fused |
 | --- | ---: | ---: | ---: | ---: |
-| 16 | 10.064 ms | 4.740 ms | 2.346 ms | 2.02x |
-| 32 | 10.225 ms | 4.689 ms | 2.861 ms | 1.64x |
+| 16 | 10.068 ms | 4.740 ms | 2.070 ms | 2.29x |
+| 32 | 10.217 ms | 4.667 ms | 2.755 ms | 1.69x |
+
+Selection fusion alone reduced B16/B32 frame time from 2.348/2.866 ms to
+2.068/2.749 ms in a paired run. Codes, embeddings, logits, and caches remained
+bitwise identical, including changed-input and repeated-frame graph replays.
+Standalone irregular-width, mixed-dtype, tie/NaN, and projected-table checks pass;
+CUDA memcheck/racecheck reported no errors or hazards.
 
 The eager reference matches upstream logits, KV, and feedback exactly at
 B=1/16/32 with matching static caches and math SDPA. Changed-input, stale-cache,
@@ -101,21 +116,18 @@ exercise cache writes and workspace reuse.
 
 H200 checks reported clean memcheck/racecheck for pre/post blocks, including
 non-bucket batches and changed-input graph replays.
-The reference cleanup was also checked with the full 28-layer checkpoint:
-before/after logits and KV caches match bitwise for eager prefill/decode at
-B1/16/17/32 and compiled Torch/fused graph replay at B16/32.
+The RoPE-cache cleanup preserves before/after eager and fused logits and KV
+caches bitwise at B16/32, including changing-position CUDA-graph replay.
 
-**Strict full-backbone pointwise validation still fails**, including for compiled
-Torch. Preserving BF16 boundaries does not preserve FP32 reduction order, and
-small differences can amplify through 28 layers. On one repeated prompt with
-32 teacher-forced decode steps, fused QKV+post had 100% top-token agreement,
-but mean/worst relative L2 logit error was 0.921%/2.395%. An earlier norm-order
-change altered one of 32 top-token decisions; neither result establishes
-free-running speech quality.
+Full-backbone pointwise differences exceed standalone tolerances, including for
+compiled Torch. On one repeated prompt with 32 teacher-forced decode steps,
+fused QKV+post had 100% top-token agreement and mean/worst relative L2 logit error
+of 0.921%/2.395%. This does not establish free-running speech quality.
 
-The backbone benchmark reports failures, collects diagnostic timings, and exits
-unsuccessfully. Diverse-request and free-running quality validation are still
-required before serving integration.
+Both model benchmarks report numerical differences and top-code agreement,
+rejecting shape mismatches and non-finite values. Standalone kernels retain
+tolerance-based assertions. Diverse-request and free-running quality validation
+remain necessary before serving integration.
 
 ## Representative Results
 
@@ -129,25 +141,17 @@ weight sets. These are selected measurements from development, not a fresh run.
 | Post-attention, warp-local norm | 16 | 27.14 us | 12.22 us | 2.22x |
 | Post-attention, warp-local norm | 32 | 27.84 us | 16.64 us | 1.67x |
 
-The retained early-weight-TMA follow-up reduced B16 post-attention from
-12.15 to 11.71 us in a separate paired run; it did not improve B32.
 QKV's baseline compiles arithmetic but uses direct in-place Torch cache-slot
 updates. Fully compiling `index_copy_` introduced full-cache copies and measured
 30.14/39.69 us instead, so it is not the standalone comparison above.
 
-Full backbone: real weights, one repeated prompt, 23-token prefix plus 32 captured
-decode inputs; timing the last step. B32 duplicates the B16 inputs.
-
-| Batch | Compiled Torch | Post fusion only | QKV + post fusion | With fused mask, later paired run |
-| --- | ---: | ---: | ---: | ---: |
-| 16 | 1.728 ms | 1.327 ms | 0.686 ms | 0.664 ms |
-| 32 | 1.995 ms | 1.643 ms | 0.972 ms | 0.946 ms |
-
-The mask A/B itself measured 684.6 -> 663.7 us at B16 and 965.2 -> 945.7 us at
-B32, with bitwise-identical logits/caches. It removes one conversion kernel per
-layer. The compiled full-backbone baseline still includes the cache copies
-described above: its speedup is not solely faster arithmetic. All backbone
-numbers are **diagnostic timings, not validated generation speedups**.
+Full fused talker after caching RoPE: **0.646 ms at B16, 0.927 ms at B32**.
+Real weights, 23-token prefix and 32 captured decode inputs; timing the last
+step. B32 duplicates the B16 inputs. The paired before/after run measured
+0.663 -> 0.646 ms and 0.942 -> 0.927 ms. The 16 setup kernels became one lookup.
+The compiled full-backbone baseline still includes the cache copies described
+above; speedup is not solely faster arithmetic. These are component timings,
+not end-to-end generation speedups.
 
 ## Profiling
 
@@ -157,9 +161,8 @@ use graph-node capture. Keep traces directly under repository `tmp/`, with model
 GPU, batch, and variant in the filename.
 
 Graph-node tracing can substantially inflate predictor timings and introduce GPU
-gaps during `cudaGraphLaunch`. In a B16 comparison, graph-level tracing measured
-5.24-5.48 ms compiled / 2.59 ms fused, versus 7.31-8.03 / 3.03-3.37 ms with
-node tracing. Use unprofiled interleaved CUDA-event timings for speedup claims.
+gaps during `cudaGraphLaunch`. Use unprofiled interleaved CUDA-event timings for
+speedup claims.
 
 Pre/post kernels have IKET per-warp markers; `--trace-only --batch-size 16`
 launches one custom block without reference GEMMs or timing loops:
@@ -183,9 +186,3 @@ Useful phases:
 
 IKET ranges include waits and instrumentation overhead. Nested or overlapping
 warp ranges cannot be summed into kernel time. Use unprofiled A/B timing for performance.
-
-Selected existing captures in `tmp/` (local artifacts, not tracked):
-
-- `qwen3_tts_0p6b_h200_b16_qkv_post_comparison.1.nsys-rep`: backbone comparison.
-- `qwen3_tts_0p6b_h200_b16_fused_mask_ab.1.nsys-rep`: boolean versus fused mask.
-- `qwen3_tts_0p6b_h200_b{16,32}_pre_attention_iket.pftrace`: QKV phases.

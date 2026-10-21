@@ -37,17 +37,17 @@ class _FusedTalkerLayer(nn.Module):
 class MegaQwen3TTSTalker(nn.Module):
     """Replace supported decode blocks without changing cache ownership or layout."""
 
-    def __init__(self, reference, *, fused: bool = True, fused_qkv: bool = True, fused_mask: bool = True):
+    def __init__(self, reference, *, fused_qkv: bool = True, fused_mask: bool = True):
         super().__init__()
-        self.model = deepcopy(reference)
-        if fused:
-            from .kernels.post_attention import FusedPostAttention
+        from .kernels.post_attention import FusedPostAttention
 
-            for index, layer in enumerate(self.model.layers):
-                if fused_qkv:
-                    self.model.layers[index] = _FusedTalkerLayer(layer, fused_mask=fused_mask)
-                else:
-                    layer.post_attention = FusedPostAttention(layer.post_attention)
+        self.model = deepcopy(reference)
+        self.fused_decode_mask = fused_qkv and fused_mask
+        for index, layer in enumerate(self.model.layers):
+            if fused_qkv:
+                self.model.layers[index] = _FusedTalkerLayer(layer, fused_mask=fused_mask)
+            else:
+                layer.post_attention = FusedPostAttention(layer.post_attention)
 
     def make_cache(self, batch_size, capacity):
         return self.model.make_cache(batch_size, capacity)
@@ -55,7 +55,7 @@ class MegaQwen3TTSTalker(nn.Module):
     def forward(self, embeddings, cache, positions):
         if embeddings.shape[1] != 1:
             return self.prefill(embeddings, cache, positions)
-        return self.model(embeddings, cache, positions)
+        return self.model(embeddings, cache, positions, build_mask=not self.fused_decode_mask)
 
     @torch.compiler.disable
     def prefill(self, embeddings, cache, positions):

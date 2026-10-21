@@ -1,4 +1,4 @@
-"""Short, interleaved CUDA-graph measurements."""
+"""Short CUDA-graph measurements and numerical reporting."""
 
 from statistics import median
 
@@ -51,3 +51,35 @@ def report_error(name, actual, expected, *, atol=0.02, rtol=0.02, strict=True):
     if strict:
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
     return passed
+
+
+def report_difference(name, actual, reference):
+    """Report model-level numerical drift; reject shape errors and non-finite values."""
+    if actual.shape != reference.shape:
+        raise ValueError(f"{name}: shape mismatch: {actual.shape} vs {reference.shape}")
+    if not torch.isfinite(actual).all() or not torch.isfinite(reference).all():
+        raise ValueError(f"{name}: non-finite values")
+    error = (actual.float() - reference.float()).abs()
+    relative_l2 = error.norm() / reference.float().norm().clamp_min(1e-12)
+    print(
+        f"{name}: max_abs={error.max().item():.6g} mean_abs={error.mean().item():.6g} "
+        f"relative_l2={relative_l2.item():.6g}",
+        flush=True,
+    )
+
+
+def print_summary(results, *, workload):
+    """Print model latency in milliseconds from timings measured in microseconds."""
+    names = list(results[0][1])
+    baseline = "Compiled" if "Compiled" in names else "Torch"
+    headers = ["Batch", *[f"{name} (ms)" for name in names], f"{baseline}/Fused"]
+    rows = [
+        [str(batch), *[f"{times[name] / 1000:.3f}" for name in names], f"{times[baseline] / times['Fused']:.3f}x"]
+        for batch, times in results
+    ]
+    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
+    print(f"\nSummary: milliseconds per {workload}.")
+    print(" | ".join(value.rjust(width) for value, width in zip(headers, widths)))
+    print("-+-".join("-" * width for width in widths))
+    for row in rows:
+        print(" | ".join(value.rjust(width) for value, width in zip(row, widths)), flush=True)
