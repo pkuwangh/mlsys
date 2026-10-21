@@ -6,7 +6,7 @@ status belong in [README.md](README.md).
 
 ## Scope and Boundaries
 
-Target: **0.6B talker, Hopper, BF16, TP1, single-token decode, B=1..32**.
+Target: **0.6B talker, Hopper/Blackwell, BF16, TP1, single-token decode, B=1..32**.
 The backbone has 28 layers, hidden width 1024, 16 query heads, 8 KV heads,
 head dimension 128, and SwiGLU width 3072. Projections have no bias.
 The five-layer code predictor reuses these blocks and adds fused greedy selection.
@@ -33,6 +33,35 @@ reference path still construct their required causal masks.
 Implementation: [pre_attention.py](mega_qwen3_tts/kernels/pre_attention.py),
 [post_attention.py](mega_qwen3_tts/kernels/post_attention.py), and
 [talker.py](mega_qwen3_tts/talker.py).
+
+## Architecture and Integration
+
+Public operation wrappers remain in `kernels/pre_attention.py` and
+`kernels/post_attention.py`. They select the target, pack weights, allocate
+workspace, and provide the standalone checks/benchmarks. Complete device
+implementations live separately in `kernels/sm90/` and `kernels/sm100/`, including
+their launch functions and MMA helpers. SM100-family code compiles for the actual
+device: `sm_100a` on B200 or `sm_103a` on B300. The SIMT selection kernel is shared.
+
+The initial Blackwell implementation retains the projection tiling and payload
+layouts, but uses `tcgen05` with 32 allocated TMEM columns per CTA. Warp 4
+allocates TMEM; one thread issues MMA and commits to a completion barrier.
+Warps 4-7 read the M64 accumulator with `tcgen05.ld.16x256b` into the reduction
+epilogue. TMEM is reused between projections and freed after all readers finish.
+Its schedule can evolve independently; the Hopper WGMMA implementation is unchanged.
+
+For a future library contribution:
+
+- Keep the device implementations independent of model classes and serving engines.
+- Expose explicit tensor, packed-weight, output, workspace, and stream contracts
+  through the destination library's existing API/plan conventions. The current
+  `nn.Module` wrappers are prototype adapters, not the proposed library API.
+- Preserve immutable packed weights and serialized workspace ownership; concurrent
+  streams require separate workspace. Compilation and allocation stay outside capture.
+- Add SGLang/vLLM adapters for their KV layouts and custom-op registration. The
+  current contiguous KV cache is not a drop-in replacement for paged serving caches.
+
+No serving-framework or library integration is implemented here yet.
 
 ## Numerical Contract
 
@@ -100,7 +129,9 @@ B are padded and excluded from final writes.
 1. Thread 0 starts a 64-KiB weight TMA before input normalization.
 2. All 16 warps normalize full input rows, then stage this CTA's K512 slice.
    Each warp owns one row at N16 or two rows at N32.
-3. Warps 4-7 issue M64 x N16/32 x K512 WGMMA and stage FP32 partials.
+3. M64 x N16/32 x K512 projects the staged operands. On Hopper, warps 4-7
+   issue WGMMA; on Blackwell, thread 128 issues `tcgen05` MMA. Warps 4-7
+   read the accumulators and stage FP32 partials.
 4. Ranks 1-3 bulk-copy their partials into rank 0's DSMEM mailbox. Rank 0
    writes its own partial locally; the transaction barrier counts only remote
    copies. Rank 0 sums each K pair, applies Q/K head RMSNorm and RoPE, and
@@ -121,7 +152,7 @@ the attention calculation.
 ## Fused Post-Attention
 
 Launch cooperative four-CTA clusters with **256 threads per CTA**. All GEMMs
-use Hopper WGMMA with BF16 operands and FP32 register accumulators, not TMEM.
+use BF16 operands and FP32 accumulators: WGMMA registers on Hopper, TMEM on Blackwell.
 
 | Batch bucket | Grid | Output projection | Gate/up | Down projection |
 | --- | ---: | --- | --- | --- |
@@ -164,8 +195,11 @@ later. N16 instead gains parallelism by giving one tile to each of 96 CTAs.
 | Threads | Output/down | Gate/up |
 | --- | --- | --- |
 | Warps 0-3 | Weight TMA and activation staging/polling | Thread 0 issues full-tile weight TMA |
-| Warps 4-7 | WGMMA | WGMMA on resident normalized inputs |
+| Warps 4-7 | MMA and accumulator reads | MMA on resident normalized inputs |
 | All, between GEMMs | Split-K reduction and residual epilogue | RMSNorm and SwiGLU epilogue |
+
+On Hopper, all four MMA warps issue WGMMA. On Blackwell, only thread 128
+issues MMA; all four warps wait for completion and read TMEM.
 
 Output/down have two distinct weight/operand stages, with no buffer-reuse
 handshake between them. Gate/up holds its entire 128-KiB weight tile in SMEM;
@@ -176,9 +210,9 @@ start down while this CTA still reads its gate/up partials.
 
 Each gate/up CTA independently normalizes the full residual. One warp owns
 a complete 1024-channel row, retaining the polled values and gamma in registers.
-Shuffles reduce statistics; normalized BF16 data goes directly into WGMMA's
+Shuffles reduce statistics; normalized BF16 data goes directly into the MMA's
 SMEM layout. No shared norm partials or inverse-RMS broadcast remain. A proxy
-fence and final CTA rendezvous publish the operands to WGMMA.
+fence and final CTA rendezvous publish the operands to MMA.
 
 ### Publication and Lifetime
 

@@ -2,7 +2,7 @@
 
 One CTA per row, small vocabularies up to 8192 entries, independent embedding
 and optional projected-embedding widths. FP16/BF16/FP32 inputs; ties and NaNs
-select the first index, matching Torch argmax. Inference only, targeting Hopper.
+select the first index, matching Torch argmax. Inference only, Hopper/Blackwell.
 Run this file for exact correctness checks and eager/compiled Torch timings.
 """
 
@@ -22,7 +22,7 @@ from torch.nn import functional as F
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mega_qwen3_tts.kernels._utils import measure
+from mega_qwen3_tts.kernels._utils import device_arch, measure
 
 
 @cute.jit
@@ -120,7 +120,7 @@ def argmax_embedding_host(logits, table, projected_table, codes, embeddings, pro
 
 
 @cache
-def compile_kernel(batch, vocab, width, projected_width, logits_dtype, embedding_dtype):
+def compile_kernel(batch, vocab, width, projected_width, logits_dtype, embedding_dtype, arch):
     def fake(dtype, *shape):
         return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))))
 
@@ -133,7 +133,7 @@ def compile_kernel(batch, vocab, width, projected_width, logits_dtype, embedding
         fake(embedding_dtype, batch, width),
         fake(embedding_dtype, batch, projected_width) if projected_width else None,
         make_fake_stream(),
-        options="--enable-tvm-ffi --gpu-arch=sm_90a",
+        options=f"--enable-tvm-ffi --gpu-arch={arch}",
     )
 
 
@@ -160,8 +160,7 @@ def argmax_embedding(logits, table, projected_table=None):
         tensors.append(projected_table)
     if any(not t.is_cuda or t.device != logits.device or not t.is_contiguous() for t in tensors):
         raise ValueError("Expected contiguous tensors on the same CUDA device")
-    if torch.cuda.get_device_capability(logits.device)[0] != 9:
-        raise ValueError("This build targets Hopper")
+    arch = device_arch(logits.device)
     codes = torch.empty(batch, device=logits.device, dtype=torch.int64)
     embeddings = table.new_empty(batch, table.shape[1])
     projected = projected_table.new_empty(batch, projected_table.shape[1]) if projected_table is not None else None
@@ -172,6 +171,7 @@ def argmax_embedding(logits, table, projected_table=None):
         projected_table.shape[1] if projected_table is not None else 0,
         types[logits.dtype],
         types[table.dtype],
+        arch,
     )(
         logits,
         table,

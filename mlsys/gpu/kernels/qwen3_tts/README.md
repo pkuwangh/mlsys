@@ -12,8 +12,8 @@ CTA/warp schedules, memory handoffs, and retained design decisions.
 
 ## Run
 
-Use a Hopper GPU and the `mlsys-gpu` environment with CUTLASS DSL experimental
-primitives. No SGLang runtime is required. Run from this directory:
+Use a Hopper or datacenter Blackwell GPU and the `mlsys-gpu` environment with
+CUTLASS DSL experimental primitives. No SGLang runtime is required. Run from this directory:
 
 ```bash
 # Complete post-attention block, correctness checks, and compiled Torch baseline.
@@ -31,11 +31,15 @@ Backbone defaults: BF16, B=16/32, 28 layers, 128 prefix tokens. Multi-token
 prefill stays eager; custom decode uses fused QKV preparation, cuDNN attention
 through Torch SDPA, fused post-attention, and compiled remaining Torch operations.
 The specialization supports B=1..32, one shared decode position, and immutable
-weights. It does not support 1.7B dimensions, training, or non-Hopper GPUs.
+weights. It does not support 1.7B dimensions or training. Architecture dispatch
+selects SM90, SM100, or SM103 automatically; device kernels are separate under
+`mega_qwen3_tts/kernels/sm90/` and `sm100/`.
 
-Call each model's `make_cache` after moving it to the final device and dtype.
-This also precomputes RoPE; decode only gathers the current position's cos/sin.
-The fused mask path skips the unused boolean-mask preparation.
+Move the reference to the final CUDA device and BF16 before constructing the
+fused module; changing device, dtype, or weights requires rebuilding it.
+Call each model's `make_cache` before capture. This also precomputes RoPE;
+decode only gathers the current position's cos/sin. The fused mask path skips
+the unused boolean-mask preparation.
 
 Useful controls:
 
@@ -152,6 +156,33 @@ step. B32 duplicates the B16 inputs. The paired before/after run measured
 The compiled full-backbone baseline still includes the cache copies described
 above; speedup is not solely faster arithmetic. These are component timings,
 not end-to-end generation speedups.
+
+### Blackwell
+
+B300 (SM103), CUTLASS DSL 4.8.0, BF16, unprofiled interleaved CUDA graphs.
+Standalone blocks rotate 28 weight sets; model runs use the real checkpoint
+and captured inputs described above.
+
+| Workload | Batch | Compiled Torch | Fused | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| QKV preparation | 16 | 24.33 us | 5.31 us | 4.59x |
+| QKV preparation | 32 | 22.05 us | 6.73 us | 3.27x |
+| Post-attention | 16 | 23.98 us | 11.73 us | 2.04x |
+| Post-attention | 32 | 23.54 us | 21.06 us | 1.12x |
+| Talker decode step | 16 | 1.572 ms | 0.622 ms | 2.53x |
+| Predictor frame | 16 | 4.193 ms | 1.967 ms | 2.13x |
+| Predictor frame | 32 | 4.291 ms | 2.826 ms | 1.52x |
+
+This initial `tcgen05` implementation retains Hopper's tiling; B32 post-attention
+remains a tuning target. Standalone pre/post and selection checks pass, as do
+the moved Hopper blocks' B16/B32 regression checks. B300 pre/post memcheck and
+racecheck report zero errors/hazards at B1/16/17/32 with changed-input/position
+graph replays. B200 dispatch is implemented but has not been tested.
+
+Talker top-token agreement is 100% over the 32 captured teacher-forced steps.
+Predictor B16/B32 teacher-forced agreement is 97.9%/96.7%, and free-running code
+agreement is 91.3%/84.0%. These are numerical comparisons, not speech-quality
+validation; the same full-backbone cache-copy caveat applies to these timings.
 
 ## Profiling
 

@@ -5,6 +5,14 @@ from statistics import median
 import torch
 
 
+def device_arch(device):
+    """Select the compiled target for Hopper or datacenter Blackwell."""
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((9, 0), (10, 0), (10, 3)):
+        raise ValueError("Expected an SM90, SM100, or SM103 GPU")
+    return f"sm_{capability[0]}{capability[1]}a"
+
+
 @torch.inference_mode()
 def measure(functions: dict, samples: int = 3, replays: int = 5, *, profile=False):
     """Warm and capture each callable; retain outputs and alternate timing order."""
