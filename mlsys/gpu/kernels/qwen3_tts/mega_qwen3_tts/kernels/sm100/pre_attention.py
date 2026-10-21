@@ -104,9 +104,12 @@ def pre_attention_kernel(
         p.tcgen05_fence(p.Tcgen05Fence.AFTER_THREAD_SYNC)
         iket.range_push("qkv_mma")
         if tid == 128:
+            da_base = descriptor(weights)
+            db_base = descriptor(normalized)
+            # Advance the encoded 16-byte address instead of rebuilding each descriptor.
             for slab in cutlass.range_constexpr(8):
-                da = descriptor(weights, slab * 4096)
-                db = descriptor(normalized, slab * N * 64)
+                da = da_base + slab * 512
+                db = db_base + slab * N * 8
                 for k in cutlass.range_constexpr(4):
                     mma(tmem_address.load(), da + 2 * k, db + 2 * k, N, slab != 0 or k != 0)
             p.tcgen05_commit(mma_done)

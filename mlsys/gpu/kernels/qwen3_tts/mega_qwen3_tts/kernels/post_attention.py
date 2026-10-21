@@ -1,9 +1,9 @@
 """Fused output projection, residual, RMSNorm, SwiGLU, and down projection.
 
 Hopper/Blackwell, BF16, hidden=1024, FFN=3072, attention width=2048, B<=32.
-B<=16 reuses 96 CTAs across the three projections. Larger batches dedicate
-64 CTAs to output/down and 48 to gate/up. Transaction-barrier mailboxes reduce
-split-K partials. Packed sentinel polling publishes residuals and gate/up
+All batches reuse 96 CTAs: 64 produce output/down and all 96 produce gate/up.
+Transaction-barrier mailboxes reduce split-K partials.
+Packed sentinel polling publishes residuals and gate/up
 activations without release flags; each CTA computes its own norm statistics.
 
 Run this file to validate and benchmark the complete fused operation.
@@ -102,7 +102,7 @@ class FusedPostAttention(nn.Module):
             self.workspaces[batch] = (
                 torch.full((2, bucket, 512), PAYLOAD_EMPTY, device=device, dtype=torch.int32),
                 torch.full((2, 96, bucket, 16), PAYLOAD_EMPTY, device=device, dtype=torch.int32),
-                # N16: 96 CTA epochs + 16 prefetch hints. N32: 112 CTA epochs.
+                # 96 CTA epochs + 16 prefetch hints.
                 torch.zeros(112, device=device, dtype=torch.int32),
             )
         output = torch.empty_like(residual, memory_format=torch.contiguous_format)

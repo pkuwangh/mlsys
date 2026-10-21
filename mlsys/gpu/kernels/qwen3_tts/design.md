@@ -43,7 +43,7 @@ implementations live separately in `kernels/sm90/` and `kernels/sm100/`, includi
 their launch functions and MMA helpers. SM100-family code compiles for the actual
 device: `sm_100a` on B200 or `sm_103a` on B300. The SIMT selection kernel is shared.
 
-The initial Blackwell implementation retains the projection tiling and payload
+The Blackwell implementation shares the projection tiling and payload
 layouts, but uses `tcgen05` with 32 allocated TMEM columns per CTA. Warp 4
 allocates TMEM; one thread issues MMA and commits to a completion barrier.
 Warps 4-7 read the M64 accumulator with `tcgen05.ld.16x256b` into the reduction
@@ -157,7 +157,7 @@ use BF16 operands and FP32 accumulators: WGMMA registers on Hopper, TMEM on Blac
 | Batch bucket | Grid | Output projection | Gate/up | Down projection |
 | --- | ---: | --- | --- | --- |
 | N16 | 96 CTAs | CTAs 0-63 | All 96 CTAs, one tile each | CTAs 0-63 |
-| N32 | 112 CTAs | CTAs 0-63 | CTAs 64-111, two tiles each | CTAs 0-63 |
+| N32 | 96 CTAs | CTAs 0-63 | All 96 CTAs, one tile each | CTAs 0-63 |
 
 ### Projection Mapping
 
@@ -178,17 +178,16 @@ and writes the final layer output. There are no global split-K partials.
 Gate/up tile `t` produces activation channels `[32*t,32*t+32)`:
 
 ```text
-N16: t = CTA ID                         # 96 tiles in one wave
-N32: t = CTA ID - 64 + 48*wave          # 48 tiles per wave, two waves
+t = CTA ID                             # 96 tiles in one wave, both buckets
 weight tile = 32 gate rows + 32 matching up rows, full K1024
 GEMM = weight[64,1024] @ normalized_input.T[1024,N]
 epilogue = round gate/up -> round SiLU -> multiply -> round activation
 ```
 
 Gate/up has no split-K. Its SMEM epilogue pairs gate and up rows before publishing
-32 activation channels. At N32, down stage 0 consumes tiles `12*r..12*r+11`
-while gate/up produces the second wave; stage 1 consumes tiles 48 positions
-later. N16 instead gains parallelism by giving one tile to each of 96 CTAs.
+32 activation channels. Down stage 0 consumes tiles `12*r..12*r+11`;
+stage 1 consumes tiles 48 positions later. Each CTA can start down as soon as
+its own gate/up epilogue finishes, polling only the activation tiles it needs.
 
 ### Warp Roles and Storage
 
@@ -204,8 +203,7 @@ issues MMA; all four warps wait for completion and read TMEM.
 Output/down have two distinct weight/operand stages, with no buffer-reuse
 handshake between them. Gate/up holds its entire 128-KiB weight tile in SMEM;
 that storage aliases the otherwise unused output/down operand region.
-At N32, the next gate/up weight tile loads during the first tile's epilogue.
-At N16, the down mailbox must be separate from the gate/up epilogue: a peer can
+The down mailbox is separate from the gate/up epilogue: a peer can
 start down while this CTA still reads its gate/up partials.
 
 Each gate/up CTA independently normalizes the full residual. One warp owns
@@ -228,7 +226,7 @@ there is no flag followed by a separate data read or GPU-wide release fence.
 | --- | --- | --- |
 | Residual | Int32 `[2,N,512]` | Packed `[N,1024]` BF16 residual, two slots |
 | Activation | Int32 `[2,96,N,16]` | Packed `[96,N,32]` BF16 SwiGLU output, two slots |
-| Epochs/hints | Int32 `[112]` | Invocation counters; N16 also uses 16 prefetch hints |
+| Epochs/hints | Int32 `[112]` | 96 invocation counters and 16 prefetch hints |
 
 Slots start empty. Each call uses `epoch & 1` and clears the inactive slot for
 the next call. Calls sharing a module/workspace must be serialized, including
@@ -242,13 +240,17 @@ rendezvous also protects DSMEM lifetimes before reuse or exit.
 
 ### Startup Decisions
 
-- N16 output weight TMA starts before epoch/mailbox setup. Earlier activation
+- Output weight TMA starts before epoch/mailbox setup. Earlier activation
   loads, `cp.async`, and activation TMA did not improve complete-block latency.
-- N16 CTAs 64-95 wait for an output producer's first-MMA progress hint, then
+- CTAs 64-95 wait for an output producer's first-MMA progress hint, then
   load their own gate/up weights and prefetch the other 64 tiles into L2.
   The hint is only scheduling advice; consumers still validate every payload.
-- N32 waits for an existing residual word before gate/up TMA. No fixed delay
-  is used: delay experiments helped identify contention, not a stable timing rule.
+- Blackwell polls the hint with the whole first warp. This avoids the long
+  startup delay observed with a single-lane poll; Hopper retains single-lane
+  polling, where the warp-wide alternative did not consistently help.
+- Both buckets distribute gate/up across all 96 CTAs. The former N32 schedule
+  used 48 dedicated CTAs and two waves; the one-wave schedule is faster on both
+  H200 and B300 and removes a separate scheduling path.
 - Warp-local norm replaced repeated shared-memory handoffs. Preserving the old
   summation order cost latency; the retained order is not bitwise-equivalent.
 

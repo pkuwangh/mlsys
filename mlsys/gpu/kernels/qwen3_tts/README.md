@@ -157,7 +157,7 @@ The compiled full-backbone baseline still includes the cache copies described
 above; speedup is not solely faster arithmetic. These are component timings,
 not end-to-end generation speedups.
 
-### Blackwell
+### Initial Blackwell Port
 
 B300 (SM103), CUTLASS DSL 4.8.0, BF16, unprofiled interleaved CUDA graphs.
 Standalone blocks rotate 28 weight sets; model runs use the real checkpoint
@@ -173,8 +173,8 @@ and captured inputs described above.
 | Predictor frame | 16 | 4.193 ms | 1.967 ms | 2.13x |
 | Predictor frame | 32 | 4.291 ms | 2.826 ms | 1.52x |
 
-This initial `tcgen05` implementation retains Hopper's tiling; B32 post-attention
-remains a tuning target. Standalone pre/post and selection checks pass, as do
+These measurements are from `5d0ecc7`, before the scheduling changes below.
+Standalone pre/post and selection checks pass, as do
 the moved Hopper blocks' B16/B32 regression checks. B300 pre/post memcheck and
 racecheck report zero errors/hazards at B1/16/17/32 with changed-input/position
 graph replays. B200 dispatch is implemented but has not been tested.
@@ -183,6 +183,36 @@ Talker top-token agreement is 100% over the 32 captured teacher-forced steps.
 Predictor B16/B32 teacher-forced agreement is 97.9%/96.7%, and free-running code
 agreement is 91.3%/84.0%. These are numerical comparisons, not speech-quality
 validation; the same full-backbone cache-copy caveat applies to these timings.
+
+### Scheduling Optimization
+
+Paired before/after measurements against `5d0ecc7`, using unprofiled interleaved
+CUDA graphs. Post-attention rotates 28 weight sets; model inputs and timing
+boundaries are as described above. Values are medians of three timing rounds.
+
+| GPU | Workload | Batch | Before | After | Speedup |
+| --- | --- | ---: | ---: | ---: | ---: |
+| B300 | Post-attention | 16 | 11.78 us | 10.81 us | 1.09x |
+| B300 | Post-attention | 32 | 21.08 us | 13.35 us | 1.58x |
+| H200 | Post-attention | 16 | 11.62 us | 11.68 us | 1.00x |
+| H200 | Post-attention | 32 | 16.54 us | 15.36 us | 1.08x |
+| B300 | Talker decode step | 16 | 0.626 ms | 0.587 ms | 1.07x |
+| B300 | Talker decode step | 32 | 0.980 ms | 0.750 ms | 1.31x |
+| B300 | Predictor frame | 16 | 1.988 ms | 1.881 ms | 1.06x |
+| B300 | Predictor frame | 32 | 2.829 ms | 2.289 ms | 1.24x |
+| H200 | Talker decode step | 32 | 0.929 ms | 0.899 ms | 1.03x |
+| H200 | Predictor frame | 32 | 2.751 ms | 2.659 ms | 1.03x |
+
+Both architectures now distribute gate/up across all 96 CTAs in one wave.
+Blackwell also uses warp-uniform startup-hint polling; Hopper retains its
+single-lane poll. Descriptor construction moves out of the K64 loops.
+H200 B16 model timings remain essentially unchanged.
+
+Before/after kernel outputs are bitwise identical at B1/16/17/32. Full-model
+logits and KV caches, plus predictor codes and feedback, are bitwise identical
+at B16/32 on both GPUs. Pre/post memcheck and racecheck pass on both GPUs with
+changed-input/position graph replays. These checks establish preservation of the
+previous fused implementation, not equivalence to eager Torch or speech quality.
 
 ## Profiling
 
