@@ -248,7 +248,7 @@ def benchmark(batch, layers, capacity, profile=False, write_mask=False, hidden=1
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--batch-size", nargs="+", type=int, default=[16, 32])
+    parser.add_argument("--batch-size", nargs="+", type=int, default=[8, 16, 32])
     parser.add_argument("--hidden-size", type=int, choices=(1024, 2048), default=1024)
     parser.add_argument("--layers", type=int, default=28, help="Distinct weight sets")
     parser.add_argument("--capacity", type=int, default=129, help="KV-cache capacity")

@@ -224,21 +224,36 @@ previous fused implementation, not equivalence to eager Torch or speech quality.
 
 ### 1.7B Talker
 
+The optimized schedule replaces two M64 channel waves with one M128 wave,
+streams normalization into operand buffers, and coalesces activation stores.
+Blackwell additionally releases operand buffers directly from MMA completion.
+Paired measurements against the initial support commit `a7069ba`, rotating
+28 weight sets in interleaved CUDA graphs:
+
+| GPU | Batch | Post-attention before | After | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| H200 | 16 | 36.00 us | 30.09 us | 1.20x |
+| H200 | 32 | 45.35 us | 35.99 us | 1.26x |
+| B300 | 16 | 32.68 us | 24.40 us | 1.34x |
+| B300 | 32 | 44.34 us | 28.78 us | 1.54x |
+
 Real CustomVoice checkpoint, synthetic embeddings, 28 layers, B16/B32,
 128-token prefix and three teacher-forced decode steps. Unprofiled, interleaved
 CUDA graphs time the final fixed-position decode step:
 
-| GPU | Batch | Compiled Torch | Fused | Speedup |
-| --- | ---: | ---: | ---: | ---: |
-| H200 | 16 | 2.553 ms | 1.560 ms | 1.64x |
-| H200 | 32 | 3.164 ms | 2.097 ms | 1.51x |
-| B300 | 16 | 2.232 ms | 1.374 ms | 1.62x |
-| B300 | 32 | 2.406 ms | 1.883 ms | 1.28x |
+| GPU | Batch | Compiled Torch | Fused before | Fused after | Compiled/after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| H200 | 16 | 2.553 ms | 1.565 ms | 1.361 ms | 1.88x |
+| H200 | 32 | 3.168 ms | 2.100 ms | 1.762 ms | 1.80x |
+| B300 | 16 | 2.222 ms | 1.374 ms | 1.064 ms | 2.09x |
+| B300 | 32 | 2.399 ms | 1.863 ms | 1.563 ms | 1.53x |
 
-QKV is faster at both batches. The staged post-attention kernel beats compiled
-Torch at B16 but remains slower at B32, particularly on B300. The full-backbone
-compiled baseline still includes its cache-copy overhead; these speedups are
-not all attributable to faster arithmetic.
+The full-backbone compiled baseline still includes its cache-copy overhead;
+these speedups are not all attributable to faster arithmetic. Before/after
+logits and caches match bitwise on B300. H200 runs can differ first in the
+unchanged SDPA call despite identical query/cache inputs; the latest B32 run
+has 0.33-0.50% logit relative-L2 difference. Isolated post-attention blocks
+fed identical checkpoint activations match bitwise.
 
 Random-input standalone checks pass at the existing tolerances. On H200,
 isolated post-attention blocks using all 28 checkpoint layers' decode inputs
@@ -250,12 +265,12 @@ Checkpoint QKV checks pass. Full-talker logit relative-L2 differences are about
 0.9-1.2%, with top-token agreement of 93.8-100% on these synthetic inputs.
 Real-prompt generation and speech quality remain unvalidated.
 
-Memcheck passes on H200/B300 at B1/16/17/32 with changed-input/position graph
-replays. H200 racecheck passes; isolated B300 QKV racecheck passes, but the
-wide post-attention kernel stalls under B300 racecheck and that check remains
-inconclusive. Normal execution and memcheck complete. The 0.6B QKV specialization
-remains bitwise identical to `f6c13f3` at B16/B32 with unchanged measured latency;
-its post-attention device kernels were not modified.
+Optimized post-attention memcheck and racecheck pass on H200/B300 at
+B1/16/17/32 with changed-input graph replays. All 28 rotating-weight blocks
+remain bitwise identical to `a7069ba`; H200 checks using checkpoint-layer
+activations also match bitwise. H200/B300 SASS has no register spills at B16/B32.
+The 0.6B device kernels were not modified; paired B16/B32 checks on both GPUs
+remain bitwise identical with unchanged measured latency.
 
 ## Profiling
 

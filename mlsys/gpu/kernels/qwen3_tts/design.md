@@ -269,23 +269,29 @@ Post-attention uses separate `sm90/post_attention_wide.py` and
 
 | Phase | CTA assignment | Work per CTA |
 | --- | --- | --- |
-| Output projection + residual | CTAs 0-63 | Two M64 output tiles per cluster; each rank reduces K512 |
-| RMSNorm | All 96 CTAs | Full 2048-channel rows, normalized once and kept in SMEM |
-| Gate/up + SiLU | All 96 CTAs | Two tiles, each producing 32 activation channels; full K2048 |
-| Down projection + residual | CTAs 0-63 | Two M64 output tiles per cluster; each rank reduces K1536 |
+| Output projection + residual | CTAs 0-63 | One 128-channel tile per cluster; each rank reduces K512 |
+| RMS statistics | All 96 CTAs | Poll full residual rows; retain one FP32 inverse RMS per token |
+| Gate/up + SiLU | All 96 CTAs | One 128-channel tile: 64 gate + 64 up channels; full K2048 |
+| Down projection + residual | CTAs 0-63 | One 128-channel tile per cluster; each rank reduces K1536 |
 
-Output/down cluster `c` owns tiles `c` and `c+16`. Gate/up CTA `b` owns tiles
-`b` and `b+96`. Output/down still use four-way DSMEM reduce-scatter; residual
-and activation handoffs still use packed Lamport payloads. Cluster rendezvous
-prevents mailbox reuse before all readers finish a wave.
+There is one channel wave per projection. Output/down cluster `c` owns
+channels `[128*c,128*c+128)`; gate/up CTA `b` produces activation channels
+`[64*b,64*b+64)`. Four-way DSMEM reduce-scatter gives each rank 32 channels.
+Residual and activation handoffs retain packed Lamport payloads, respectively
+Int32 `[2,N,1024]` and `[2,96,N,32]`.
 
-Warps 0-3 stream weights and stage operands; warps 4-7 consume them through
-WGMMA or `tcgen05`. Two weight buffers use K512 stages at N16 and K256 at N32.
-Ready/free transaction barriers protect buffer reuse while TMA overlaps MMA.
-Output/down operands reuse normalization storage before norm and after both
-gate/up tiles finish. Gate/up weights no longer need to fit in SMEM in full.
-The launch remains a cooperative 96-CTA grid, not a 192-CTA grid that could
-leave producers unscheduled while consumers poll.
+Warps 0-3 stream two K256 weight/operand buffers; warps 4-7 handle MMA and its
+epilogue. Instead of retaining the full normalized matrix, the producer loads
+each residual/gamma chunk into registers and applies normalization while
+staging it. This preserves both BF16 rounding boundaries and leaves space for
+larger weight tiles. SiLU reads use a swizzled shared layout; adjacent lanes
+publish adjacent packed activation words.
+
+Blackwell issues native M128 `tcgen05` operations. Hardware completion signals
+the buffer-free barrier directly, allowing the next MMA stage to issue without
+a software drain. Hopper pairs two M64 WGMMA accumulators and drains each stage
+before releasing its buffer; pipelining WGMMA groups regressed in testing.
+Both retain a cooperative 96-CTA grid. The 0.6B kernels and tiling are unchanged.
 
 The 1.7B predictor directly reuses the 0.6B transformer kernels. Its
 2048-to-1024 input projection remains in Torch; embedding feedback stays

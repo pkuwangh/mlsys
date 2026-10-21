@@ -2,7 +2,7 @@
 
 Hopper/Blackwell, BF16, hidden=1024/2048, FFN=3*hidden, attention width=2048, B<=32.
 Both sizes reuse 96 CTAs: 64 produce output/down and all 96 produce gate/up.
-The larger shape streams weights and uses two output-channel waves.
+The larger shape uses 128-channel tiles and streams weights and activations.
 Transaction-barrier mailboxes reduce split-K partials.
 Packed sentinel polling publishes residuals and gate/up
 activations without release flags; each CTA computes its own norm statistics.
@@ -33,6 +33,8 @@ PAYLOAD_EMPTY = -2147450880
 
 @cache
 def compile_kernel(batch, bucket, eps, arch, hidden=1024):
+    tile_m = 128 if hidden == 2048 else 64
+    gate_channels = tile_m // 2
     if arch == "sm_90a":
         if hidden == 2048:
             from mega_qwen3_tts.kernels.sm90.post_attention_wide import post_attention_host
@@ -51,12 +53,12 @@ def compile_kernel(batch, bucket, eps, arch, hidden=1024):
         post_attention_host,
         fake(cutlass.BFloat16, batch, 2048),
         fake(cutlass.BFloat16, batch, hidden),
-        fake(cutlass.BFloat16, hidden // 64, 32, 64, 64),
-        fake(cutlass.BFloat16, 3 * hidden // 32, hidden // 64, 64, 64),
-        fake(cutlass.BFloat16, hidden // 64, 3 * hidden // 64, 64, 64),
+        fake(cutlass.BFloat16, hidden // tile_m, 32, tile_m, 64),
+        fake(cutlass.BFloat16, 3 * hidden // gate_channels, hidden // 64, tile_m, 64),
+        fake(cutlass.BFloat16, hidden // tile_m, 3 * hidden // 64, tile_m, 64),
         fake(cutlass.BFloat16, hidden),
         fake(cutlass.Int32, 2, bucket, hidden // 2),
-        fake(cutlass.Int32, 2, 3 * hidden // 32, bucket, 16),
+        fake(cutlass.Int32, 2, 3 * hidden // gate_channels, bucket, gate_channels // 2),
         fake(cutlass.Int32, 112 if hidden == 1024 else 96),
         fake(cutlass.BFloat16, batch, hidden),
         make_fake_stream(),
@@ -84,25 +86,27 @@ class FusedPostAttention(nn.Module):
         self.arch = device_arch(reference.o_proj.weight.device)
         self.reference = reference
         self.hidden = hidden
-        tiles = 3 * hidden // 32
+        tile_m = 128 if hidden == 2048 else 64
+        self.gate_channels = tile_m // 2
+        tiles = 3 * hidden // self.gate_channels
         packed = torch.cat(
             (
-                reference.gate_proj.weight.reshape(tiles, 32, hidden),
-                reference.up_proj.weight.reshape(tiles, 32, hidden),
+                reference.gate_proj.weight.reshape(tiles, self.gate_channels, hidden),
+                reference.up_proj.weight.reshape(tiles, self.gate_channels, hidden),
             ),
             dim=1,
         ).detach()
         self.register_buffer(
-            "packed_gate_up", packed.reshape(tiles, 64, hidden // 64, 64).permute(0, 2, 1, 3).contiguous()
+            "packed_gate_up", packed.reshape(tiles, tile_m, hidden // 64, 64).permute(0, 2, 1, 3).contiguous()
         )
         self.register_buffer(
             "packed_o",
-            reference.o_proj.weight.detach().reshape(hidden // 64, 64, 32, 64).permute(0, 2, 1, 3).contiguous(),
+            reference.o_proj.weight.detach().reshape(hidden // tile_m, tile_m, 32, 64).permute(0, 2, 1, 3).contiguous(),
         )
         self.register_buffer(
             "packed_down",
             reference.down_proj.weight.detach()
-            .reshape(hidden // 64, 64, 3 * hidden // 64, 64)
+            .reshape(hidden // tile_m, tile_m, 3 * hidden // 64, 64)
             .permute(0, 2, 1, 3)
             .contiguous(),
         )
@@ -122,7 +126,12 @@ class FusedPostAttention(nn.Module):
             device = attention.device
             self.workspaces[batch] = (
                 torch.full((2, bucket, self.hidden // 2), PAYLOAD_EMPTY, device=device, dtype=torch.int32),
-                torch.full((2, 3 * self.hidden // 32, bucket, 16), PAYLOAD_EMPTY, device=device, dtype=torch.int32),
+                torch.full(
+                    (2, 3 * self.hidden // self.gate_channels, bucket, self.gate_channels // 2),
+                    PAYLOAD_EMPTY,
+                    device=device,
+                    dtype=torch.int32,
+                ),
                 # The 1024-wide schedule also uses 16 prefetch hints.
                 torch.zeros(112 if self.hidden == 1024 else 96, device=device, dtype=torch.int32),
             )
@@ -241,7 +250,7 @@ def print_summary(results, layers, hidden=1024):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--batch-size", type=int, nargs="+", default=[16, 32], help="Decode batches")
+    parser.add_argument("--batch-size", type=int, nargs="+", default=[8, 16, 32], help="Decode batches")
     parser.add_argument("--hidden-size", type=int, choices=(1024, 2048), default=1024)
     parser.add_argument("--layers", type=int, default=28, help="Distinct weight sets to rotate through")
     parser.add_argument("--profile", action="store_true", help="Capture named CUDA-graph replays")
