@@ -37,3 +37,6 @@
 [submodule "mlsys/inference/sglang/sglang-omni"]
 	path = mlsys/inference/sglang/sglang-omni
 	url = https://github.com/pkuwangh/sglang-omni.git
+[submodule "mlsys/inference/deepinfer/DeepInfer"]
+	path = mlsys/inference/deepinfer/DeepInfer
+	url = https://github.com/deepseek-ai/DeepInfer.git
