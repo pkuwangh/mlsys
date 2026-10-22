@@ -25,7 +25,7 @@ from torch import nn
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mega_qwen3_tts.kernels._utils import device_arch, measure, report_error
+from mega_qwen3_tts.kernels._utils import device_arch, measure, print_kernel_summary, report_error
 
 # Packed BF16 negative zeros, matching the device kernels' unpublished payload.
 PAYLOAD_EMPTY = -2147450880
@@ -248,22 +248,11 @@ def benchmark(batch, layers, profile=False, hidden=1024):
 
 def print_summary(results, layers, hidden=1024):
     """Print per-block latency and baseline/fused speedups for every batch."""
-    headers = ["Batch", "Fused (us)", "Torch (us)", "Compiled (us)", "vs Torch", "vs Compiled"]
-    rows = [
-        [
-            str(batch),
-            *[f"{times[name]:.3f}" for name in ("Fused", "Torch", "Compiled")],
-            *[f"{times[name] / times['Fused']:.3f}x" for name in ("Torch", "Compiled")],
-        ]
-        for batch, times in results
-    ]
-    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
-    print(f"\nSummary: BF16, hidden={hidden}, {layers} weight sets, median interleaved CUDA-graph timing per block.")
-    print("Speedup=baseline/Fused. Compilation, weight packing and validation excluded.")
-    for index, row in enumerate([headers, *rows]):
-        print(" | ".join(value.rjust(width) for value, width in zip(row, widths)), flush=True)
-        if index == 0:
-            print("-+-".join("-" * width for width in widths), flush=True)
+    print_kernel_summary(
+        [((batch,), times) for batch, times in results],
+        columns=["Batch"],
+        workload=f"post-attention block, BF16, hidden={hidden}, {layers} weight sets",
+    )
 
 
 if __name__ == "__main__":

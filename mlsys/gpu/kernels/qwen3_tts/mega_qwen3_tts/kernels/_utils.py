@@ -14,7 +14,7 @@ def device_arch(device):
 
 
 @torch.inference_mode()
-def measure(functions: dict, samples: int = 3, replays: int = 5, *, profile=False):
+def measure(functions: dict, samples: int = 3, replays: int = 5, *, profile=False, calls_per_graph=1):
     """Warm and capture each callable; retain outputs and alternate timing order."""
     graphs, outputs = {}, {}
     for name, function in functions.items():
@@ -23,7 +23,8 @@ def measure(functions: dict, samples: int = 3, replays: int = 5, *, profile=Fals
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            outputs[name] = function()
+            for _ in range(calls_per_graph):
+                outputs[name] = function()
         graphs[name] = graph
     times = {name: [] for name in functions}
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -35,7 +36,7 @@ def measure(functions: dict, samples: int = 3, replays: int = 5, *, profile=Fals
                 graphs[name].replay()
             end.record()
             end.synchronize()
-            times[name].append(start.elapsed_time(end) * 1000 / replays)
+            times[name].append(start.elapsed_time(end) * 1000 / (replays * calls_per_graph))
     if profile:
         torch.cuda.cudart().cudaProfilerStart()
         with torch.cuda.nvtx.range("benchmark"):
@@ -76,6 +77,34 @@ def report_difference(name, actual, reference):
     )
 
 
+def print_table(headers, rows):
+    """Print aligned columns with a header separator."""
+    rows = [[str(value) for value in row] for row in rows]
+    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
+    print(" | ".join(value.rjust(width) for value, width in zip(headers, widths)), flush=True)
+    print("-+-".join("-" * width for width in widths), flush=True)
+    for row in rows:
+        print(" | ".join(value.rjust(width) for value, width in zip(row, widths)), flush=True)
+
+
+def print_kernel_summary(results, *, columns, workload):
+    """Print per-call microseconds and baseline/fused speedups after a kernel sweep."""
+    baselines = [name for name in ("Torch", "Compiled") if name in results[0][1]]
+    names = ["Fused", *baselines]
+    headers = [*columns, *[f"{name} (us)" for name in names], *[f"vs {name}" for name in baselines]]
+    rows = [
+        [
+            *case,
+            *[f"{times[name]:.3f}" for name in names],
+            *[f"{times[name] / times['Fused']:.3f}x" for name in baselines],
+        ]
+        for case, times in results
+    ]
+    print(f"\nSummary: {workload}, median interleaved CUDA-graph timing per call.")
+    print("Speedup=baseline/Fused. Compilation, preparation and validation excluded.")
+    print_table(headers, rows)
+
+
 def print_summary(results, *, workload):
     """Print model latency in milliseconds from timings measured in microseconds."""
     names = list(results[0][1])
@@ -85,9 +114,5 @@ def print_summary(results, *, workload):
         [str(batch), *[f"{times[name] / 1000:.3f}" for name in names], f"{times[baseline] / times['Fused']:.3f}x"]
         for batch, times in results
     ]
-    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
     print(f"\nSummary: milliseconds per {workload}.")
-    print(" | ".join(value.rjust(width) for value, width in zip(headers, widths)))
-    print("-+-".join("-" * width for width in widths))
-    for row in rows:
-        print(" | ".join(value.rjust(width) for value, width in zip(row, widths)), flush=True)
+    print_table(headers, rows)

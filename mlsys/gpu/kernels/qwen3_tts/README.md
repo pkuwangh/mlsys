@@ -135,6 +135,124 @@ shape, finiteness, and exact feedback checks still raise errors. These standalon
 checks do not establish speech quality.
 See [numerical attribution](design.md#predictor-numerical-attribution).
 
+## Auxiliary Kernels
+
+Standalone Hopper implementations; these additions are not wired into a serving
+framework or the waveform decoder yet. Each file runs correctness checks and an
+interleaved CUDA-graph benchmark against `torch.compile`, without a checkpoint:
+
+```bash
+python mega_qwen3_tts/kernels/embedding_update.py
+python mega_qwen3_tts/kernels/argmax_embedding.py
+python mega_qwen3_tts/kernels/sampling.py
+python mega_qwen3_tts/kernels/snake_beta.py
+```
+
+| File | Fused work |
+| --- | --- |
+| `embedding_update.py` | Embedding gather + BF16 accumulation + optional preprojected-table lookup |
+| `argmax_embedding.py` | Greedy selection + both lookups + optional accumulation and strided code writes |
+| `sampling.py` | Top-k + temperature + top-p + seeded Gumbel sampling, optionally including both lookups and accumulation; also accepts prefiltered log probabilities |
+| `snake_beta.py` | Channel scaling + sine + square + inverse-beta scaling + residual, preserving each eager BF16 rounding boundary |
+
+Embedding transfers use 128-bit loads/stores and packed BF16 additions. Independent
+loads precede stores to avoid serializing the accumulator read. Sampling packs a
+BF16 score and token ID into a 32-bit key, discards losing runs during top-k merge,
+and recovers scores from keys without rereading logits. One CTA handles each row.
+SnakeBeta uses packed BF16 arithmetic and precomputed immutable coefficients;
+large tensors additionally use a shared 128 KiB table covering every BF16 sine input.
+Small tensors retain direct sine because the extra lookup costs more there.
+
+New embedding paths require contiguous BF16 tables with widths divisible by eight;
+token IDs may be strided. Raw-logit sampling supports BF16 `[B,2048]`, top-k up to
+128, per-row GPU sampling parameters, and changing seeds/positions under graph
+replay. Equal logits use ascending token IDs, **not PyTorch's unspecified `topk`
+tie order**. Prefiltered sampling preserves the supplied candidate order and
+supports up to 2048 candidates. Floating-point cutoff boundaries can also affect
+same-seed parity. SnakeBeta accepts BCT or BTC storage, BF16 only; construct it on
+the final device before capture. The existing greedy kernel retains its mixed-dtype
+and irregular-width support.
+
+H200, CUTLASS DSL 4.8.0, Torch 2.13.0+cu132, synthetic inputs, 2026-10-22.
+Times below are microseconds per call: 16 calls/graph, median of three interleaved
+rounds of five replays. Compilation, allocation and immutable-table preparation
+are excluded. SnakeBeta's compiled reference preserves BF16 precision casts;
+the sampler baseline implements the same deterministic tie ordering.
+These are component measurements, not end-to-end speech throughput.
+
+| Operation | Shape | Compiled | CuTeDSL | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| Gather + accumulation | B16, D1024 | 1.300 | 1.230 | 1.06x |
+| Gather + accumulation + projected lookup | B16, D2048/1024 | 2.388 | 1.449 | 1.65x |
+| Greedy + gather + accumulation | B16, V2048, D1024 | 3.221 | 1.794 | 1.80x |
+| Greedy + both lookups + accumulation | B16, V2048, D2048/1024 | 3.574 | 2.274 | 1.57x |
+| Top-k/top-p sampling | B16, V2048, K50 | 26.591 | 4.615 | 5.76x |
+| Sampling + both lookups + accumulation | B16, V2048, K50, D2048/1024 | 28.911 | 5.258 | 5.50x |
+| Prefiltered sampling | B16, K50 | 4.242 | 1.944 | 2.18x |
+| Prefiltered sampling | B16, K2048 | 6.655 | 3.920 | 1.70x |
+| SnakeBeta, BCT storage | 4,64,16384 | 10.389 | 5.216 | 1.99x |
+| SnakeBeta, BTC storage | 4,64,131072 | 93.800 | 37.294 | 2.52x |
+
+Not every case wins: prefiltered K50 sampling takes 1.879 vs 1.763 us at B1 and
+1.991 vs 1.862 us at B32. Small SnakeBeta and
+plain gathers are approximately tied. `--tune` exposes the retained launch choices
+in the new files.
+
+Changed-input graph checks pass, including accumulation and untouched code slots.
+Both SnakeBeta paths match eager Torch across all 65,536 BF16 input encodings with
+eight coefficient pairs. H200 memcheck/racecheck pass. Inspected SASS confirms
+vectorized transfers and packed arithmetic without register spills.
+
+Matched comparison against the local Omni Triton implementations (`02993ce46`),
+on one H200 (`viking-prod-309`), Torch 2.14.1+cu132 / Triton 3.8.0. Same inputs,
+interleaved unprofiled graphs and timing method as above; microseconds per call:
+
+| Operation | Shape | Triton path | CuTeDSL | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| Gather + accumulation | B16, D1024 | 1.225 | 1.213 | 1.01x |
+| Gather + accumulation + projected lookup | B16, D2048/1024 | 1.494 | 1.420 | 1.05x |
+| Greedy + both lookups + accumulation | B16, V2048, D2048/1024 | 9.662 | 2.252 | 4.29x |
+| Top-k/top-p sampling | B16, V2048, K50 | 6.110 | 4.602 | 1.33x |
+| Sampling + both lookups + accumulation | B16, V2048, K50, D2048/1024 | 7.514 | 5.260 | 1.43x |
+| Prefiltered sampling | B16, K50 | 2.021 | 1.938 | 1.04x |
+| Prefiltered sampling | B16, K1024 | 4.533 | 2.877 | 1.58x |
+| SnakeBeta, BCT storage | 4,64,16384 | 8.128 | 5.312 | 1.53x |
+| SnakeBeta, BTC storage | 4,64,131072 | 73.827 | 37.630 | 1.96x |
+
+The greedy baseline is **Torch argmax followed by Triton gather**, not a single
+Triton kernel. SnakeBeta prepares immutable coefficients and its sine table outside
+timing; Triton recomputes coefficients per call. Gather, greedy, prefiltered and
+SnakeBeta outputs match exactly on these inputs. A separate multi-seed check matched
+160/160 draws for both K50 and K128. K16 matched 137/160; all 23 differing token IDs
+had equal BF16 logits. K16 is excluded from the table because its tie ordering is
+not a drop-in match.
+The full B1/B16/B32 sweep is saved in `tmp/qtts_aux_h200_triton_comparison.json`.
+
+The sampling rows above predate overlapping Gumbel generation with merge/softmax.
+An interleaved H200 A/B test (Torch 2.13.0+cu132, same timing method, eight warps)
+measured the scheduling change alone:
+
+| Operation | Shape | Before (us) | After (us) | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| Sampling | B16, K50 | 4.609 | 3.613 | 1.28x |
+| Sampling + both lookups + accumulation | B16, K50 | 5.212 | 4.238 | 1.23x |
+| Sampling | B16, K128 | 6.191 | 4.355 | 1.42x |
+| Sampling + both lookups + accumulation | B16, K128 | 6.608 | 4.924 | 1.34x |
+
+All 48 combinations of B1/16/32, K1/16/50/128, four/eight warps, and optional
+embedding updates matched the previous kernel exactly across five changed-input
+draws per case. Results: `tmp/qtts_sampling_overlap_bench.json`.
+The updated kernel passes memcheck/racecheck and the changed-input graph tests.
+K50 SASS uses 30 registers/thread with no spills and retains 128-bit transfers
+and packed BF16 embedding arithmetic.
+
+The standalone embedding kernel now assigns projected lookups to separate CTAs
+in the same launch. On H200, B16/D2048/DP1024 improves from 1.39 to 1.17 us
+(32 to 48 CTAs at 128 threads); issuing both lookups early in the original CTAs
+takes 1.25 us. Unprojected lookup timings are unchanged within measurement noise.
+Interleaved A/B results: `tmp/qtts_embedding_partition_bench.json` and
+`tmp/qtts_embedding_partition_tuning.json`. The older tables above predate this change.
+
 ## Talker Validation
 
 The Torch reference follows upstream Qwen-TTS BF16 rounding; the compiled
@@ -323,3 +441,31 @@ Useful phases:
 
 IKET ranges include waits and instrumentation overhead. Nested or overlapping
 warp ranges cannot be summed into kernel time. Use unprofiled A/B timing for performance.
+
+Auxiliary kernels also have IKET markers: `logits_load_keys`, `warp_topk`,
+`candidate_handoff`, `merge_topk`, `softmax`, `top_p_gumbel`, `sample_handoff`,
+`embedding_load`, and `embedding_store_add`. Greedy and prefiltered sampling
+mark their reductions; SnakeBeta marks coefficient loading, sine and final stores.
+The markers are inactive in normal compilation.
+
+H200 captures in `tmp/` (2026-10-22):
+
+- `qwen3_tts_aux_h200_b16_cta0_iket_20261022.pftrace`: one CTA per variant;
+  B16 selection/embedding and B4/C64/T16384 SnakeBeta, both direct sine and lookup.
+- `qwen3_tts_sampling_h200_b32_all_ctas_iket_20261022.pftrace`: all CTAs,
+  K50 sampling with/without embedding and prefiltered K50/K1024 sampling.
+
+These combined captures include seconds of setup between microsecond launches;
+at full zoom the kernel events are almost invisible. Prefer the per-launch exports
+`qwen3_tts_<operation>_h200_<shape>_iket_20261022.pftrace` in `tmp/`, for example
+`qwen3_tts_sampling_k50_embedding_h200_b32_all_ctas_iket_20261022.pftrace`.
+They preserve the original events/timestamps but omit other launches and unused
+tracks, so each opens at microsecond scale.
+
+The captures above predate the sampling overlap change. Sampling now computes
+rank-based FP64 noise in helper warps (`gumbel_prepare`) while warp 0 merges
+candidates and computes softmax. After `gumbel_ready`, warp 0 applies top-p and
+selects the winner. Other warps then gather embeddings; their `sample_handoff`
+wait overlaps warp 0's work and is not an additional independent cost.
+The updated single-launch trace is
+`tmp/qwen3_tts_sampling_k50_embedding_h200_b16_overlap_iket_20261022.pftrace`.
