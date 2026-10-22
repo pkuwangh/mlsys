@@ -28,6 +28,8 @@ def pre_attention_kernel(
     CAPACITY: cutlass.Constexpr,
     EPS: cutlass.Constexpr,
     H: cutlass.Constexpr,
+    cache_slots: cute.Tensor | None = None,
+    value_cache: cute.Tensor | None = None,
 ):
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -133,9 +135,14 @@ def pre_attention_kernel(
             pass
         iket.range_pop()
         iket.range_push("head_norm_rope_cache")
-        position = positions[0]
         for token in cutlass.range_constexpr(N // 16):
             row = warp + token * 16
+            position = positions[0]
+            slot = cutlass.Int64(0)
+            if cutlass.const_expr(value_cache is not None):  # noqa: SIM102 - preserve DSL specialization guard
+                if row < B:
+                    position = positions[row]
+                    slot = cutlass.Int64(cache_slots[row])
             channel = lane * 4
             half, local_channel = channel // 64, channel % 64
             first = partials.load(idx=(half * 2 * N + row) * 64 + local_channel, vector_size=4, alignment=16)
@@ -159,8 +166,24 @@ def pre_attention_kernel(
                 for i in cutlass.range_constexpr(4):
                     opposite = cute.arch.shuffle_sync_bfly(scaled[i], 16)
                     rotated[i] = cutlass.select_(channel < 64, -opposite, opposite)
-                cv = (cos.iterator.raw_ptr() + channel).load(count=4, alignment=8).to(cutlass.Float32)
-                sv = (sin.iterator.raw_ptr() + channel).load(count=4, alignment=8).to(cutlass.Float32)
+                if cutlass.const_expr(value_cache is not None):
+                    # Token positions select rows in the [cos64, sin64] table.
+                    rope_offset = position * 128 + channel % 64
+                    cv = (
+                        (cos.iterator.raw_ptr() + rope_offset)
+                        .load(count=4, alignment=8)
+                        .to(cutlass.BFloat16)
+                        .to(cutlass.Float32)
+                    )
+                    sv = (
+                        (cos.iterator.raw_ptr() + rope_offset + 64)
+                        .load(count=4, alignment=8)
+                        .to(cutlass.BFloat16)
+                        .to(cutlass.Float32)
+                    )
+                else:
+                    cv = (cos.iterator.raw_ptr() + channel).load(count=4, alignment=8).to(cutlass.Float32)
+                    sv = (sin.iterator.raw_ptr() + channel).load(count=4, alignment=8).to(cutlass.Float32)
                 left = (scaled * cv).to(cutlass.BFloat16).to(cutlass.Float32)
                 right = (rotated.load().to_vector() * sv).to(cutlass.BFloat16).to(cutlass.Float32)
                 result = (left + right).to(cutlass.BFloat16)
@@ -168,13 +191,21 @@ def pre_attention_kernel(
                     if head < 16:
                         (q.iterator.raw_ptr() + (row * 16 + head) * 128 + channel).store(result, alignment=8)
                     else:
-                        (kv.iterator.raw_ptr() + ((row * 8 + head - 16) * CAPACITY + position) * 128 + channel).store(
-                            result, alignment=8
-                        )
+                        if cutlass.const_expr(value_cache is not None):
+                            (kv.iterator.raw_ptr() + (slot * 8 + head - 16) * 128 + channel).store(result, alignment=8)
+                        else:
+                            (
+                                kv.iterator.raw_ptr() + ((row * 8 + head - 16) * CAPACITY + position) * 128 + channel
+                            ).store(result, alignment=8)
             else:
                 if row < B:
-                    offset = B * 8 * CAPACITY * 128 + ((row * 8 + head - 24) * CAPACITY + position) * 128 + channel
-                    (kv.iterator.raw_ptr() + offset).store(projected, alignment=8)
+                    if cutlass.const_expr(value_cache is not None):
+                        (value_cache.iterator.raw_ptr() + (slot * 8 + head - 24) * 128 + channel).store(
+                            projected, alignment=8
+                        )
+                    else:
+                        offset = B * 8 * CAPACITY * 128 + ((row * 8 + head - 24) * CAPACITY + position) * 128 + channel
+                        (kv.iterator.raw_ptr() + offset).store(projected, alignment=8)
         iket.range_pop()
     if cutlass.const_expr(mask is not None):  # noqa: SIM102 - preserve DSL specialization guard
         # Rank 1 of the first cluster is free while rank 0 finishes its epilogue.
@@ -205,10 +236,29 @@ def pre_attention_host(
     CAPACITY: cutlass.Constexpr,
     EPS: cutlass.Constexpr,
     H: cutlass.Constexpr,
+    cache_slots: cute.Tensor | None = None,
+    value_cache: cute.Tensor | None = None,
 ):
     weight_map = tensor_map.create_tensor_map_tiled_from_view(
         weights, (1, H // 128, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
     )
     pre_attention_kernel(
-        x, gamma, weight_map, qgamma, kgamma, cos, sin, positions, kv, q, mask, B, N, CAPACITY, EPS, H
+        x,
+        gamma,
+        weight_map,
+        qgamma,
+        kgamma,
+        cos,
+        sin,
+        positions,
+        kv,
+        q,
+        mask,
+        B,
+        N,
+        CAPACITY,
+        EPS,
+        H,
+        cache_slots,
+        value_cache,
     ).launch(grid=(128, 1, 1), block=(512, 1, 1), cluster=(4, 1, 1), stream=stream)

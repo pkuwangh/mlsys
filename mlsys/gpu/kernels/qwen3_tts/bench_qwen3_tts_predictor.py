@@ -78,7 +78,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--model", help="Local Qwen3-TTS checkpoint; omitted for random weights")
     parser.add_argument("--inputs", help="Replay .pt with hidden [B,1,D] and first_code [B,1] from the matching talker")
-    parser.add_argument("--batch-size", nargs="+", type=int, default=[16, 32], help="Frame batches")
+    parser.add_argument("--batch-size", nargs="+", type=int, default=[1, 8, 16, 32], help="Frame batches")
     parser.add_argument("--profile", action="store_true", help="Capture one full-frame graph replay per variant")
     parser.add_argument(
         "--fused-selection",

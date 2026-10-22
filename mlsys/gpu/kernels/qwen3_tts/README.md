@@ -13,7 +13,7 @@ CTA/warp schedules, memory handoffs, and retained design decisions.
 ## Run
 
 Use a Hopper or datacenter Blackwell GPU and the `mlsys-gpu` environment with
-CUTLASS DSL experimental primitives. No SGLang runtime is required. Run from this directory:
+CUTLASS DSL experimental primitives. Run from this directory:
 
 ```bash
 # Complete post-attention block, correctness checks, and compiled Torch baseline.
@@ -32,7 +32,7 @@ python bench_qwen3_tts_talker.py --model /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoic
 python bench_qwen3_tts_talker.py --model /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice
 ```
 
-Backbone defaults: BF16, B=16/32, 28 layers, 128 prefix tokens. Multi-token
+Backbone defaults: BF16, B=1/8/16/32, 28 layers, 128 prefix tokens. Multi-token
 prefill stays eager; custom decode uses fused QKV preparation, cuDNN attention
 through Torch SDPA, fused post-attention, and compiled remaining Torch operations.
 The specialization supports B=1..32, one shared decode position, and immutable
@@ -62,6 +62,23 @@ three samples of five replays; compilation, packing, allocation, and cache setup
 are excluded. Backbone timing repeatedly overwrites the final fixed KV slot,
 not a growing-context generation loop.
 
+## Cache-Slot Interface
+
+`SlotPreAttention` accepts per-token positions and writes directly to separate,
+caller-owned K/V buffers of shape `[slots, 8, 128]`. RoPE uses a
+`[positions, 128]` table containing 64 cosine and 64 sine values per position.
+`PackedPostAttention` accepts projection and normalization weights directly,
+without a reference-model dependency. Construct both modules before graph capture.
+
+```bash
+python -m pytest test_cache_slots.py -q
+```
+
+Tests check changing positions/slots under CUDA graph replay, untouched cache
+entries, irregular batches, both hidden widths, and post-attention workspace reuse
+against the Torch reference. The cache-slot path has been tested on H200;
+Blackwell validation remains outstanding.
+
 ## Code Predictor
 
 ```bash
@@ -85,7 +102,7 @@ views, avoiding repeated setup kernels while retaining a fixed-capacity KV cache
 
 The benchmark compares eager, compiled, and fused **complete frame generation**:
 prefix, decode, greedy selection, embedding lookup, and the final embedding sum.
-All three use interleaved CUDA graphs. Defaults are B=16/32; `--profile` captures
+All three use interleaved CUDA graphs. Defaults are B=1/8/16/32; `--profile` captures
 one frame per variant. Optional `--inputs` loads a `.pt` with `hidden [B,1,1024]`
 and `first_code [B,1]` from the matching talker. Otherwise inputs are synthetic.
 
@@ -114,8 +131,9 @@ no indexing, cache-write, or BF16-boundary mismatch was found in the tested case
 Eager Torch is not an exact-arithmetic oracle: using FP64 projection reductions
 with the same BF16 output boundaries also changes codes (81.25% agreement at B32).
 The benchmark reports numerical differences without a tolerance-based failure;
-shape, finiteness, and exact feedback checks still raise errors. Speech quality
-has not been evaluated. See [numerical attribution](design.md#predictor-numerical-attribution).
+shape, finiteness, and exact feedback checks still raise errors. These standalone
+checks do not establish speech quality.
+See [numerical attribution](design.md#predictor-numerical-attribution).
 
 ## Talker Validation
 
@@ -138,8 +156,8 @@ of 0.921%/2.395%. This does not establish free-running speech quality.
 
 Both model benchmarks report numerical differences and top-code agreement,
 rejecting shape mismatches and non-finite values. Standalone kernels retain
-tolerance-based assertions. Diverse-request and free-running quality validation
-remain necessary before serving integration.
+tolerance-based assertions. Free-running speech-quality validation is outside
+the scope of these standalone benchmarks.
 
 ## Representative Results
 

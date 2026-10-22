@@ -90,7 +90,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--model", help="Local Qwen3-TTS checkpoint; omitted for random weights")
     parser.add_argument("--inputs", help="Replay .pt with prefix/decode [B,T,hidden] embeddings; overrides --context")
-    parser.add_argument("--batch-size", nargs="+", type=int, default=[16, 32], help="Decode batches")
+    parser.add_argument("--batch-size", nargs="+", type=int, default=[1, 8, 16, 32], help="Decode batches")
     parser.add_argument("--context", type=int, default=128, help="Prefill token count")
     parser.add_argument("--layers", type=int, help="Override layer count for a short development run")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True, help="Compile Torch baseline")

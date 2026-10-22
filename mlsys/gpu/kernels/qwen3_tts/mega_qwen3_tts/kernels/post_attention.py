@@ -69,30 +69,31 @@ def compile_kernel(batch, bucket, eps, arch, hidden=1024):
     )
 
 
-class FusedPostAttention(nn.Module):
+class PackedPostAttention(nn.Module):
     """Inference-only replacement; each instance owns a serialized workspace."""
 
-    def __init__(self, reference):
+    def __init__(self, o_weight, gate_weight, up_weight, down_weight, norm_weight, eps):
         super().__init__()
-        hidden = reference.o_proj.weight.shape[0]
+        hidden = o_weight.shape[0]
         if (
             hidden not in (1024, 2048)
-            or tuple(reference.o_proj.weight.shape) != (hidden, 2048)
-            or tuple(reference.gate_proj.weight.shape) != (3 * hidden, hidden)
+            or tuple(o_weight.shape) != (hidden, 2048)
+            or tuple(gate_weight.shape) != (3 * hidden, hidden)
         ):
             raise ValueError("The fused block supports hidden=1024/2048, attention=2048, FFN=3*hidden")
-        if reference.o_proj.weight.dtype != torch.bfloat16 or not reference.o_proj.weight.is_cuda:
+        if o_weight.dtype != torch.bfloat16 or not o_weight.is_cuda:
             raise ValueError("The fused block requires CUDA BF16 weights")
-        self.arch = device_arch(reference.o_proj.weight.device)
-        self.reference = reference
+        self.arch = device_arch(o_weight.device)
+        self.register_buffer("norm_weight", norm_weight.detach())
+        self.eps = eps
         self.hidden = hidden
         tile_m = 128 if hidden == 2048 else 64
         self.gate_channels = tile_m // 2
         tiles = 3 * hidden // self.gate_channels
         packed = torch.cat(
             (
-                reference.gate_proj.weight.reshape(tiles, self.gate_channels, hidden),
-                reference.up_proj.weight.reshape(tiles, self.gate_channels, hidden),
+                gate_weight.reshape(tiles, self.gate_channels, hidden),
+                up_weight.reshape(tiles, self.gate_channels, hidden),
             ),
             dim=1,
         ).detach()
@@ -101,11 +102,11 @@ class FusedPostAttention(nn.Module):
         )
         self.register_buffer(
             "packed_o",
-            reference.o_proj.weight.detach().reshape(hidden // tile_m, tile_m, 32, 64).permute(0, 2, 1, 3).contiguous(),
+            o_weight.detach().reshape(hidden // tile_m, tile_m, 32, 64).permute(0, 2, 1, 3).contiguous(),
         )
         self.register_buffer(
             "packed_down",
-            reference.down_proj.weight.detach()
+            down_weight.detach()
             .reshape(hidden // tile_m, tile_m, 3 * hidden // 64, 64)
             .permute(0, 2, 1, 3)
             .contiguous(),
@@ -114,9 +115,6 @@ class FusedPostAttention(nn.Module):
 
     @torch.compiler.disable
     def forward(self, attention, residual):
-        # Prefill stays in Torch; only one-token decoding uses this schedule.
-        if attention.ndim == 3 and attention.shape[1] != 1:
-            return self.reference(attention, residual)
         batch = attention.shape[0]
         if not 1 <= batch <= 32:
             raise ValueError("Fused decode supports 1 <= B <= 32")
@@ -136,19 +134,39 @@ class FusedPostAttention(nn.Module):
                 torch.zeros(112 if self.hidden == 1024 else 96, device=device, dtype=torch.int32),
             )
         output = torch.empty_like(residual, memory_format=torch.contiguous_format)
-        fn = compile_kernel(batch, bucket, self.reference.norm.eps, self.arch, self.hidden)
+        fn = compile_kernel(batch, bucket, self.eps, self.arch, self.hidden)
         fn(
             attention.reshape(batch, 2048),
             residual.reshape(batch, self.hidden),
             self.packed_o,
             self.packed_gate_up,
             self.packed_down,
-            self.reference.norm.weight,
+            self.norm_weight,
             *self.workspaces[batch],
             output.reshape(batch, self.hidden),
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
         return output
+
+
+class FusedPostAttention(PackedPostAttention):
+    """Reference-model adapter retaining its multi-token prefill path."""
+
+    def __init__(self, reference):
+        super().__init__(
+            reference.o_proj.weight,
+            reference.gate_proj.weight,
+            reference.up_proj.weight,
+            reference.down_proj.weight,
+            reference.norm.weight,
+            reference.norm.eps,
+        )
+        self.reference = reference
+
+    def forward(self, attention, residual):
+        if attention.ndim == 3 and attention.shape[1] != 1:
+            return self.reference(attention, residual)
+        return super().forward(attention, residual)
 
 
 @torch.inference_mode()
@@ -250,7 +268,7 @@ def print_summary(results, layers, hidden=1024):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--batch-size", type=int, nargs="+", default=[8, 16, 32], help="Decode batches")
+    parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 8, 16, 32], help="Decode batches")
     parser.add_argument("--hidden-size", type=int, choices=(1024, 2048), default=1024)
     parser.add_argument("--layers", type=int, default=28, help="Distinct weight sets to rotate through")
     parser.add_argument("--profile", action="store_true", help="Capture named CUDA-graph replays")

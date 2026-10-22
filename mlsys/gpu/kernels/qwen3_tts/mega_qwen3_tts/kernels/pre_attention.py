@@ -60,6 +60,96 @@ def compile_kernel(batch, bucket, capacity, eps, write_mask, arch, hidden=1024):
     )
 
 
+@cache
+def compile_slot_kernel(batch, hidden, slots, rope_positions, rope_dtype, slot_dtype, eps, arch):
+    """Use per-token positions and flat caller-owned K/V cache slots."""
+    if arch == "sm_90a":
+        from mega_qwen3_tts.kernels.sm90.pre_attention import pre_attention_host
+    else:
+        from mega_qwen3_tts.kernels.sm100.pre_attention import pre_attention_host
+
+    def fake(dtype, *shape):
+        return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))))
+
+    rope_type = cutlass.Float32 if rope_dtype == torch.float32 else cutlass.BFloat16
+    slot_type = cutlass.Int64 if slot_dtype == torch.int64 else cutlass.Int32
+    return cute.compile(
+        pre_attention_host,
+        fake(cutlass.BFloat16, batch, hidden),
+        fake(cutlass.BFloat16, hidden),
+        fake(cutlass.BFloat16, 64, hidden // 64, 64, 64),
+        fake(cutlass.BFloat16, 128),
+        fake(cutlass.BFloat16, 128),
+        fake(rope_type, rope_positions, 128),
+        fake(rope_type, rope_positions, 128),
+        fake(cutlass.Int64, batch),
+        fake(cutlass.BFloat16, slots, 8, 128),
+        fake(cutlass.BFloat16, batch, 16, 1, 128),
+        None,
+        make_fake_stream(),
+        batch,
+        16 if batch <= 16 else 32,
+        0,
+        eps,
+        hidden,
+        fake(slot_type, batch),
+        fake(cutlass.BFloat16, slots, 8, 128),
+        options=f"--enable-tvm-ffi --gpu-arch={arch} --ptxas-options=--fmad=false",
+    )
+
+
+class SlotPreAttention(nn.Module):
+    """Fused preparation writing separate token-major K/V buffers."""
+
+    def __init__(self, norm_weight, qkv_weight, q_norm_weight, k_norm_weight, eps):
+        super().__init__()
+        self.hidden = norm_weight.numel()
+        if self.hidden not in (1024, 2048) or qkv_weight.shape != (4096, self.hidden):
+            raise ValueError("Expected hidden=1024/2048 and Q=16, KV=8, head_dim=128")
+        self.arch = device_arch(norm_weight.device)
+        self.eps = eps
+        self.register_buffer("norm_weight", norm_weight.detach())
+        self.register_buffer("q_norm_weight", q_norm_weight.detach())
+        self.register_buffer("k_norm_weight", k_norm_weight.detach())
+        self.register_buffer(
+            "packed_weights",
+            qkv_weight.detach().reshape(64, 64, self.hidden // 64, 64).permute(0, 2, 1, 3).contiguous(),
+        )
+
+    @torch.compiler.disable
+    def forward(self, x, positions, rope_cache, cache_slots, key_cache, value_cache):
+        batch = x.shape[0]
+        if not 1 <= batch <= 32:
+            raise ValueError("Slot QKV supports 1 <= token rows <= 32")
+        q = torch.empty((batch, 16, 1, 128), device=x.device, dtype=x.dtype)
+        compile_slot_kernel(
+            batch,
+            self.hidden,
+            key_cache.shape[0],
+            rope_cache.shape[0],
+            rope_cache.dtype,
+            cache_slots.dtype,
+            self.eps,
+            self.arch,
+        )(
+            x,
+            self.norm_weight,
+            self.packed_weights,
+            self.q_norm_weight,
+            self.k_norm_weight,
+            rope_cache,
+            rope_cache,
+            positions,
+            key_cache,
+            q,
+            None,
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            cache_slots,
+            value_cache,
+        )
+        return q.reshape(batch, 2048)
+
+
 class FusedPreAttention(nn.Module):
     """Decode-only QKV preparation with a contiguous, caller-owned KV cache."""
 
@@ -248,7 +338,7 @@ def benchmark(batch, layers, capacity, profile=False, write_mask=False, hidden=1
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--batch-size", nargs="+", type=int, default=[8, 16, 32])
+    parser.add_argument("--batch-size", nargs="+", type=int, default=[1, 8, 16, 32])
     parser.add_argument("--hidden-size", type=int, choices=(1024, 2048), default=1024)
     parser.add_argument("--layers", type=int, default=28, help="Distinct weight sets")
     parser.add_argument("--capacity", type=int, default=129, help="KV-cache capacity")
