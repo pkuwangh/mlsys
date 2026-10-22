@@ -13,13 +13,13 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(OMNI_DIR))
 
 
-async def profile_requests(config, concurrencies):
+async def profile_requests(config, concurrencies, requests):
     import torch
     from benchmarks.dataset.seedtts import load_seedtts_samples
     from benchmarks.eval.benchmark_tts_seedtts import run_tts_seedtts_benchmark
     from benchmarks.metrics.performance import print_speed_summary
 
-    samples = load_seedtts_samples(config.meta, 2 * max(concurrencies), split="en")
+    samples = load_seedtts_samples(config.meta, requests or 2 * max(concurrencies), split="en")
     for concurrency in concurrencies:
         point = replace(config, concurrency=concurrency, output_dir=str(Path(config.output_dir) / f"c{concurrency}"))
         print(f"Warming up {concurrency} requests...", flush=True)
@@ -32,7 +32,9 @@ async def profile_requests(config, concurrencies):
             raise RuntimeError("Warmup failed; see speed_results.json")
         print(f"Starting benchmark NVTX range: concurrency={concurrency}", flush=True)
         with torch.cuda.nvtx.range("benchmark"):
-            result = await run_tts_seedtts_benchmark(point, samples=samples[: 2 * concurrency], save_audio=False)
+            result = await run_tts_seedtts_benchmark(
+                point, samples=samples[: requests or 2 * concurrency], save_audio=False
+            )
         print_speed_summary(result["summary"], config.model, concurrency=concurrency)
         if result["summary"]["failed_requests"]:
             raise RuntimeError("Some profiled requests failed; see speed_results.json")
@@ -44,9 +46,12 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", help="CustomVoice checkpoint")
     parser.add_argument("--stream", action="store_true", help="Use streaming audio responses")
     parser.add_argument("--seed", type=int, default=None, help="Sampling seed for paired profiling runs")
+    parser.add_argument("--requests", type=int, help="Measured requests; default is twice each concurrency")
     args = parser.parse_args()
     if min(args.concurrencies) < 1:
         parser.error("concurrency must be positive")
+    if args.requests is not None and args.requests < max(args.concurrencies):
+        parser.error("requests must be at least the largest concurrency")
 
     from benchmarks.benchmarker.utils import managed_omni_server
     from benchmarks.eval.benchmark_tts_seedtts import TtsSeedttsBenchmarkConfig
@@ -77,7 +82,7 @@ def main():
         timeout=float(os.environ.get("SGLANG_OMNI_STARTUP_TIMEOUT", "1200")),
         wait_for_gpu_release=False,
     ):
-        asyncio.run(profile_requests(config, args.concurrencies))
+        asyncio.run(profile_requests(config, args.concurrencies, args.requests))
 
 
 if __name__ == "__main__":
