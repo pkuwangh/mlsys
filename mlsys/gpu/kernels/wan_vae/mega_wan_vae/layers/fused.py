@@ -1,36 +1,62 @@
-"""Wan VAE decoding with custom input, convolution, and post-processing kernels.
+"""Shared Wan residual and attention adapters with opaque custom operations.
 
-Reuse the Torch reference's temporal loop and unsupported layers. Custom kernels
-cover latent input packing/convolution, attention post-processing, and C256
-convolution fusion. C512 stages use cuDNN convolutions with custom standalone
-post-processing. Opaque ops retain fullgraph compilation of surrounding Torch
-work; NCTHW/NTHWC boundaries are stride views.
+Wan 2.1 fuses C96/C192 convolution epilogues; Wan 2.2 uses the C256 path here.
+Shape-specific cuDNN fallbacks use the same preparation operations.
+Opaque ops retain fullgraph compilation of surrounding Torch work;
+NCTHW/NTHWC boundaries are stride views.
 """
 
 import torch
 import torch.nn.functional as F
-from wan_vae_reference import (
+
+from .._utils import FeatCache, update_cache
+from ..kernels._precision import resolve_precision
+from ..kernels.conv import ConvConfig, WanConv3d, prepare, prepare_next, prepare_spatial_residual
+from ..kernels.memory import pack_history
+from ..kernels.norm import rmsnorm, rmsnorm_silu_conv_prep
+from .torch import (
     RawWanResidualBlock,
-    TorchWanVaeDecoder,
     raw_cached_causal_conv3d,
     raw_canonicalize_cache,
     raw_conv2d,
     raw_dup_up3d,
 )
 
-from ._utils import FeatCache, update_cache
-from .kernels.conv import ConvConfig, WanConv3d, prepare, prepare_next
-from .kernels.memory import pack_history
-from .kernels.norm import rmsnorm_silu_conv_prep
+
+@torch.library.custom_op("wan_vae::rmsnorm", mutates_args=())
+def _rmsnorm(x: torch.Tensor, gamma: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+    """Keep the eager channel reduction tree across torch.compile boundaries."""
+    is_image = x.ndim == 4
+    value = x.unsqueeze(2) if is_image else x
+    value = value.permute(0, 2, 3, 4, 1).contiguous()
+    out = rmsnorm(value, gamma, bias).permute(0, 4, 1, 2, 3)
+    return out.squeeze(2) if is_image else out
+
+
+@_rmsnorm.register_fake
+def _rmsnorm_fake(x, gamma, bias):
+    return torch.empty_like(x, memory_format=torch.channels_last if x.ndim == 4 else torch.channels_last_3d)
+
+
+class _FusedRMSNorm(torch.nn.Module):
+    """Preserve norm weights and channel-first API with a fixed reduction tree."""
+
+    def __init__(self, norm):
+        super().__init__()
+        self.norm = norm
+
+    def forward(self, x):
+        bias = self.norm.bias
+        return _rmsnorm(x, self.norm.gamma.reshape(-1), bias.reshape(-1) if isinstance(bias, torch.Tensor) else None)
 
 
 @torch.library.custom_op("wan_decoder::input_conv3d", mutates_args=())
 def _input_conv3d(
-    x: torch.Tensor, weight: torch.Tensor, previous: torch.Tensor | None, ctas: int
+    x: torch.Tensor, weight: torch.Tensor, previous: torch.Tensor | None, ctas: int, precision: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack strided latent input/history and run the C48->C1024 convolution."""
     packed = pack_history(x, previous, input_ncthw=True)
-    cfg = ConvConfig(*packed.padded.shape, co=weight.shape[0], ctas=ctas)
+    cfg = ConvConfig(*packed.padded.shape, co=weight.shape[0], ctas=ctas, precision=precision)
     output = prepare(packed.padded, weight, cfg)()
     stream = torch.cuda.current_stream(x.device)
     for tensor in (x, weight, previous, packed.padded, packed.cache, output):
@@ -40,7 +66,7 @@ def _input_conv3d(
 
 
 @_input_conv3d.register_fake
-def _input_conv3d_fake(x, weight, previous, ctas):
+def _input_conv3d_fake(x, weight, previous, ctas, precision):
     """Describe the raw convolution and unpadded latent-history cache."""
     n, c, t, h, w = x.shape
     history = 0 if previous is None else previous.shape[1]
@@ -98,10 +124,12 @@ def _conv_residual_norm_prepare(
     previous: torch.Tensor | None,
     residual: torch.Tensor,
     ctas: int,
+    precision: str,
+    save_residual: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fuse conv2 and its residual into the following block's normalized input."""
-    cfg = ConvConfig(*x.shape, co=weight.shape[0], ctas=ctas)
-    result = prepare_next(x, weight, bias, gamma, cfg, previous, residual=residual)()
+    """Fuse conv2 into normalized consumer input, optionally retaining its skip."""
+    cfg = ConvConfig(*x.shape, co=weight.shape[0], ctas=ctas, precision=precision)
+    result = prepare_next(x, weight, bias, gamma, cfg, previous, residual=residual, save_residual=save_residual)()
     stream = torch.cuda.current_stream(x.device)
     for tensor in (
         x,
@@ -116,14 +144,14 @@ def _conv_residual_norm_prepare(
     ):
         if tensor is not None:
             tensor.record_stream(stream)
-    return result.padded, result.cache, result.residual
+    return result.padded, result.cache, result.residual if result.residual is not None else x.new_empty((0,))
 
 
 @_conv_residual_norm_prepare.register_fake
-def _conv_residual_norm_prepare_fake(x, weight, bias, gamma, previous, residual, ctas):
-    """Describe prepared next-block input and the rounded residual sum."""
-    padded, cache = _conv_norm_prepare_fake(x, weight, bias, gamma, previous, ctas)
-    return padded, cache, torch.empty_like(residual)
+def _conv_residual_norm_prepare_fake(x, weight, bias, gamma, previous, residual, ctas, precision, save_residual=True):
+    """Describe prepared input and an optional rounded residual sum."""
+    padded, cache = _conv_norm_prepare_fake(x, weight, bias, gamma, previous, ctas, precision)
+    return padded, cache, torch.empty_like(residual) if save_residual else x.new_empty((0,))
 
 
 @torch.library.custom_op("wan_decoder::conv_norm_prepare", mutates_args=())
@@ -134,9 +162,10 @@ def _conv_norm_prepare(
     gamma: torch.Tensor,
     previous: torch.Tensor | None,
     ctas: int,
+    precision: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run convolution/bias/norm/SiLU and produce padded input plus cache."""
-    cfg = ConvConfig(*x.shape, co=weight.shape[0], ctas=ctas)
+    cfg = ConvConfig(*x.shape, co=weight.shape[0], ctas=ctas, precision=precision)
     result = prepare_next(x, weight, bias, gamma, cfg, previous)()
     stream = torch.cuda.current_stream(x.device)
     for tensor in (x, weight, bias, gamma, previous, result.padded, result.cache):
@@ -146,7 +175,7 @@ def _conv_norm_prepare(
 
 
 @_conv_norm_prepare.register_fake
-def _conv_norm_prepare_fake(x, weight, bias, gamma, previous, ctas):
+def _conv_norm_prepare_fake(x, weight, bias, gamma, previous, ctas, precision):
     """Describe fresh NTHWC output storage without launching CUDA."""
     n, t, h, w, _ = x.shape
     history = 0 if previous is None else previous.shape[1]
@@ -155,9 +184,9 @@ def _conv_norm_prepare_fake(x, weight, bias, gamma, previous, ctas):
 
 
 @torch.library.custom_op("wan_decoder::conv_raw", mutates_args=())
-def _conv_raw(x: torch.Tensor, weight: torch.Tensor, ctas: int) -> torch.Tensor:
+def _conv_raw(x: torch.Tensor, weight: torch.Tensor, ctas: int, precision: str) -> torch.Tensor:
     """Run a raw NTHWC convolution, leaving bias to compiled Torch."""
-    cfg = ConvConfig(*x.shape, co=weight.shape[0], ctas=ctas)
+    cfg = ConvConfig(*x.shape, co=weight.shape[0], ctas=ctas, precision=precision)
     result = prepare(x, weight, cfg)()
     stream = torch.cuda.current_stream(x.device)
     for tensor in (x, weight, result):
@@ -166,26 +195,47 @@ def _conv_raw(x: torch.Tensor, weight: torch.Tensor, ctas: int) -> torch.Tensor:
 
 
 @_conv_raw.register_fake
-def _conv_raw_fake(x, weight, ctas):
+def _conv_raw_fake(x, weight, ctas, precision):
     """Describe the raw valid-convolution output."""
     n, t, h, w, _ = x.shape
     return x.new_empty((n, t - 2, h - 2, w - 2, weight.shape[0]))
 
 
-class _FusedResidualBlock(torch.nn.Module):
-    """Fuse C256 convolutions and keep C512 post-processing separate from cuDNN."""
+@torch.library.custom_op("wan_vae::conv_spatial_residual", mutates_args=())
+def _conv_spatial_residual(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, residual: torch.Tensor, ctas: int, precision: str
+) -> torch.Tensor:
+    """Produce bias/residual-summed input with a zero bottom/right border."""
+    cfg = ConvConfig(*x.shape, co=weight.shape[0], ctas=ctas, precision=precision)
+    result = prepare_spatial_residual(x, weight, bias, residual, cfg)()
+    stream = torch.cuda.current_stream(x.device)
+    for tensor in (x, weight, bias, residual, result):
+        tensor.record_stream(stream)
+    return result
 
-    def __init__(self, block: RawWanResidualBlock) -> None:
+
+@_conv_spatial_residual.register_fake
+def _conv_spatial_residual_fake(x, weight, bias, residual, ctas, precision):
+    n, t, h, w, _ = x.shape
+    return x.new_empty((n, t - 2, h - 1, w - 1, weight.shape[0]))
+
+
+class _FusedResidualBlock(torch.nn.Module):
+    """Fuse normalization/cache preparation around custom or cuDNN convolutions."""
+
+    def __init__(self, block: RawWanResidualBlock, *, custom_conv: bool = False) -> None:
         super().__init__()
         self.shortcut = block.conv_shortcut
         conv1, conv2 = block.conv1.conv, block.conv2.conv
+        self.precision = resolve_precision(conv1.weight.dtype)
         norm2 = block.norm2.norm
-        self.fuse_conv = conv1.out_channels == 256
+        self.fuse_conv = conv1.out_channels == 256 or (custom_conv and conv1.out_channels in (96, 192))
+        self.custom_conv = custom_conv or self.fuse_conv
         if norm2.bias != 0 or block.norm1.norm.bias != 0:
             raise ValueError("Expected Wan RMSNorm without affine bias")
         weights = (conv1.weight.detach(), conv2.weight.detach())
-        if self.fuse_conv:
-            weights = tuple(weight.permute(0, 2, 3, 4, 1).contiguous() for weight in weights)
+        if self.custom_conv:
+            weights = tuple(WanConv3d(weight, precision=self.precision).weight for weight in weights)
         for name, value in (
             ("weight1", weights[0]),
             ("weight2", weights[1]),
@@ -198,9 +248,9 @@ class _FusedResidualBlock(torch.nn.Module):
         self.ctas = torch.cuda.get_device_properties(conv1.weight.device).multi_processor_count // 2 * 2
 
     def _convolve(self, x, weight):
-        """Use custom C256 or cuDNN C512 convolution on already-padded input."""
-        if self.fuse_conv:
-            return _conv_raw(x, weight, self.ctas)
+        """Convolve already-padded input using the adapter's selected backend."""
+        if self.custom_conv:
+            return _conv_raw(x, weight, self.ctas, self.precision)
         return F.conv3d(x.permute(0, 4, 1, 2, 3), weight).permute(0, 2, 3, 4, 1)
 
     def forward(
@@ -210,6 +260,8 @@ class _FusedResidualBlock(torch.nn.Module):
         feat_idx: int,
         prepared=None,
         next_gamma=None,
+        save_residual=True,
+        spatial_output=False,
     ):
         """Preserve the reference's two causal-cache entries and BF16 additions."""
         residual = x if self.shortcut is None else self.shortcut(x)
@@ -223,7 +275,9 @@ class _FusedResidualBlock(torch.nn.Module):
             padded, cache1 = prepared
         previous2 = _history(feat_cache[feat_idx + 1])
         if self.fuse_conv:
-            padded2, cache2 = _conv_norm_prepare(padded, self.weight1, self.bias1, self.gamma, previous2, self.ctas)
+            padded2, cache2 = _conv_norm_prepare(
+                padded, self.weight1, self.bias1, self.gamma, previous2, self.ctas, self.precision
+            )
         else:
             raw = self._convolve(padded, self.weight1)
             padded2, cache2, _ = _norm_prepare(raw, self.gamma, previous2, self.bias1)
@@ -240,12 +294,23 @@ class _FusedResidualBlock(torch.nn.Module):
                     previous,
                     skip,
                     self.ctas,
+                    self.precision,
+                    save_residual,
                 )
             else:
                 raw = self._convolve(padded2, self.weight2)
                 padded3, cache3, result = _norm_prepare(raw, next_gamma, previous, self.bias2, skip)
             next_prepared = (padded3, cache3)
-            result = result.permute(0, 4, 1, 2, 3)
+            result = result.permute(0, 4, 1, 2, 3) if save_residual else None
+        elif spatial_output:
+            result = _conv_spatial_residual(
+                padded2,
+                self.weight2,
+                self.bias2,
+                residual.permute(0, 2, 3, 4, 1).contiguous(),
+                self.ctas,
+                self.precision,
+            ).permute(0, 4, 1, 2, 3)
         else:
             result = self._convolve(padded2, self.weight2)
             result = (result + self.bias2).permute(0, 4, 1, 2, 3) + residual
@@ -262,9 +327,11 @@ def _history(value):
 class _FusedUpBlock(torch.nn.Module):
     """Pass fused conv2 preparation directly to the following conv1."""
 
-    def __init__(self, stage):
+    def __init__(self, stage, *, custom_conv: bool = False):
         super().__init__()
-        self.resnets = torch.nn.ModuleList(_FusedResidualBlock(block) for block in stage.resnets)
+        self.resnets = torch.nn.ModuleList(
+            _FusedResidualBlock(block, custom_conv=custom_conv) for block in stage.resnets
+        )
         self.upsampler = stage.upsampler
         self.avg_shortcut = stage.avg_shortcut
 
@@ -280,6 +347,52 @@ class _FusedUpBlock(torch.nn.Module):
         if self.avg_shortcut is not None:
             x = x + raw_dup_up3d(self.avg_shortcut, shortcut, first_chunk)
         return x, feat_cache, feat_idx
+
+
+class _DecoderWithPreparedHead(torch.nn.Module):
+    """Consume the last residual convolution directly as prepared head input."""
+
+    def __init__(self, decoder):
+        super().__init__()
+        self.decoder = decoder
+        stage = decoder.up_blocks[-1]
+        if stage.upsampler is not None or stage.avg_shortcut is not None:
+            raise ValueError("Prepared output head requires no intervening stage operation")
+        if not stage.resnets[-1].fuse_conv or decoder.norm_out.norm.bias != 0:
+            raise ValueError("Prepared output head requires a supported residual convolution and bias-free norm")
+        conv = decoder.conv_out.conv
+        if (
+            tuple(conv.kernel_size) != (3, 3, 3)
+            or tuple(conv._padding) != (1, 1, 1, 1, 2, 0)
+            or tuple(conv.stride) != (1, 1, 1)
+            or tuple(conv.dilation) != (1, 1, 1)
+            or tuple(conv.padding) != (0, 0, 0)
+            or conv.groups != 1
+        ):
+            raise ValueError("Prepared output head requires a unit-stride causal 3x3x3 convolution")
+
+    def forward(self, x, feat_cache, first_chunk=False):
+        """Preserve causal-cache order while bypassing the final head intermediates."""
+        decoder = self.decoder
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+        feat_cache = raw_canonicalize_cache(feat_cache)
+        x, feat_cache, feat_idx = raw_cached_causal_conv3d(decoder.conv_in, x, feat_cache, 0)
+        x, feat_cache, feat_idx = decoder.mid_block(x, feat_cache, feat_idx)
+        for stage in decoder.up_blocks[:-1]:
+            x, feat_cache, feat_idx = stage(x, feat_cache, feat_idx, first_chunk)
+        blocks = decoder.up_blocks[-1].resnets
+        prepared = None
+        for index, block in enumerate(blocks):
+            last = index + 1 == len(blocks)
+            gamma = decoder.norm_out.norm.gamma.reshape(-1) if last else blocks[index + 1].gamma1
+            x, feat_cache, feat_idx, prepared = block(x, feat_cache, feat_idx, prepared, gamma, save_residual=not last)
+        padded, cache = prepared
+        conv = decoder.conv_out.conv
+        x = F.conv3d(
+            padded.permute(0, 4, 1, 2, 3), conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups
+        )
+        feat_cache = update_cache(feat_cache, feat_idx, cache.permute(0, 4, 1, 2, 3))
+        return x, feat_cache
 
 
 class _FusedMidBlock(torch.nn.Module):
@@ -342,55 +455,3 @@ class _FusedMidBlock(torch.nn.Module):
             x, feat_cache, feat_idx = raw_cached_causal_conv3d(block.conv2, x, feat_cache, feat_idx)
             x = x + residual.permute(0, 4, 1, 2, 3)
         return x, feat_cache, feat_idx
-
-
-class _FusedDecoder(torch.nn.Module):
-    """Replace latent input packing/convolution and attention post-processing."""
-
-    def __init__(self, decoder) -> None:
-        super().__init__()
-        self.decoder = decoder
-        self.input_conv = WanConv3d(decoder.conv_in.conv.weight)
-        self.decoder.mid_block = _FusedMidBlock(decoder.mid_block)
-        self.cache_size = decoder.cache_size
-
-    def forward(self, x, feat_cache, first_chunk=False):
-        """Retain the decoder's cache ordering and unchanged upsampling/output head."""
-        feat_cache = raw_canonicalize_cache(feat_cache)
-        raw, cache = _input_conv3d(x, self.input_conv.weight, _history(feat_cache[0]), self.input_conv.ctas)
-        x = (raw + self.decoder.conv_in.conv.bias).permute(0, 4, 1, 2, 3)
-        feat_cache = update_cache(feat_cache, 0, cache.permute(0, 4, 1, 2, 3))
-        x, feat_cache, feat_idx = self.decoder.mid_block(x, feat_cache, 1)
-        for block in self.decoder.up_blocks:
-            x, feat_cache, feat_idx = block(x, feat_cache, feat_idx, first_chunk)
-        x = self.decoder.activation(self.decoder.norm_out(x))
-        x, feat_cache, _ = raw_cached_causal_conv3d(self.decoder.conv_out, x, feat_cache, feat_idx)
-        return x, feat_cache
-
-
-class MegaWanVaeDecoder(torch.nn.Module):
-    """Compile a decoder with custom input, attention-boundary, and residual blocks."""
-
-    def __init__(self, vae) -> None:
-        super().__init__()
-        if vae.dtype != torch.bfloat16:
-            raise ValueError("Decoder custom kernels require BF16")
-        self.raw_decoder = TorchWanVaeDecoder(vae).eval()
-        self.fused_blocks = 0
-        for index, stage in enumerate(self.raw_decoder.decoder.up_blocks):
-            if stage.resnets[0].conv1.conv.out_channels in (256, 512):
-                self.raw_decoder.decoder.up_blocks[index] = _FusedUpBlock(stage)
-                self.fused_blocks += len(stage.resnets)
-        if not self.fused_blocks:
-            raise ValueError("No supported decoder blocks found")
-        self.raw_decoder.decoder = _FusedDecoder(self.raw_decoder.decoder)
-        self.chunk_decoder = torch.compile(
-            self.raw_decoder.decoder,
-            fullgraph=True,
-            dynamic=False,
-            options={"emulate_precision_casts": True},
-        )
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        """Decode with fresh history using the reference chunk loop."""
-        return self.raw_decoder.decode_temporal_chunks(latent, self.chunk_decoder)

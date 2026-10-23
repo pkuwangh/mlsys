@@ -2,7 +2,7 @@
 # pyright: reportMissingImports=false, reportOperatorIssue=false
 # pyright: reportOptionalMemberAccess=false
 
-"""Direct causal padding/history/cache assembly for BF16 Wan activations.
+"""Direct causal padding/history/cache assembly for BF16 or FP32 Wan activations.
 
 Output and history are NTHWC. The input may be NTHWC or the initial NCTHW
 encoder tensor; the latter conversion is fused into the same pass. The generic
@@ -19,7 +19,6 @@ its cache remains C12 and every extra output channel is zero.
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cache
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -28,8 +27,14 @@ from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 if __package__:
+    from ._compile import compile_cache, compile_kernel
+    from ._dtype import storage_type
+    from ._geometry import SpatialDivisors
     from ._utils import measure, print_benchmark_table
 else:
+    from _compile import compile_cache, compile_kernel
+    from _dtype import storage_type
+    from _geometry import SpatialDivisors
     from _utils import measure, print_benchmark_table
 
 
@@ -51,37 +56,40 @@ def input_pack_kernel(
     previous: cute.Tensor,
     out: cute.Tensor,
     cache: cute.Tensor,
-    T: cutlass.Constexpr[int],
-    H: cutlass.Constexpr[int],
-    W: cutlass.Constexpr[int],
-    P: cutlass.Constexpr[int],
-    CT: cutlass.Constexpr[int],
-    STRIDES: cutlass.Constexpr,
+    out_numel: cutlass.Int64,
+    T,
+    H,
+    W,
+    P,
+    CT,
+    STRIDES,
+    divisors,
 ) -> None:
     """Pack C12 input: out=pad(concat(previous, NTHWC(x))), cache=last_CT.
 
     All other output elements are zero. Spatially adjacent lanes load the same
     channel, coalescing NCTHW reads; register gathering yields C16 output vectors.
-    Cache pixels are 24 bytes apart, so their vector stores promise only 8-byte
-    alignment. One thread owns each output pixel and its optional cache pixel.
+    C12 cache pixels are 24 bytes apart in BF16 and 48 bytes in FP32;
+    their vector stores promise only 8-byte alignment. One thread owns each
+    output pixel and its optional cache pixel.
     """
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     pixel = cutlass.Int64(bid) * 256 + tid
-    if pixel < out.shape[0] // 16:
-        w = pixel % (W + 2) - 1
-        h = pixel // (W + 2) % (H + 2) - 1
-        t = pixel // ((W + 2) * (H + 2)) % (T + 2) - 2
-        n = pixel // ((T + 2) * (W + 2) * (H + 2))
-        values = cutlass.Array(cutlass.BFloat16, 16, space=cutlass.AddressSpace.rmem)
-        values.store(cutlass.vector.full((16,), 0, cutlass.BFloat16), 0)
+    if pixel < out_numel // 16:
+        n, t, h, w = divisors.coordinates(pixel, promote_batch=False)
+        t -= 2
+        h -= 1
+        w -= 1
+        values = cutlass.Array(x.element_type, 16, space=cutlass.AddressSpace.rmem)
+        values.store(cutlass.vector.full((16,), 0, x.element_type), 0)
         if h >= 0 and h < H and w >= 0 and w < W:
             if t >= 0:
                 sn, sc, st, sh, sw = STRIDES
                 for c in cutlass.range_constexpr(12):
                     values[c] = x[n * sn + c * sc + t * st + h * sh + w * sw]
             elif t >= -P:
-                offset = (((n * P + t + P) * H + h) * W + w) * 12
+                offset = cutlass.Int64(((n * P + t + P) * H + h) * W + w) * 12
                 for part in cutlass.range_constexpr(3):
                     ptr = previous.iterator.raw_ptr() + offset + part * 4
                     if (previous.iterator.toint() & 7) == 0:
@@ -89,7 +97,7 @@ def input_pack_kernel(
                     else:
                         values.store(ptr.load(count=4, alignment=2), part * 4)
             if t >= T - CT:
-                cache_offset = (((n * CT + t - T + CT) * H + h) * W + w) * 12
+                cache_offset = cutlass.Int64(((n * CT + t - T + CT) * H + h) * W + w) * 12
                 for part in cutlass.range_constexpr(3):
                     (cache.iterator.raw_ptr() + cache_offset + part * 4).store(values.load(part * 4, 4), alignment=8)
         for part in cutlass.range_constexpr(2):
@@ -101,6 +109,7 @@ def initial_bias_kernel(
     x: cute.Tensor,
     bias: cute.Tensor,
     out: cute.Tensor,
+    out_numel: cutlass.Int64,
     C: cutlass.Constexpr[int],
     ALIGNMENT: cutlass.Constexpr[int],
 ) -> None:
@@ -112,52 +121,45 @@ def initial_bias_kernel(
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     offset = (cutlass.Int64(bid) * 256 + tid) * 8
-    if offset < out.shape[0]:
+    if offset < out_numel:
         value = (x.iterator.raw_ptr() + offset).load(count=8, alignment=ALIGNMENT)
         channel_bias = (bias.iterator.raw_ptr() + offset % C).load(count=8, alignment=ALIGNMENT)
-        result = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(cutlass.BFloat16)
+        result = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(x.element_type)
         (out.iterator.raw_ptr() + offset).store(result, alignment=16)
 
 
 @cute.jit
-def initial_pack_host(
+def initial_bias_host(
     x: cute.Tensor,
     bias: cute.Tensor,
     out: cute.Tensor,
-    cache: cute.Tensor,
+    out_numel: cutlass.Int64,
     stream: cuda.CUstream,
-    SPEC: cutlass.Constexpr,
+    channels: cutlass.Constexpr[int],
+    alignment: cutlass.Constexpr[int],
 ) -> None:
-    ncthw, h, w, c, strides, alignment = SPEC
-    if cutlass.const_expr(ncthw):
-        input_pack_kernel(x, x, out, cache, 1, h, w, 0, 1, strides).launch(
-            grid=((out.shape[0] // 16 + 255) // 256, 1, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
-    else:
-        initial_bias_kernel(x, bias, out, c, alignment).launch(
-            grid=((out.shape[0] // 8 + 255) // 256, 1, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
+    initial_bias_kernel(x, bias, out, out_numel, channels, alignment).launch(
+        grid=((out_numel // 8 + 255) // 256, 1, 1),
+        block=(256, 1, 1),
+        stream=stream,
+    )
 
 
-@cache
-def compile_initial_pack(spec: tuple) -> Callable:
-    """Compile initial-chunk specializations without allocating device tensors."""
-    x = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2)
-    bias = make_fake_compact_tensor(cutlass.BFloat16, (spec[3],), assumed_align=2)
-    out = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(divisibility=8),), assumed_align=16)
-    cache = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=8)
-    return cute.compile(
-        initial_pack_host,
+@compile_cache()
+def compile_initial_bias(channels: int, alignment: int, storage_dtype: torch.dtype = torch.bfloat16) -> Callable:
+    """Initial unpadded one-frame bias addition, with shared output/cache storage."""
+    x = make_fake_compact_tensor(storage_type(storage_dtype), (cute.sym_int64(),), assumed_align=2)
+    bias = make_fake_compact_tensor(storage_type(storage_dtype), (channels,), assumed_align=2)
+    out = make_fake_compact_tensor(storage_type(storage_dtype), (cute.sym_int64(divisibility=8),), assumed_align=16)
+    return compile_kernel(
+        initial_bias_host,
         x,
         bias,
         out,
-        cache,
+        cutlass.Int64(1),
         make_fake_stream(),
-        spec,
+        channels,
+        alignment,
         options="--enable-tvm-ffi --ptxas-options=--fmad=false",
     )
 
@@ -169,18 +171,20 @@ def causal_pack_kernel(
     bias: cute.Tensor,
     out: cute.Tensor,
     cache: cute.Tensor,
-    T: cutlass.Constexpr[int],
-    H: cutlass.Constexpr[int],
-    W: cutlass.Constexpr[int],
+    out_numel: cutlass.Int64,
+    T,
+    H,
+    W,
     C: cutlass.Constexpr[int],
-    P: cutlass.Constexpr[int],
+    P,
     PT: cutlass.Constexpr[int],
     PH: cutlass.Constexpr[int],
     PW: cutlass.Constexpr[int],
-    CT: cutlass.Constexpr[int],
+    CT,
     NCTHW: cutlass.Constexpr[bool],
     HAS_BIAS: cutlass.Constexpr[bool],
-    INPUT_STRIDES: cutlass.Constexpr = None,
+    INPUT_STRIDES,
+    divisors,
     VECTOR: cutlass.Constexpr[int] = 1,
     ALIGNMENT: cutlass.Constexpr[int] = 2,
 ) -> None:
@@ -195,33 +199,43 @@ def causal_pack_kernel(
     bid, _, _ = cute.arch.block_idx()
     OC: cutlass.Constexpr = 16 if NCTHW and C == 12 else C
     i = (cutlass.Int64(bid) * 256 + tid) * VECTOR
-    if i < out.shape[0]:
+    if i < out_numel:
         c = i % OC
-        w = i // OC % (W + 2 * PW) - PW
-        h = i // (OC * (W + 2 * PW)) % (H + 2 * PH) - PH
-        t = i // (OC * (W + 2 * PW) * (H + 2 * PH)) % (T + PT) - PT
-        n = i // (OC * (W + 2 * PW) * (H + 2 * PH) * (T + PT))
-        value = cutlass.vector.full((VECTOR,), 0, cutlass.BFloat16)
+        n, t, h, w = divisors.coordinates(i // OC, promote_batch=False)
+        t -= PT
+        h -= PH
+        w -= PW
+        value = cutlass.vector.full((VECTOR,), 0, x.element_type)
         spatial = h >= 0 and h < H and w >= 0 and w < W
         if spatial and c < C:
             if t >= 0:
-                offset = (((n * T + t) * H + h) * W + w) * C + c
+                offset = cutlass.Int64(((n * T + t) * H + h) * W + w) * C + c
                 if NCTHW:
-                    offset = (((n * C + c) * T + t) * H + h) * W + w
-                    if cutlass.const_expr(INPUT_STRIDES is not None):
-                        sn, sc, st, sh, sw = INPUT_STRIDES
-                        offset = n * sn + c * sc + t * st + h * sh + w * sw
+                    sn, sc, st, sh, sw = INPUT_STRIDES
+                    offset = n * sn + c * sc + t * st + h * sh + w * sw
                 value = (x.iterator.raw_ptr() + offset).load(count=VECTOR, alignment=ALIGNMENT)
                 if HAS_BIAS:
                     channel_bias = (bias.iterator.raw_ptr() + c).load(count=VECTOR, alignment=ALIGNMENT)
-                    value = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(cutlass.BFloat16)
+                    value = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(x.element_type)
             elif t >= -P:
-                offset = (((n * P + t + P) * H + h) * W + w) * C + c
+                offset = cutlass.Int64(((n * P + t + P) * H + h) * W + w) * C + c
                 value = (previous.iterator.raw_ptr() + offset).load(count=VECTOR, alignment=ALIGNMENT)
         (out.iterator.raw_ptr() + i).store(value, alignment=ALIGNMENT)
         if spatial and c < C and t >= T - CT:
-            offset = (((n * CT + t - T + CT) * H + h) * W + w) * C + c
+            offset = cutlass.Int64(((n * CT + t - T + CT) * H + h) * W + w) * C + c
             (cache.iterator.raw_ptr() + offset).store(value, alignment=ALIGNMENT)
+
+
+@dataclass(frozen=True)
+class PackConfig:
+    """Capabilities that change generated code; no tensor extents or strides."""
+
+    channels: int
+    padding: tuple[int, int, int]
+    input_ncthw: bool
+    has_bias: bool
+    vector: int
+    wide_index: bool = False
 
 
 @cute.jit
@@ -231,63 +245,106 @@ def causal_pack_host(
     bias: cute.Tensor,
     out: cute.Tensor,
     cache: cute.Tensor,
+    out_numel: cutlass.Int64,
+    geometry,
+    input_strides,
     stream: cuda.CUstream,
-    SPEC: cutlass.Constexpr,
+    config: cutlass.Constexpr,
 ) -> None:
-    if cutlass.const_expr(SPEC[9] and SPEC[3] == 12 and not SPEC[10] and SPEC[5:8] == (2, 1, 1)):
-        t, h, w, c, p = SPEC[:5]
-        ct = SPEC[8]
-        strides = SPEC[11] if len(SPEC) > 11 else None
-        if cutlass.const_expr(strides is None):
-            strides = (c * t * h * w, t * h * w, h * w, w, 1)
-        input_pack_kernel(x, previous, out, cache, t, h, w, p, ct, strides).launch(
-            grid=((out.shape[0] // 16 + 255) // 256, 1, 1),
+    t, h, w, p, ct = geometry
+    pt, ph, pw = config.padding
+    c = config.channels
+    divisors = SpatialDivisors(t + pt, h + 2 * ph, w + 2 * pw, wide=config.wide_index)
+    if cutlass.const_expr(config.input_ncthw and c == 12 and not config.has_bias and config.padding == (2, 1, 1)):
+        input_pack_kernel(x, previous, out, cache, out_numel, t, h, w, p, ct, input_strides, divisors).launch(
+            grid=((out_numel // 16 + 255) // 256, 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )
         return
-    # Decoder latent chunks are strided NCTHW views with contiguous channels.
-    # Such views can use the same vector copies as physically NTHWC input.
-    channel_contiguous = not SPEC[9] or (
-        len(SPEC) > 11
-        and SPEC[11] is not None
-        and SPEC[11][1] == 1
-        and all(stride % 8 == 0 for axis, stride in enumerate(SPEC[11]) if axis != 1)
-    )
-    vector = 8 if channel_contiguous and SPEC[3] % 8 == 0 else 1
+    vector = config.vector
     addresses = x.iterator.toint() | out.iterator.toint() | cache.iterator.toint()
-    if cutlass.const_expr(SPEC[4] > 0):
+    if p > 0:
         addresses = addresses | previous.iterator.toint()
-    if cutlass.const_expr(SPEC[10]):
+    if cutlass.const_expr(config.has_bias):
         addresses = addresses | bias.iterator.toint()
-    if vector == 8 and (addresses & 15) == 0:
-        causal_pack_kernel(x, previous, bias, out, cache, *SPEC, VECTOR=vector, ALIGNMENT=16).launch(
-            grid=((out.shape[0] + 256 * vector - 1) // (256 * vector), 1, 1),
+    if vector >= 8 and (addresses & 15) == 0:
+        causal_pack_kernel(
+            x,
+            previous,
+            bias,
+            out,
+            cache,
+            out_numel,
+            t,
+            h,
+            w,
+            c,
+            p,
+            pt,
+            ph,
+            pw,
+            ct,
+            config.input_ncthw,
+            config.has_bias,
+            input_strides,
+            divisors,
+            VECTOR=vector,
+            ALIGNMENT=16,
+        ).launch(
+            grid=((out_numel + 256 * vector - 1) // (256 * vector), 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )
     else:
-        causal_pack_kernel(x, previous, bias, out, cache, *SPEC, VECTOR=vector, ALIGNMENT=2).launch(
-            grid=((out.shape[0] + 256 * vector - 1) // (256 * vector), 1, 1),
+        causal_pack_kernel(
+            x,
+            previous,
+            bias,
+            out,
+            cache,
+            out_numel,
+            t,
+            h,
+            w,
+            c,
+            p,
+            pt,
+            ph,
+            pw,
+            ct,
+            config.input_ncthw,
+            config.has_bias,
+            input_strides,
+            divisors,
+            VECTOR=vector,
+            ALIGNMENT=2,
+        ).launch(
+            grid=((out_numel + 256 * vector - 1) // (256 * vector), 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )
 
 
-@cache
-def compile_pack(spec: tuple) -> Callable:
-    """Compile only immutable geometry/layout metadata; never cache tensors."""
-    tensors = [make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2) for _ in range(4)]
-    bias = make_fake_compact_tensor(cutlass.BFloat16, (spec[3],), assumed_align=2)
-    return cute.compile(
+@compile_cache()
+def compile_pack(config: PackConfig, storage_dtype: torch.dtype = torch.bfloat16) -> Callable:
+    """Reuse packing code across extents, chunk lengths, and physical strides."""
+    tensors = [
+        make_fake_compact_tensor(storage_type(storage_dtype), (cute.sym_int64(),), assumed_align=2) for _ in range(4)
+    ]
+    bias = make_fake_compact_tensor(storage_type(storage_dtype), (config.channels,), assumed_align=2)
+    return compile_kernel(
         causal_pack_host,
         tensors[0],
         tensors[1],
         bias,
         tensors[2],
         tensors[3],
+        cutlass.Int64(1),
+        tuple((cutlass.Int64 if config.wide_index else cutlass.Int32)(1) for _ in range(5)),
+        tuple(cutlass.Int64(1) for _ in range(5)),
         make_fake_stream(),
-        spec,
+        config,
         options="--enable-tvm-ffi --ptxas-options=--fmad=false",
     )
 
@@ -324,10 +381,13 @@ def pack_history(
         if (
             value.device != x.device
             or value.device.type != "cuda"
-            or value.dtype != torch.bfloat16
+            or value.dtype != x.dtype
+            or value.dtype not in (torch.bfloat16, torch.float32)
             or (not value.is_contiguous() and not (value is x and input_ncthw))
         ):
-            raise ValueError("Pack inputs must be BF16 on one CUDA device; only NCTHW input may be strided")
+            raise ValueError(
+                "Pack inputs must share BF16 or FP32 dtype on one CUDA device; only NCTHW input may be strided"
+            )
         if torch.is_grad_enabled() and value.requires_grad:
             raise ValueError("History packing is inference-only")
     ct = min(cache_frames, p + t)
@@ -345,58 +405,50 @@ def pack_history(
     input_span = 1 + sum((size - 1) * stride for size, stride in zip(x.shape, x.stride()))
     flat_input = x.as_strided((input_span,), (1,))
     with torch.cuda.device(x.device):
-        initial_input = input_ncthw and t == 1 and c == 12 and p == 0 and padding == (2, 1, 1) and bias is None
-        if initial_input or initial_bias:
-            alignment = 16 if initial_bias and x.data_ptr() % 16 == 0 and bias.data_ptr() % 16 == 0 else 2
-            compile_initial_pack((initial_input, h, w, c, input_strides, alignment))(
-                flat_input,
-                cache.view(-1)[:c] if bias is None else bias,
-                out.view(-1),
-                cache.view(-1),
-                cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
+        stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+        if initial_bias:
+            alignment = 16 if x.data_ptr() % 16 == 0 and bias.data_ptr() % 16 == 0 else 2
+            compile_initial_bias(c, alignment, storage_dtype=x.dtype)(
+                flat_input, bias, out.view(-1), out.numel(), stream
             )
             return PackedHistory(out, cache)
-        compile_pack(
-            (
-                t,
-                h,
-                w,
-                c,
-                p,
-                pt,
-                ph,
-                pw,
-                ct,
-                input_ncthw,
-                bias is not None,
-                input_strides,
-            )
-        )(
+        channel_contiguous = not input_ncthw or (
+            input_strides[1] == 1 and all(stride % 8 == 0 for axis, stride in enumerate(input_strides) if axis != 1)
+        )
+        config = PackConfig(
+            c,
+            padding,
+            input_ncthw,
+            bias is not None,
+            8 if channel_contiguous and c % 8 == 0 else 1,
+            n * (t + pt) * (h + 2 * ph) * (w + 2 * pw) >= 2**31,
+        )
+        compile_pack(config, storage_dtype=x.dtype)(
             flat_input,
             flat_input if previous is None else previous.view(-1),
             cache.view(-1)[:c] if bias is None else bias,
             out.view(-1),
             cache.view(-1),
-            cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
+            out.numel(),
+            (t, h, w, p, ct),
+            input_strides or (0, 0, 0, 0, 0),
+            stream,
         )
     return PackedHistory(out, cache)
 
 
 def compile() -> None:
-    compile_initial_pack((True, 8, 6, 12, (12 * 17 * 8 * 6, 17 * 8 * 6, 8 * 6, 6, 1), 2))
+    """Compile the live packing capabilities, independent of video geometry."""
     for channels in (320, 640):
         for alignment in (2, 16):
-            compile_initial_pack((False, 8, 6, channels, None, alignment))
-    for c, ncthw, pad, history in (
-        (12, True, (2, 1, 1), 2),
-        (48, True, (2, 1, 1), 2),
-        (320, False, (1, 0, 0), 1),
+            compile_initial_bias(channels, alignment)
+    for channels, ncthw, padding, vector in (
+        (12, True, (2, 1, 1), 1),
+        (48, True, (2, 1, 1), 1),
+        (48, True, (2, 1, 1), 8),
+        (320, False, (1, 0, 0), 8),
     ):
-        for t, p in ((1, 0), (4, history)):
-            compile_pack((t, 8, 6, c, p, *pad, min(history, p + t), ncthw, not ncthw))
-            if ncthw:
-                strides = (c * 17 * 8 * 6, 17 * 8 * 6, 8 * 6, 6, 1)
-                compile_pack((t, 8, 6, c, p, *pad, min(history, p + t), True, False, strides))
+        compile_pack(PackConfig(channels, padding, ncthw, not ncthw, vector))
 
 
 @torch.inference_mode()

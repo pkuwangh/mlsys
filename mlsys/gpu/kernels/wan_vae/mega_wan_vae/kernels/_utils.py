@@ -34,8 +34,8 @@ def measure(
     reference: Callable,
     custom: Callable,
     *,
-    samples: int = 3,
-    replays: int = 5,
+    samples: int = 8,
+    replays: int = 10,
 ) -> BenchmarkResult:
     """Measure paired median GPU times, excluding Python and JIT compilation.
 
@@ -43,9 +43,28 @@ def measure(
     samples to reduce clock drift bias; retain graph outputs throughout.
     Both callables must be inference-only and use the current CUDA device.
     """
+    ref_ms, custom_ms = measure_group((reference, custom), samples=samples, replays=replays)
+    return BenchmarkResult(label, custom_ms, ref_ms)
+
+
+def measure_group(
+    functions: tuple[Callable, ...], *, samples: int = 20, replays: int = 10, warmup_ms: float = 500
+) -> tuple[float, ...]:
+    """Time related paths together, rotating replay order to reduce clock drift.
+
+    Each path gets its own CUDA graph and retained outputs. Compilation and
+    allocation during capture are excluded. Choose a multiple of the number
+    of paths for samples to give each path every position equally often.
+    Condition all captured paths before timing so JIT idle periods do not
+    leave the first samples at idle clocks. Warmup is excluded from samples.
+    Replay each selected path twice before its sample to condition its own
+    cache footprint after switching between paths with different buffers.
+    """
+    if not functions or samples < 1 or replays < 1 or warmup_ms < 0:
+        raise ValueError("Expected nonempty functions, positive samples/replays and nonnegative warmup")
     graphs = []
     outputs = []
-    for fn in (reference, custom):
+    for fn in functions:
         for _ in range(3):
             fn()
         torch.cuda.synchronize()
@@ -53,19 +72,31 @@ def measure(
         with torch.cuda.graph(graph):
             outputs.append(fn())
         graphs.append(graph)
-    times = [[], []]
+    times = [[] for _ in functions]
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
+    if warmup_ms:
+        start.record()
+        elapsed = 0.0
+        while elapsed < warmup_ms:
+            for graph in graphs:
+                for _ in range(replays):
+                    graph.replay()
+            end.record()
+            end.synchronize()
+            elapsed = start.elapsed_time(end)
     for sample in range(samples):
-        for index in (0, 1) if sample % 2 == 0 else (1, 0):
+        for offset in range(len(functions)):
+            index = (sample + offset) % len(functions)
+            for _ in range(2):
+                graphs[index].replay()
             start.record()
             for _ in range(replays):
                 graphs[index].replay()
             end.record()
             end.synchronize()
             times[index].append(start.elapsed_time(end) / replays)
-    ref_ms, custom_ms = (median(values) for values in times)
-    return BenchmarkResult(label, custom_ms, ref_ms)
+    return tuple(median(values) for values in times)
 
 
 def print_benchmark_table(results: list[BenchmarkResult], reference_name: str = "Torch reference") -> None:

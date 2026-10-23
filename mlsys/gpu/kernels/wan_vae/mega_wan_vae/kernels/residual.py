@@ -4,14 +4,15 @@
 
 """Wan bias/residual additions and grouped stage shortcuts.
 
-All activations are contiguous BF16 NTHWC. Bias, each residual branch, and
-shortcut means are rounded separately before the final addition. Spatial
+All activations are contiguous, matching BF16 or FP32 NTHWC. Bias, each
+residual branch, and shortcut means are rounded separately before the final addition. Spatial
 residual preparation writes the bottom/right zero border in the same pass.
 """
 
 import argparse
 from collections.abc import Callable
-from functools import cache, partial
+from dataclasses import dataclass
+from functools import partial
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -20,8 +21,14 @@ from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 if __package__:
+    from ._compile import compile_cache, compile_kernel
+    from ._dtype import storage_type
+    from ._geometry import SpatialDivisors
     from ._utils import measure, print_benchmark_table
 else:
+    from _compile import compile_cache, compile_kernel
+    from _dtype import storage_type
+    from _geometry import SpatialDivisors
     from _utils import measure, print_benchmark_table
 
 THREADS = 128
@@ -35,13 +42,15 @@ def bias_residual_kernel(
     residual: cute.Tensor,
     residual_bias: cute.Tensor,
     out: cute.Tensor,
+    numel: cutlass.Int64,
     CHANNELS: cutlass.Constexpr[int],
     HAS_BIAS: cutlass.Constexpr[bool],
     HAS_RESIDUAL_BIAS: cutlass.Constexpr[bool],
-    HEIGHT: cutlass.Constexpr[int],
-    WIDTH: cutlass.Constexpr[int],
+    HEIGHT,
+    WIDTH,
     PAD_SPATIAL: cutlass.Constexpr[bool],
     ALIGNMENT: cutlass.Constexpr[int],
+    divisors,
 ) -> None:
     """Fuse channel bias and residual addition over contiguous NTHWC storage.
 
@@ -63,15 +72,13 @@ def bias_residual_kernel(
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     offset = (cutlass.Int64(bid) * THREADS + tid) * EPILOGUE_VECTOR
-    if offset < out.shape[0]:
+    if offset < numel:
         input_offset = offset
         valid = cutlass.Boolean(True)
-        if PAD_SPATIAL:
+        if cutlass.const_expr(PAD_SPATIAL):
             row = offset // CHANNELS
-            w = row % (WIDTH + 1)
-            h = row // (WIDTH + 1) % (HEIGHT + 1)
-            nt = row // ((WIDTH + 1) * (HEIGHT + 1))
-            input_offset = ((nt * HEIGHT + h) * WIDTH + w) * CHANNELS + offset % CHANNELS
+            nt, h, w = divisors.plane_coordinates(row, promote_batch=False)
+            input_offset = cutlass.Int64((nt * HEIGHT + h) * WIDTH + w) * CHANNELS + offset % CHANNELS
             valid = h < HEIGHT and w < WIDTH
         if valid:
             value = (x.iterator.raw_ptr() + input_offset).load(count=EPILOGUE_VECTOR, alignment=ALIGNMENT)
@@ -79,17 +86,17 @@ def bias_residual_kernel(
                 channel_bias = (bias.iterator.raw_ptr() + offset % CHANNELS).load(
                     count=EPILOGUE_VECTOR, alignment=ALIGNMENT
                 )
-                value = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(cutlass.BFloat16)
+                value = (value.to(cutlass.Float32) + channel_bias.to(cutlass.Float32)).to(x.element_type)
             skip = (residual.iterator.raw_ptr() + input_offset).load(count=EPILOGUE_VECTOR, alignment=ALIGNMENT)
             if HAS_RESIDUAL_BIAS:
                 skip_bias = (residual_bias.iterator.raw_ptr() + offset % CHANNELS).load(
                     count=EPILOGUE_VECTOR, alignment=ALIGNMENT
                 )
-                skip = (skip.to(cutlass.Float32) + skip_bias.to(cutlass.Float32)).to(cutlass.BFloat16)
-            result = (value.to(cutlass.Float32) + skip.to(cutlass.Float32)).to(cutlass.BFloat16)
+                skip = (skip.to(cutlass.Float32) + skip_bias.to(cutlass.Float32)).to(x.element_type)
+            result = (value.to(cutlass.Float32) + skip.to(cutlass.Float32)).to(x.element_type)
             (out.iterator.raw_ptr() + offset).store(result, alignment=ALIGNMENT)
         else:
-            zeros = cutlass.vector.full((EPILOGUE_VECTOR,), 0, cutlass.BFloat16)
+            zeros = cutlass.vector.full((EPILOGUE_VECTOR,), 0, x.element_type)
             (out.iterator.raw_ptr() + offset).store(zeros, alignment=ALIGNMENT)
 
 
@@ -100,16 +107,23 @@ def bias_residual_host(
     residual: cute.Tensor,
     residual_bias: cute.Tensor,
     out: cute.Tensor,
+    numel: cutlass.Int64,
+    HEIGHT,
+    WIDTH,
     stream: cuda.CUstream,
     CHANNELS: cutlass.Constexpr[int],
     HAS_BIAS: cutlass.Constexpr[bool],
     HAS_RESIDUAL_BIAS: cutlass.Constexpr[bool],
-    HEIGHT: cutlass.Constexpr[int],
-    WIDTH: cutlass.Constexpr[int],
     PAD_SPATIAL: cutlass.Constexpr[bool],
     ALIGNMENT: cutlass.Constexpr[int],
+    WIDE_INDEX: cutlass.Constexpr[bool],
 ) -> None:
-    """Launch one CTA per 1024 BF16 output elements on the caller's stream."""
+    """Launch one CTA per 1024 output elements on the caller's stream.
+
+    Carry numel as an explicit Int64 through launch and bounds checks;
+    extracting a flattened symbolic tensor extent can narrow it to Int32.
+    """
+    divisors = SpatialDivisors(1, HEIGHT + 1, WIDTH + 1, wide=WIDE_INDEX) if PAD_SPATIAL else None
     tile = THREADS * EPILOGUE_VECTOR
     bias_residual_kernel(
         x,
@@ -117,6 +131,7 @@ def bias_residual_host(
         residual,
         residual_bias,
         out,
+        numel,
         CHANNELS,
         HAS_BIAS,
         HAS_RESIDUAL_BIAS,
@@ -124,21 +139,24 @@ def bias_residual_host(
         WIDTH,
         PAD_SPATIAL,
         ALIGNMENT,
+        divisors,
     ).launch(
-        grid=((out.shape[0] + tile - 1) // tile, 1, 1),
+        grid=((numel + tile - 1) // tile, 1, 1),
         block=(THREADS, 1, 1),
         stream=stream,
     )
 
 
-@cache
+@compile_cache()
 def compile_bias_residual(
     channels: int = 160,
     has_bias: bool = True,
-    spatial_shape: tuple[int, int] | None = None,
+    pad_spatial: bool = False,
     *,
     has_residual_bias: bool = False,
     alignment: int = 16,
+    wide_index: bool = False,
+    storage_dtype: torch.dtype = torch.bfloat16,
 ) -> Callable:
     """Cache shape-dynamic epilogue code by channel count and bias presence."""
     if channels <= 0 or channels % EPILOGUE_VECTOR:
@@ -146,30 +164,33 @@ def compile_bias_residual(
     if alignment not in (2, 16):
         raise ValueError("Bias/residual alignment must be 2 or 16 bytes")
     tensor = make_fake_compact_tensor(
-        cutlass.BFloat16,
+        storage_type(storage_dtype),
         (cute.sym_int64(divisibility=EPILOGUE_VECTOR),),
         assumed_align=alignment,
     )
     out = make_fake_compact_tensor(
-        cutlass.BFloat16,
+        storage_type(storage_dtype),
         (cute.sym_int64(divisibility=EPILOGUE_VECTOR),),
         assumed_align=alignment,
     )
-    weight = make_fake_compact_tensor(cutlass.BFloat16, (channels,), assumed_align=alignment)
-    return cute.compile(
+    weight = make_fake_compact_tensor(storage_type(storage_dtype), (channels,), assumed_align=alignment)
+    return compile_kernel(
         bias_residual_host,
         tensor,
         weight,
         tensor,
         weight,
         out,
+        cutlass.Int64(1),
+        (cutlass.Int64 if wide_index else cutlass.Int32)(1),
+        (cutlass.Int64 if wide_index else cutlass.Int32)(1),
         make_fake_stream(),
         channels,
         has_bias,
         has_residual_bias,
-        *(spatial_shape or (1, 1)),
-        spatial_shape is not None,
+        pad_spatial,
         alignment,
+        wide_index,
         options="--enable-tvm-ffi --ptxas-options=--fmad=false",
     )
 
@@ -206,8 +227,8 @@ def bias_residual(
             continue
         if tensor.device.type != "cuda" or tensor.device != x.device:
             raise ValueError("Bias/residual tensors must share a CUDA device")
-        if tensor.dtype != torch.bfloat16 or not tensor.is_contiguous():
-            raise ValueError("Bias/residual tensors must be contiguous BF16")
+        if tensor.dtype != x.dtype or tensor.dtype not in (torch.bfloat16, torch.float32) or not tensor.is_contiguous():
+            raise ValueError("Bias/residual tensors must be contiguous, matching BF16 or FP32")
         if torch.is_grad_enabled() and tensor.requires_grad:
             raise ValueError("Bias/residual fusion is inference-only")
         if tensor.data_ptr() % 16:
@@ -226,15 +247,20 @@ def bias_residual(
             compile_bias_residual(
                 channels,
                 bias is not None,
-                (height, width) if pad_spatial else None,
+                pad_spatial,
                 has_residual_bias=residual_bias is not None,
                 alignment=alignment,
+                storage_dtype=x.dtype,
+                wide_index=pad_spatial and n * frames * (height + 1) * (width + 1) >= 2**31,
             )(
                 x.view(-1),
                 x.view(-1)[:channels] if bias is None else bias,
                 residual.view(-1),
                 x.view(-1)[:channels] if residual_bias is None else residual_bias,
                 out.view(-1),
+                out.numel(),
+                height if pad_spatial else 1,
+                width if pad_spatial else 1,
                 stream,
             )
     return out
@@ -248,7 +274,7 @@ def torch_bias_residual(
     residual_bias: torch.Tensor | None = None,
     pad_spatial: bool = False,
 ) -> torch.Tensor:
-    """Torch reference with separately rounded BF16 additions."""
+    """Torch reference with separately rounded storage-dtype additions."""
     value = (x if bias is None else x + bias) + (residual if residual_bias is None else residual + residual_bias)
     return torch.nn.functional.pad(value, (0, 0, 0, 1, 0, 1)) if pad_spatial else value
 
@@ -260,15 +286,17 @@ def stage_add_kernel(
     bias: cute.Tensor,
     residual: cute.Tensor,
     out: cute.Tensor,
-    T: cutlass.Constexpr[int],
-    H: cutlass.Constexpr[int],
-    W: cutlass.Constexpr[int],
+    numel: cutlass.Int64,
+    T,
+    H,
+    W,
     CI: cutlass.Constexpr[int],
     CO: cutlass.Constexpr[int],
     FT: cutlass.Constexpr[int],
     FS: cutlass.Constexpr[int],
     HAS_RESIDUAL: cutlass.Constexpr[bool],
     HAS_BIAS: cutlass.Constexpr[bool],
+    divisors,
 ) -> None:
     """Compute y = B(main + B(mean_g(shortcut))), with B = BF16 rounding.
 
@@ -283,16 +311,11 @@ def stage_add_kernel(
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     i = cutlass.Int64(bid) * 256 + tid
-    OT = (T + FT - 1) // FT
-    OH, OW = H // FS, W // FS
     FACTOR = FT * FS * FS
     GROUP = CI * FACTOR // CO
-    if i < out.shape[0]:
+    if i < numel:
         c = i % CO
-        w = i // CO % OW
-        h = i // (CO * OW) % OH
-        t = i // (CO * OW * OH) % OT
-        n = i // (CO * OW * OH * OT)
+        n, t, h, w = divisors.coordinates(i // CO)
         total = cutlass.Float32(0)
         for g in cutlass.range_constexpr(GROUP):
             j = c * GROUP + g
@@ -304,13 +327,13 @@ def stage_add_kernel(
             if ti >= 0:
                 off = (((n * T + ti) * H + hi) * W + wi) * CI + ci
                 total += cutlass.Float32(skip[off])
-        pooled = cutlass.BFloat16(total / GROUP)
+        pooled = x.element_type(total / GROUP)
         value = cutlass.Float32(x[i])
         if HAS_BIAS:
-            value = cutlass.Float32(cutlass.BFloat16(value + cutlass.Float32(bias[c])))
+            value = cutlass.Float32(x.element_type(value + cutlass.Float32(bias[c])))
         if HAS_RESIDUAL:
-            value = cutlass.Float32(cutlass.BFloat16(value + cutlass.Float32(residual[i])))
-        out[i] = cutlass.BFloat16(value + cutlass.Float32(pooled))
+            value = cutlass.Float32(x.element_type(value + cutlass.Float32(residual[i])))
+        out[i] = x.element_type(value + cutlass.Float32(pooled))
 
 
 @cute.jit
@@ -320,15 +343,17 @@ def stage_add_vector(
     bias: cute.Tensor,
     residual: cute.Tensor,
     out: cute.Tensor,
-    T: cutlass.Constexpr[int],
-    H: cutlass.Constexpr[int],
-    W: cutlass.Constexpr[int],
+    numel: cutlass.Int64,
+    T,
+    H,
+    W,
     CI: cutlass.Constexpr[int],
     CO: cutlass.Constexpr[int],
     FT: cutlass.Constexpr[int],
     FS: cutlass.Constexpr[int],
     HAS_RESIDUAL: cutlass.Constexpr[bool],
     HAS_BIAS: cutlass.Constexpr[bool],
+    divisors,
     ALIGNMENT: cutlass.Constexpr[int],
 ) -> None:
     """Eight outputs per lane, preserving stage_add_kernel's ordered mean.
@@ -340,18 +365,13 @@ def stage_add_vector(
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     i = (cutlass.Int64(bid) * 256 + tid) * 8
-    OT = (T + FT - 1) // FT
-    OH, OW = H // FS, W // FS
     FACTOR = FT * FS * FS
     RATIO = CO // CI
     GROUP = FACTOR // RATIO
-    if i < out.shape[0]:
+    if i < numel:
         c = i % CO
-        w = i // CO % OW
-        h = i // (CO * OW) % OH
-        t = i // (CO * OW * OH) % OT
-        n = i // (CO * OW * OH * OT)
-        pooled = cutlass.Array(cutlass.BFloat16, 8, space=cutlass.AddressSpace.rmem)
+        n, t, h, w = divisors.coordinates(i // CO)
+        pooled = cutlass.Array(x.element_type, 8, space=cutlass.AddressSpace.rmem)
         for part in cutlass.range_constexpr(RATIO):
             total = cutlass.vector.full((8 // RATIO,), 0, cutlass.Float32)
             for g in cutlass.range_constexpr(GROUP):
@@ -366,18 +386,31 @@ def stage_add_vector(
                         alignment=ALIGNMENT // RATIO if ALIGNMENT == 16 else 2,
                     )
                     total = total + values.to(cutlass.Float32)
-            mean = (total / GROUP).to(cutlass.BFloat16)
+            mean = (total / GROUP).to(x.element_type)
             for channel in cutlass.range_constexpr(8 // RATIO):
                 pooled[channel * RATIO + part] = mean[channel]
         value = (x.iterator.raw_ptr() + i).load(count=8, alignment=ALIGNMENT)
         if HAS_BIAS:
             b = (bias.iterator.raw_ptr() + c).load(count=8, alignment=ALIGNMENT)
-            value = (value.to(cutlass.Float32) + b.to(cutlass.Float32)).to(cutlass.BFloat16)
+            value = (value.to(cutlass.Float32) + b.to(cutlass.Float32)).to(x.element_type)
         if HAS_RESIDUAL:
             r = (residual.iterator.raw_ptr() + i).load(count=8, alignment=ALIGNMENT)
-            value = (value.to(cutlass.Float32) + r.to(cutlass.Float32)).to(cutlass.BFloat16)
-        result = (value.to(cutlass.Float32) + pooled.load(0, 8).to(cutlass.Float32)).to(cutlass.BFloat16)
+            value = (value.to(cutlass.Float32) + r.to(cutlass.Float32)).to(x.element_type)
+        result = (value.to(cutlass.Float32) + pooled.load(0, 8).to(cutlass.Float32)).to(x.element_type)
         (out.iterator.raw_ptr() + i).store(result, alignment=ALIGNMENT)
+
+
+@dataclass(frozen=True)
+class StageConfig:
+    """Static channel grouping and shortcut arithmetic."""
+
+    ci: int
+    co: int
+    ft: int
+    fs: int
+    has_residual: bool
+    has_bias: bool
+    wide_index: bool = False
 
 
 @cute.kernel
@@ -387,17 +420,52 @@ def stage_add_vector_kernel(
     bias: cute.Tensor,
     residual: cute.Tensor,
     out: cute.Tensor,
-    SPEC: cutlass.Constexpr,
+    numel: cutlass.Int64,
+    geometry,
+    divisors,
+    config: cutlass.Constexpr,
 ) -> None:
     addresses = x.iterator.toint() | skip.iterator.toint() | out.iterator.toint()
-    if cutlass.const_expr(SPEC[7]):
+    if cutlass.const_expr(config.has_residual):
         addresses = addresses | residual.iterator.toint()
-    if cutlass.const_expr(SPEC[8]):
+    if cutlass.const_expr(config.has_bias):
         addresses = addresses | bias.iterator.toint()
     if (addresses & 15) == 0:
-        stage_add_vector(x, skip, bias, residual, out, *SPEC, 16)
+        stage_add_vector(
+            x,
+            skip,
+            bias,
+            residual,
+            out,
+            numel,
+            *geometry,
+            config.ci,
+            config.co,
+            config.ft,
+            config.fs,
+            config.has_residual,
+            config.has_bias,
+            divisors,
+            16,
+        )
     else:
-        stage_add_vector(x, skip, bias, residual, out, *SPEC, 2)
+        stage_add_vector(
+            x,
+            skip,
+            bias,
+            residual,
+            out,
+            numel,
+            *geometry,
+            config.ci,
+            config.co,
+            config.ft,
+            config.fs,
+            config.has_residual,
+            config.has_bias,
+            divisors,
+            2,
+        )
 
 
 @cute.jit
@@ -407,36 +475,59 @@ def stage_add_host(
     bias: cute.Tensor,
     residual: cute.Tensor,
     out: cute.Tensor,
+    numel: cutlass.Int64,
+    geometry,
     stream: cuda.CUstream,
-    SPEC: cutlass.Constexpr,
+    config: cutlass.Constexpr,
 ) -> None:
-    if cutlass.const_expr(SPEC[3] % 8 == 0 and SPEC[4] in (SPEC[3], SPEC[3] * 2)):
-        stage_add_vector_kernel(x, skip, bias, residual, out, SPEC).launch(
-            grid=((out.shape[0] + 2047) // 2048, 1, 1), block=(256, 1, 1), stream=stream
+    t, h, w = geometry
+    divisors = SpatialDivisors((t + config.ft - 1) // config.ft, h // config.fs, w // config.fs, wide=config.wide_index)
+    if cutlass.const_expr(config.ci % 8 == 0 and config.co in (config.ci, config.ci * 2)):
+        stage_add_vector_kernel(x, skip, bias, residual, out, numel, geometry, divisors, config).launch(
+            grid=((numel + 2047) // 2048, 1, 1),
+            block=(256, 1, 1),
+            stream=stream,
         )
     else:
-        stage_add_kernel(x, skip, bias, residual, out, *SPEC).launch(
-            grid=((out.shape[0] + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream
+        stage_add_kernel(
+            x,
+            skip,
+            bias,
+            residual,
+            out,
+            numel,
+            *geometry,
+            config.ci,
+            config.co,
+            config.ft,
+            config.fs,
+            config.has_residual,
+            config.has_bias,
+            divisors,
+        ).launch(
+            grid=((numel + 255) // 256, 1, 1),
+            block=(256, 1, 1),
+            stream=stream,
         )
 
 
-@cache
-def compile_stage(
-    spec: tuple[int, int, int, int, int, int, int, bool, bool],
-) -> Callable:
-    """Cache code by scalar shape/factor metadata, never by tensor identity."""
-    tensor = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2)
-    skip = make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int64(),), assumed_align=2)
-    bias = make_fake_compact_tensor(cutlass.BFloat16, (spec[4],), assumed_align=2)
-    return cute.compile(
+@compile_cache()
+def compile_stage(config: StageConfig, storage_dtype: torch.dtype = torch.bfloat16) -> Callable:
+    """Compile grouping/layout capabilities, independent of runtime geometry."""
+    tensor = make_fake_compact_tensor(storage_type(storage_dtype), (cute.sym_int64(),), assumed_align=2)
+    skip = make_fake_compact_tensor(storage_type(storage_dtype), (cute.sym_int64(),), assumed_align=2)
+    bias = make_fake_compact_tensor(storage_type(storage_dtype), (config.co,), assumed_align=2)
+    return compile_kernel(
         stage_add_host,
         tensor,
         skip,
         bias,
         tensor,
         tensor,
+        cutlass.Int64(1),
+        tuple((cutlass.Int64 if config.wide_index else cutlass.Int32)(1) for _ in range(3)),
         make_fake_stream(),
-        spec,
+        config,
         options="--enable-tvm-ffi --ptxas-options=--fmad=false",
     )
 
@@ -464,10 +555,11 @@ def stage_add(
         if (
             value.device != x.device
             or value.device.type != "cuda"
-            or value.dtype != torch.bfloat16
+            or value.dtype != x.dtype
+            or value.dtype not in (torch.bfloat16, torch.float32)
             or not value.is_contiguous()
         ):
-            raise ValueError("Stage tensors must be contiguous BF16 on one CUDA device")
+            raise ValueError("Stage tensors must be contiguous, matching BF16 or FP32 on one CUDA device")
         if torch.is_grad_enabled() and value.requires_grad:
             raise ValueError("Stage fusion is inference-only")
     if bias is not None and bias.shape != (co,):
@@ -477,12 +569,17 @@ def stage_add(
     out = torch.empty_like(x)
     if out.numel():
         with torch.cuda.device(x.device):
-            compile_stage((t, h, w, ci, co, ft, fs, residual is not None, bias is not None))(
+            compile_stage(
+                StageConfig(ci, co, ft, fs, residual is not None, bias is not None, n * (t + ft - 1) * h * w >= 2**31),
+                storage_dtype=x.dtype,
+            )(
                 x.view(-1),
                 skip.view(-1),
                 x.view(-1)[:co] if bias is None else bias,
                 (x if residual is None else residual).view(-1),
                 out.view(-1),
+                out.numel(),
+                (t, h, w),
                 cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
             )
     return out
@@ -511,15 +608,14 @@ def compile() -> None:
     """Compile the encoder's residual widths and four stage shortcuts."""
     for c in (160, 320, 640):
         compile_bias_residual(c)
-        compile_bias_residual(c, spatial_shape=(3, 5))
+        compile_bias_residual(c, pad_spatial=True)
     for ci, co, ft, fs in (
         (160, 160, 1, 2),
         (160, 320, 2, 2),
         (320, 640, 2, 2),
         (640, 640, 1, 1),
     ):
-        for t in (1, 4):
-            compile_stage((t, 8, 6, ci, co, ft, fs, fs == 1, fs == 1))
+        compile_stage(StageConfig(ci, co, ft, fs, fs == 1, fs == 1))
 
 
 @torch.inference_mode()

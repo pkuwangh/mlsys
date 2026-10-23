@@ -4,7 +4,7 @@
 
 """Fuse Wan convolution bias, RMSNorm/SiLU, causal padding, and cache updates.
 
-All activation and cache tensors are contiguous BF16 [N,T,H,W,C]. The canonical
+All activation and cache tensors are contiguous BF16 or FP32 [N,T,H,W,C]. The canonical
 C160/256/320/512/640/1024 path partitions one launch into current-frame normalization CTAs
 and vectorized history/padding CTAs. Post-attention reduction keeps one group per
 padded output row. Each owner also writes its part of the next cache; history
@@ -16,7 +16,7 @@ Uses only the installed public CUTLASS DSL 4.7.1 runtime.
 
 import argparse
 from collections.abc import Callable
-from functools import cache, partial
+from functools import partial
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -25,8 +25,14 @@ from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 if __package__:
+    from ._compile import compile_cache, compile_kernel
+    from ._dtype import storage_type
+    from ._geometry import SpatialDivisors
     from ._utils import PreparedConvInput, measure, print_benchmark_table
 else:
+    from _compile import compile_cache, compile_kernel
+    from _dtype import storage_type
+    from _geometry import SpatialDivisors
     from _utils import PreparedConvInput, measure, print_benchmark_table
 
 THREADS = 128
@@ -74,8 +80,9 @@ def rmsnorm_silu_row(
         out_c = z_c instead when APPLY_SILU=False (attention normalization)
 
     This follows F.normalize then scale/affine, NOT rsqrt(mean(x*x)+eps).
-    All math is FP32 between the explicit BF16 cast points. One lane group owns
-    a row and retains its inputs in registers. All group lanes participate in the
+    All math is FP32 between casts to the input storage dtype. The formula
+    above describes BF16; FP32 storage preserves the intermediate values. One
+    lane group owns a row and retains its inputs in registers. All group lanes participate in the
     reduction, including lanes whose last channel slot is out of bounds.
     For C=160/320/640, use 16 interleaved sums, merge four sums per group,
     then merge the four groups. This reproduces the eager Torch channel
@@ -97,9 +104,9 @@ def rmsnorm_silu_row(
         tid, _, _ = cute.arch.thread_idx()
         lane_base = tid % 32 // 16 * 16
         shuffle_mask = cutlass.Uint32(0xFFFF) << lane_base
-    result = cutlass.Array(cutlass.BFloat16, SLOTS, space=cutlass.AddressSpace.rmem)
+    result = cutlass.Array(x.element_type, SLOTS, space=cutlass.AddressSpace.rmem)
     for slot in cutlass.range_constexpr(SLOTS):
-        result[slot] = cutlass.BFloat16(0.0)
+        result[slot] = x.element_type(0.0)
     if row < x.shape[0]:
         values = cutlass.Array(
             cutlass.Float32,
@@ -118,14 +125,14 @@ def rmsnorm_silu_row(
             if lane < GROUPS and col < CHANNELS:
                 value = cutlass.Float32(x[row, col])
                 if HAS_INPUT_BIAS:
-                    value = cutlass.Float32(cutlass.BFloat16(value + cutlass.Float32(input_bias[col])))
+                    value = cutlass.Float32(x.element_type(value + cutlass.Float32(input_bias[col])))
                 if HAS_RESIDUAL:
                     skip = cutlass.Float32(residual[row, col])
                     if HAS_RESIDUAL_BIAS:
-                        skip = cutlass.Float32(cutlass.BFloat16(skip + cutlass.Float32(residual_bias[col])))
-                    value = cutlass.Float32(cutlass.BFloat16(value + skip))
+                        skip = cutlass.Float32(x.element_type(skip + cutlass.Float32(residual_bias[col])))
+                    value = cutlass.Float32(x.element_type(value + skip))
                 if HAS_RESIDUAL or SAVE_INPUT:
-                    residual_out[row, col] = cutlass.BFloat16(value)
+                    residual_out[row, col] = x.element_type(value)
             values[slot] = value
             if VECTOR_REDUCE:
                 partials[slot % 4] = partials[slot % 4] + value * value
@@ -158,15 +165,15 @@ def rmsnorm_silu_row(
             if VECTOR_REDUCE:
                 col = lane * 4 + (slot // 4) * 128 + slot % 4
             if lane < GROUPS and col < CHANNELS:
-                normalized = cutlass.BFloat16(values[slot] / denominator)
-                scaled = cutlass.BFloat16(cutlass.Float32(normalized) * (CHANNELS**0.5))
-                affine = cutlass.BFloat16(cutlass.Float32(scaled) * cutlass.Float32(gamma[col]))
+                normalized = x.element_type(values[slot] / denominator)
+                scaled = x.element_type(cutlass.Float32(normalized) * (CHANNELS**0.5))
+                affine = x.element_type(cutlass.Float32(scaled) * cutlass.Float32(gamma[col]))
                 if HAS_BIAS:
-                    affine = cutlass.BFloat16(cutlass.Float32(affine) + cutlass.Float32(bias[col]))
+                    affine = x.element_type(cutlass.Float32(affine) + cutlass.Float32(bias[col]))
                 value = cutlass.Float32(affine)
                 result[slot] = affine
                 if APPLY_SILU:
-                    result[slot] = cutlass.BFloat16(value / (1.0 + cute.math.exp(-value, fastmath=False)))
+                    result[slot] = x.element_type(value / (1.0 + cute.math.exp(-value, fastmath=False)))
     return result
 
 
@@ -203,9 +210,10 @@ def rmsnorm_kernel(
             32,
             False,
         )
-        SLOTS = (CHANNELS + 127) // 128 * 4
+        VECTOR_REDUCE = CHANNELS >= 128 and CHANNELS % 4 == 0
+        SLOTS = (CHANNELS + 127) // 128 * 4 if VECTOR_REDUCE else (CHANNELS + 31) // 32
         for slot in cutlass.range_constexpr(SLOTS):
-            col = lane * 4 + (slot // 4) * 128 + slot % 4
+            col = lane * 4 + (slot // 4) * 128 + slot % 4 if VECTOR_REDUCE else lane + slot * 32
             if col < CHANNELS:
                 out[row, col] = values[slot]
 
@@ -229,23 +237,24 @@ def rmsnorm_host(
     )
 
 
-@cache
+@compile_cache()
 def compile_rmsnorm(
     channels: int = 160,
     has_bias: bool = False,
+    storage_dtype: torch.dtype = torch.bfloat16,
 ) -> Callable:
-    """Cache code by channel count, bias mode, and reference reduction order."""
-    if channels not in (160, 256, 320, 512, 640, 1024):
+    """Cache code by channel count, bias mode, and storage dtype."""
+    if channels not in (96, 160, 192, 256, 320, 384, 512, 640, 1024):
         raise ValueError("Unsupported Wan encoder/decoder RMSNorm channel count")
     tensor = make_fake_compact_tensor(
-        cutlass.BFloat16,
+        storage_type(storage_dtype),
         (cute.sym_int64(), channels),
         stride_order=(1, 0),
         assumed_align=2,
     )
-    weight = make_fake_compact_tensor(cutlass.BFloat16, (channels,), assumed_align=2)
+    weight = make_fake_compact_tensor(storage_type(storage_dtype), (channels,), assumed_align=2)
     # Keep the BF16 gamma multiply and bias addition separately rounded.
-    return cute.compile(
+    return compile_kernel(
         rmsnorm_host,
         tensor,
         weight,
@@ -263,9 +272,9 @@ def rmsnorm(
     gamma: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run inference-only Wan attention RMSNorm-affine on contiguous BF16 NTHWC.
+    """Run inference-only Wan attention RMSNorm-affine on contiguous BF16 or FP32 NTHWC.
 
-    Gamma and optional bias must be contiguous BF16 vectors of length C on
+    Gamma and optional bias must be contiguous vectors with the input dtype on
     the input device. Reject unsupported inputs instead of copying/falling back.
     Attention uses the contiguous-channel reference reduction and no activation.
     """
@@ -276,7 +285,7 @@ def rmsnorm(
         return out
     with torch.cuda.device(x.device):
         stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
-        compile_rmsnorm(channels, bias is not None)(
+        compile_rmsnorm(channels, bias is not None, storage_dtype=x.dtype)(
             x.view(-1, channels),
             gamma,
             gamma if bias is None else bias,
@@ -287,18 +296,18 @@ def rmsnorm(
 
 
 def validate_rmsnorm_inputs(x: torch.Tensor, gamma: torch.Tensor, bias: torch.Tensor | None) -> None:
-    """Validate the shared inference-only BF16 NTHWC and affine contract."""
+    """Validate the shared inference-only NTHWC, storage-dtype and affine contract."""
     if x.ndim != 5 or not x.is_contiguous():
         raise ValueError("RMSNorm SiLU requires contiguous [N,T,H,W,C] input")
     channels = x.shape[-1]
-    if channels not in (160, 256, 320, 512, 640, 1024):
+    if channels not in (96, 160, 192, 256, 320, 384, 512, 640, 1024):
         raise ValueError("Unsupported Wan encoder/decoder RMSNorm channel count")
     tensors = (x, gamma) if bias is None else (x, gamma, bias)
     for tensor in tensors:
         if tensor.device.type != "cuda" or tensor.device != x.device:
             raise ValueError("RMSNorm SiLU tensors must share a CUDA device")
-        if tensor.dtype != torch.bfloat16:
-            raise TypeError("RMSNorm SiLU requires torch.bfloat16")
+        if tensor.dtype != x.dtype or tensor.dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError("RMSNorm tensors must share BF16 or FP32 storage dtype")
         if torch.is_grad_enabled() and tensor.requires_grad:
             raise ValueError("RMSNorm SiLU is inference-only; disable gradient tracking")
     for weight in tensors[1:]:
@@ -319,9 +328,9 @@ def _conv_prep_row(
     padded: cute.Tensor,
     cache: cute.Tensor,
     row: cutlass.Int64,
-    frames: cutlass.Constexpr[int],
-    height: cutlass.Constexpr[int],
-    width: cutlass.Constexpr[int],
+    frames: cutlass.Int64,
+    height: cutlass.Int64,
+    width: cutlass.Int64,
     previous_frames: cutlass.Int64,
     cache_frames: cutlass.Int64,
     CHANNELS: cutlass.Constexpr[int],
@@ -334,6 +343,11 @@ def _conv_prep_row(
     PAD_T: cutlass.Constexpr[int],
     PAD_H: cutlass.Constexpr[int],
     PAD_W: cutlass.Constexpr[int],
+    current_divisors,
+    padded_divisors,
+    auxiliary_divisor,
+    border_divisor,
+    WIDE_INDEX: cutlass.Constexpr[bool],
 ) -> None:
     """Compute padded = pad(concat(previous, SiLU(WanRMSNorm(x))), ...).
 
@@ -359,19 +373,17 @@ def _conv_prep_row(
     ROW_LANES = 16 if not CONTIGUOUS_REDUCTION and CHANNELS in (160, 320, 640) else 32
     lane = tid % ROW_LANES
     if row < padded.shape[0]:
-        padded_h = height + 2 * PAD_H
-        padded_w = width + 2 * PAD_W
-        w = row % padded_w - PAD_W
-        h = (row // padded_w) % padded_h - PAD_H
-        t = (row // (padded_w * padded_h)) % (frames + PAD_T) - PAD_T
-        n = row // (padded_w * padded_h * (frames + PAD_T))
+        n, t, h, w = padded_divisors.coordinates(row)
+        w -= PAD_W
+        h -= PAD_H
+        t -= PAD_T
         valid_spatial = h >= 0 and h < height and w >= 0 and w < width
         VECTOR_REDUCE = CONTIGUOUS_REDUCTION and CHANNELS >= 128 and CHANNELS % 4 == 0
         GROUPS = 16 if not VECTOR_REDUCE and CHANNELS in (160, 320, 640) else 32
         SLOTS = (CHANNELS + 127) // 128 * 4 if VECTOR_REDUCE else (CHANNELS + GROUPS - 1) // GROUPS
-        values = cutlass.Array(cutlass.BFloat16, SLOTS, space=cutlass.AddressSpace.rmem)
+        values = cutlass.Array(x.element_type, SLOTS, space=cutlass.AddressSpace.rmem)
         for slot in cutlass.range_constexpr(SLOTS):
-            values[slot] = cutlass.BFloat16(0.0)
+            values[slot] = x.element_type(0.0)
         if valid_spatial:
             if t >= 0:
                 input_row = ((n * frames + t) * height + h) * width + w
@@ -425,9 +437,9 @@ def rmsnorm_silu_conv_prep_kernel(
     previous: cute.Tensor,
     padded: cute.Tensor,
     cache: cute.Tensor,
-    frames: cutlass.Constexpr[int],
-    height: cutlass.Constexpr[int],
-    width: cutlass.Constexpr[int],
+    frames: cutlass.Int64,
+    height: cutlass.Int64,
+    width: cutlass.Int64,
     previous_frames: cutlass.Int64,
     cache_frames: cutlass.Int64,
     CHANNELS: cutlass.Constexpr[int],
@@ -440,6 +452,11 @@ def rmsnorm_silu_conv_prep_kernel(
     PAD_T: cutlass.Constexpr[int],
     PAD_H: cutlass.Constexpr[int],
     PAD_W: cutlass.Constexpr[int],
+    current_divisors,
+    padded_divisors,
+    auxiliary_divisor,
+    border_divisor,
+    WIDE_INDEX: cutlass.Constexpr[bool],
 ) -> None:
     """Give each padded row one warp group; history/cache writers are disjoint."""
     tid, _, _ = cute.arch.thread_idx()
@@ -473,6 +490,11 @@ def rmsnorm_silu_conv_prep_kernel(
         PAD_T,
         PAD_H,
         PAD_W,
+        current_divisors=current_divisors,
+        padded_divisors=padded_divisors,
+        auxiliary_divisor=auxiliary_divisor,
+        border_divisor=border_divisor,
+        WIDE_INDEX=WIDE_INDEX,
     )
 
 
@@ -482,13 +504,18 @@ def _conv_prep_aux_vector(
     padded: cute.Tensor,
     cache: cute.Tensor,
     vector_idx: cutlass.Int64,
-    frames: cutlass.Constexpr[int],
-    height: cutlass.Constexpr[int],
-    width: cutlass.Constexpr[int],
+    frames: cutlass.Int64,
+    height: cutlass.Int64,
+    width: cutlass.Int64,
     previous_frames: cutlass.Int64,
     cache_frames: cutlass.Int64,
     CHANNELS: cutlass.Constexpr[int],
     ALIGNMENT: cutlass.Constexpr[int],
+    current_divisors,
+    padded_divisors,
+    auxiliary_divisor,
+    border_divisor,
+    WIDE_INDEX: cutlass.Constexpr[bool],
 ) -> None:
     """Own one history/halo vector; current-frame interiors are excluded.
 
@@ -505,28 +532,30 @@ def _conv_prep_aux_vector(
     vectors_per_batch = auxiliary_rows * vectors_per_row
     batches = padded.shape[0] // ((frames + 2) * padded_h * padded_w)
     if vector_idx < batches * vectors_per_batch:
-        batch = vector_idx // vectors_per_batch
-        index_type: cutlass.Constexpr = cutlass.Int32 if vectors_per_batch < 2**31 else cutlass.Int64
-        local_vector = index_type(vector_idx % vectors_per_batch)
+        index_type: cutlass.Constexpr = cutlass.Int64 if WIDE_INDEX else cutlass.Int32
+        coordinate = index_type(vector_idx)
+        batch = cutlass.Int64(coordinate // auxiliary_divisor)
+        local_vector = coordinate % auxiliary_divisor
         channel = local_vector % vectors_per_row * EPILOGUE_VECTOR
         local_row = local_vector // vectors_per_row
         pt = index_type(0)
         ph = index_type(0)
         pw = index_type(0)
         if local_row < history_rows:
-            pt = local_row // (padded_h * padded_w)
-            ph = local_row // padded_w % padded_h
-            pw = local_row % padded_w
+            pt = local_row // padded_divisors.plane
+            within_plane = local_row % padded_divisors.plane
+            ph = within_plane // padded_divisors.width
+            pw = within_plane % padded_divisors.width
         else:
-            border = (local_row - history_rows) % border_rows
-            pt = (local_row - history_rows) // border_rows + 2
+            border = (local_row - history_rows) % border_divisor
+            pt = (local_row - history_rows) // border_divisor + 2
             if border < 2 * padded_w:
-                ph = border // padded_w * (height + 1)
-                pw = border % padded_w
+                ph = index_type(border // padded_divisors.width * (height + 1))
+                pw = border % padded_divisors.width
             else:
-                ph = (border - 2 * padded_w) // 2 + 1
-                pw = (border - 2 * padded_w) % 2 * (width + 1)
-        values = cutlass.vector.full((EPILOGUE_VECTOR,), 0, cutlass.BFloat16)
+                ph = index_type((border - 2 * padded_w) // 2 + 1)
+                pw = index_type((border - 2 * padded_w) % 2 * (width + 1))
+        values = cutlass.vector.full((EPILOGUE_VECTOR,), 0, padded.element_type)
         valid_spatial = ph > 0 and ph <= height and pw > 0 and pw <= width
         if pt < 2 and pt >= 2 - previous_frames and valid_spatial:
             source = (
@@ -561,11 +590,12 @@ def _prep_current_row_pair(
 ) -> None:
     """Compute non-residual C160/C320 prep with two adjacent channels per lane.
 
-    B denotes BF16 rounding; omit the addition when input_bias is absent.
+    B denotes storage-dtype rounding; omit the addition when input_bias is absent.
     Math and every BF16 rounding follow rmsnorm_silu_row. Lane l retains
     B(x[16*s+2*l:16*s+2*l+2] + input_bias) packed in one register and sums
-    the two channel parities independently. Each parity merges original sums
-    at offsets 2,4,6; lane zero forms (G0+G2)+(G1+G3). This is the original
+    the two channel parities independently. FP32 retains two typed values
+    instead of packing two BF16 values into one word. Each parity merges
+    original sums at offsets 2,4,6; lane zero forms (G0+G2)+(G1+G3). This is the original
     16-sum FP32 tree, not a reassociated eight-sum reduction. Four independent
     rows share a warp; masks and broadcasts remain within each eight-lane row.
     """
@@ -573,7 +603,12 @@ def _prep_current_row_pair(
     lane = tid % 8
     lane_base = tid % 32 // 8 * 8
     mask = cutlass.Uint32(0xFF) << lane_base
-    retained = cutlass.Array(cutlass.Uint32, CHANNELS // 16, space=cutlass.AddressSpace.rmem)
+    PACKED: cutlass.Constexpr = x.element_type == cutlass.BFloat16
+    retained = cutlass.Array(
+        cutlass.Uint32 if PACKED else cutlass.Float32,
+        CHANNELS // (16 if PACKED else 8),
+        space=cutlass.AddressSpace.rmem,
+    )
     partials = cutlass.Array(cutlass.Float32, 2, space=cutlass.AddressSpace.rmem)
     for parity in cutlass.range_constexpr(2):
         partials[parity] = cutlass.Float32(0.0)
@@ -583,10 +618,13 @@ def _prep_current_row_pair(
         pair = (x.iterator.raw_ptr() + offset).load(count=2, alignment=ALIGNMENT)
         if HAS_INPUT_BIAS:
             bias_pair = (input_bias.iterator.raw_ptr() + col).load(count=2, alignment=ALIGNMENT)
-            pair = (pair.to(cutlass.Float32) + bias_pair.to(cutlass.Float32)).to(cutlass.BFloat16)
+            pair = (pair.to(cutlass.Float32) + bias_pair.to(cutlass.Float32)).to(x.element_type)
         if SAVE_INPUT:
             (residual_out.iterator.raw_ptr() + offset).store(pair, alignment=ALIGNMENT)
-        retained.store(pair.bitcast(cutlass.Uint32), slot)
+        if cutlass.const_expr(PACKED):
+            retained.store(pair.bitcast(cutlass.Uint32), slot)
+        else:
+            retained.store(pair, slot * 2)
         values = pair.to(cutlass.Float32)
         for parity in cutlass.range_constexpr(2):
             partials[parity] = partials[parity] + values[parity] * values[parity]
@@ -605,13 +643,16 @@ def _prep_current_row_pair(
         denominator = cutlass.Float32(1e-12)
     for slot in cutlass.range_constexpr(CHANNELS // 16):
         col = slot * 16 + lane * 2
-        values = retained.load(slot, 1).bitcast(cutlass.BFloat16).to(cutlass.Float32)
-        normalized = (values / denominator).to(cutlass.BFloat16)
-        scaled = (normalized.to(cutlass.Float32) * (CHANNELS**0.5)).to(cutlass.BFloat16)
+        if cutlass.const_expr(PACKED):
+            values = retained.load(slot, 1).bitcast(cutlass.BFloat16).to(cutlass.Float32)
+        else:
+            values = retained.load(slot * 2, 2)
+        normalized = (values / denominator).to(x.element_type)
+        scaled = (normalized.to(cutlass.Float32) * (CHANNELS**0.5)).to(x.element_type)
         gamma_pair = (gamma.iterator.raw_ptr() + col).load(count=2, alignment=ALIGNMENT)
-        affine = (scaled.to(cutlass.Float32) * gamma_pair.to(cutlass.Float32)).to(cutlass.BFloat16)
+        affine = (scaled.to(cutlass.Float32) * gamma_pair.to(cutlass.Float32)).to(x.element_type)
         activated = affine.to(cutlass.Float32)
-        result = (activated / (1.0 + cute.math.exp(-activated, fastmath=False))).to(cutlass.BFloat16)
+        result = (activated / (1.0 + cute.math.exp(-activated, fastmath=False))).to(x.element_type)
         (padded.iterator.raw_ptr() + padded_row * CHANNELS + col).store(result, alignment=ALIGNMENT)
         if write_cache:
             (cache.iterator.raw_ptr() + cache_row * CHANNELS + col).store(result, alignment=ALIGNMENT)
@@ -658,7 +699,7 @@ def _prep_contiguous_row(
     lane = tid % LANES
     lane_base = tid % 32 // LANES * LANES
     mask = cutlass.Uint32((1 << LANES) - 1) << lane_base
-    retained = cutlass.Array(cutlass.BFloat16, CHANNELS // LANES, space=cutlass.AddressSpace.rmem)
+    retained = cutlass.Array(x.element_type, CHANNELS // LANES, space=cutlass.AddressSpace.rmem)
     partials = cutlass.Array(cutlass.Float32, VIRTUAL_GROUPS * 4, space=cutlass.AddressSpace.rmem)
     for group in cutlass.range_constexpr(CHANNELS // (LANES * 4)):
         col = lane * 4 + group * LANES * 4
@@ -666,48 +707,63 @@ def _prep_contiguous_row(
         value = (x.iterator.raw_ptr() + offset).load(count=4, alignment=ALIGNMENT)
         if HAS_INPUT_BIAS:
             b = (input_bias.iterator.raw_ptr() + col).load(count=4, alignment=ALIGNMENT)
-            value = (value.to(cutlass.Float32) + b.to(cutlass.Float32)).to(cutlass.BFloat16)
+            value = (value.to(cutlass.Float32) + b.to(cutlass.Float32)).to(x.element_type)
         if HAS_RESIDUAL:
             skip = (residual.iterator.raw_ptr() + offset).load(count=4, alignment=ALIGNMENT)
             if HAS_RESIDUAL_BIAS:
                 b = (residual_bias.iterator.raw_ptr() + col).load(count=4, alignment=ALIGNMENT)
-                skip = (skip.to(cutlass.Float32) + b.to(cutlass.Float32)).to(cutlass.BFloat16)
-            value = (value.to(cutlass.Float32) + skip.to(cutlass.Float32)).to(cutlass.BFloat16)
+                skip = (skip.to(cutlass.Float32) + b.to(cutlass.Float32)).to(x.element_type)
+            value = (value.to(cutlass.Float32) + skip.to(cutlass.Float32)).to(x.element_type)
         if HAS_RESIDUAL or SAVE_INPUT:
             (residual_out.iterator.raw_ptr() + offset).store(value, alignment=ALIGNMENT)
         retained.store(value, group * 4)
         fp = value.to(cutlass.Float32)
         squares = fp * fp
-        if cutlass.const_expr(group >= VIRTUAL_GROUPS):
-            squares = partials.load((group % VIRTUAL_GROUPS) * 4, 4) + squares
-        partials.store(squares, (group % VIRTUAL_GROUPS) * 4)
-    groups = cutlass.Array(cutlass.Float32, VIRTUAL_GROUPS, space=cutlass.AddressSpace.rmem)
-    for group in cutlass.range_constexpr(VIRTUAL_GROUPS):
-        total = partials[group * 4]
-        for part in cutlass.range_constexpr(1, 4):
-            total = total + partials[group * 4 + part]
-        groups[group] = total
-    if cutlass.const_expr(LANES == 8):
-        total = (groups[0] + groups[2]) + (groups[1] + groups[3])
+        if cutlass.const_expr(CHANNELS == 96):
+            # Torch uses scalar lanes below C128: c, c+32, c+64.
+            # Each physical lane holds four adjacent virtual lanes.
+            if cutlass.const_expr(group > 0):
+                squares = partials.load(0, 4) + squares
+            partials.store(squares, 0)
+        else:
+            if cutlass.const_expr(group >= VIRTUAL_GROUPS):
+                squares = partials.load((group % VIRTUAL_GROUPS) * 4, 4) + squares
+            partials.store(squares, (group % VIRTUAL_GROUPS) * 4)
+    if cutlass.const_expr(CHANNELS == 96):
+        for part in cutlass.range_constexpr(4):
+            total = partials[part]
+            for offset in (4, 2, 1):
+                total = total + cute.arch.shuffle_sync_down(total, offset, mask=mask)
+            partials[part] = total
+        total = (partials[0] + partials[2]) + (partials[1] + partials[3])
     else:
-        total = groups[0]
-    for offset in (16, 8, 4, 2, 1) if LANES == 32 else (4, 2, 1):
-        total = total + cute.arch.shuffle_sync_down(total, offset, mask=mask)
+        groups = cutlass.Array(cutlass.Float32, VIRTUAL_GROUPS, space=cutlass.AddressSpace.rmem)
+        for group in cutlass.range_constexpr(VIRTUAL_GROUPS):
+            total = partials[group * 4]
+            for part in cutlass.range_constexpr(1, 4):
+                total = total + partials[group * 4 + part]
+            groups[group] = total
+        if cutlass.const_expr(LANES == 8):
+            total = (groups[0] + groups[2]) + (groups[1] + groups[3])
+        else:
+            total = groups[0]
+        for offset in (16, 8, 4, 2, 1) if LANES == 32 else (4, 2, 1):
+            total = total + cute.arch.shuffle_sync_down(total, offset, mask=mask)
     denominator = cute.math.sqrt(cute.arch.shuffle_sync(total, lane_base, mask=mask), fastmath=False)
     if denominator < 1e-12:
         denominator = cutlass.Float32(1e-12)
     for group in cutlass.range_constexpr(CHANNELS // (LANES * 4)):
         col = lane * 4 + group * LANES * 4
         value = retained.load(group * 4, 4).to(cutlass.Float32)
-        normalized = (value / denominator).to(cutlass.BFloat16)
-        scaled = (normalized.to(cutlass.Float32) * (CHANNELS**0.5)).to(cutlass.BFloat16)
+        normalized = (value / denominator).to(x.element_type)
+        scaled = (normalized.to(cutlass.Float32) * (CHANNELS**0.5)).to(x.element_type)
         g = (gamma.iterator.raw_ptr() + col).load(count=4, alignment=ALIGNMENT)
-        affine = (scaled.to(cutlass.Float32) * g.to(cutlass.Float32)).to(cutlass.BFloat16)
+        affine = (scaled.to(cutlass.Float32) * g.to(cutlass.Float32)).to(x.element_type)
         if HAS_BIAS:
             b = (bias.iterator.raw_ptr() + col).load(count=4, alignment=ALIGNMENT)
-            affine = (affine.to(cutlass.Float32) + b.to(cutlass.Float32)).to(cutlass.BFloat16)
+            affine = (affine.to(cutlass.Float32) + b.to(cutlass.Float32)).to(x.element_type)
         value = affine.to(cutlass.Float32)
-        result = (value / (1.0 + cute.math.exp(-value, fastmath=False))).to(cutlass.BFloat16)
+        result = (value / (1.0 + cute.math.exp(-value, fastmath=False))).to(x.element_type)
         (padded.iterator.raw_ptr() + padded_row * CHANNELS + col).store(result, alignment=ALIGNMENT)
         if write_cache:
             (cache.iterator.raw_ptr() + cache_row * CHANNELS + col).store(result, alignment=ALIGNMENT)
@@ -725,9 +781,9 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
     previous: cute.Tensor,
     padded: cute.Tensor,
     cache: cute.Tensor,
-    frames: cutlass.Constexpr[int],
-    height: cutlass.Constexpr[int],
-    width: cutlass.Constexpr[int],
+    frames: cutlass.Int64,
+    height: cutlass.Int64,
+    width: cutlass.Int64,
     previous_frames: cutlass.Int64,
     cache_frames: cutlass.Int64,
     CHANNELS: cutlass.Constexpr[int],
@@ -737,6 +793,11 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
     HAS_RESIDUAL_BIAS: cutlass.Constexpr[bool],
     SAVE_INPUT: cutlass.Constexpr[bool],
     CONTIGUOUS_REDUCTION: cutlass.Constexpr[bool],
+    current_divisors,
+    padded_divisors,
+    auxiliary_divisor,
+    border_divisor,
+    WIDE_INDEX: cutlass.Constexpr[bool],
 ) -> None:
     """Partition one nonpersistent launch into normalization and auxiliary CTAs.
 
@@ -759,7 +820,7 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
         input_row = cutlass.Int64(bid) * (THREADS // ROW_LANES) + tid // ROW_LANES
         if input_row < x.shape[0]:
             lane = tid % ROW_LANES
-            values = cutlass.Array(cutlass.BFloat16, SLOTS, space=cutlass.AddressSpace.rmem)
+            values = cutlass.Array(x.element_type, SLOTS, space=cutlass.AddressSpace.rmem)
             # Decode output coordinates after normalization: hoisting them
             # across normalization increases live registers on residual paths.
             if cutlass.const_expr(not PAIRED and not VECTOR_CONTIGUOUS):
@@ -782,13 +843,7 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
                     HAS_RESIDUAL_BIAS=HAS_RESIDUAL_BIAS,
                     SAVE_INPUT=SAVE_INPUT,
                 )
-            rows_per_batch = frames * height * width
-            index_type: cutlass.Constexpr = cutlass.Int32 if rows_per_batch < 2**31 else cutlass.Int64
-            batch = input_row // rows_per_batch
-            local_row = index_type(input_row % rows_per_batch)
-            t = local_row // (height * width)
-            h = local_row // width % height
-            w = local_row % width
+            batch, t, h, w = current_divisors.coordinates(input_row)
             padded_row = ((batch * (frames + 2) + t + 2) * (height + 2) + h + 1) * (width + 2) + w + 1
             cache_row = ((batch * cache_frames + t - frames + cache_frames) * height + h) * width + w
             if cutlass.const_expr(VECTOR_CONTIGUOUS):
@@ -924,6 +979,11 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
                     cache_frames,
                     CHANNELS,
                     16,
+                    current_divisors=current_divisors,
+                    padded_divisors=padded_divisors,
+                    auxiliary_divisor=auxiliary_divisor,
+                    border_divisor=border_divisor,
+                    WIDE_INDEX=WIDE_INDEX,
                 )
             else:
                 _conv_prep_aux_vector(
@@ -938,6 +998,11 @@ def rmsnorm_silu_conv_prep_partitioned_kernel(
                     cache_frames,
                     CHANNELS,
                     2,
+                    current_divisors=current_divisors,
+                    padded_divisors=padded_divisors,
+                    auxiliary_divisor=auxiliary_divisor,
+                    border_divisor=border_divisor,
+                    WIDE_INDEX=WIDE_INDEX,
                 )
 
 
@@ -953,9 +1018,9 @@ def conv_prep_host(
     previous: cute.Tensor,
     padded: cute.Tensor,
     cache: cute.Tensor,
-    frames: cutlass.Constexpr[int],
-    height: cutlass.Constexpr[int],
-    width: cutlass.Constexpr[int],
+    frames: cutlass.Int64,
+    height: cutlass.Int64,
+    width: cutlass.Int64,
     previous_frames: cutlass.Int64,
     cache_frames: cutlass.Int64,
     stream: cuda.CUstream,
@@ -969,10 +1034,17 @@ def conv_prep_host(
     PAD_T: cutlass.Constexpr[int],
     PAD_H: cutlass.Constexpr[int],
     PAD_W: cutlass.Constexpr[int],
+    WIDE_INDEX: cutlass.Constexpr[bool],
 ) -> None:
     """Use partitioned canonical CTAs, or the unchanged general row scheduler."""
+    current_divisors = SpatialDivisors(frames, height, width, wide=WIDE_INDEX)
+    padded_divisors = SpatialDivisors(frames + PAD_T, height + 2 * PAD_H, width + 2 * PAD_W, wide=WIDE_INDEX)
+    border_rows = 2 * (width + 2) + 2 * height
+    auxiliary_vectors = (2 * (height + 2) * (width + 2) + frames * border_rows) * (CHANNELS // 8)
+    auxiliary_divisor = auxiliary_vectors if WIDE_INDEX else cute.fast_divmod_create_divisor(auxiliary_vectors)
+    border_divisor = border_rows if WIDE_INDEX else cute.fast_divmod_create_divisor(border_rows)
     if cutlass.const_expr(
-        (CHANNELS in (160, 320, 640) or (CONTIGUOUS_REDUCTION and CHANNELS in (256, 512, 1024)))
+        (CHANNELS in (160, 320, 640) or (CONTIGUOUS_REDUCTION and CHANNELS in (96, 192, 256, 384, 512, 1024)))
         and (PAD_T, PAD_H, PAD_W) == (2, 1, 1)
     ):
         row_lanes = (
@@ -1011,6 +1083,11 @@ def conv_prep_host(
             HAS_RESIDUAL_BIAS,
             SAVE_INPUT,
             CONTIGUOUS_REDUCTION,
+            current_divisors=current_divisors,
+            padded_divisors=padded_divisors,
+            auxiliary_divisor=auxiliary_divisor,
+            border_divisor=border_divisor,
+            WIDE_INDEX=WIDE_INDEX,
         ).launch(
             grid=(current_blocks + auxiliary_blocks, 1, 1),
             block=(THREADS, 1, 1),
@@ -1046,6 +1123,11 @@ def conv_prep_host(
         PAD_T,
         PAD_H,
         PAD_W,
+        current_divisors=current_divisors,
+        padded_divisors=padded_divisors,
+        auxiliary_divisor=auxiliary_divisor,
+        border_divisor=border_divisor,
+        WIDE_INDEX=WIDE_INDEX,
     ).launch(
         grid=(grid, 1, 1),
         block=(THREADS, 1, 1),
@@ -1053,17 +1135,18 @@ def conv_prep_host(
     )
 
 
-@cache
+@compile_cache()
 def compile_conv_prep(
     channels: int = 160,
     has_bias: bool = False,
     contiguous_reduction: bool = True,
     has_input_bias: bool = False,
     has_residual: bool = False,
-    shape: tuple[int, int, int] = (1, 3, 5),
     *,
     has_residual_bias: bool = False,
     save_input: bool = False,
+    wide_index: bool = False,
+    storage_dtype: torch.dtype = torch.bfloat16,
 ) -> Callable:
     """Specialize immutable metadata without GPU allocations or device queries."""
     if has_residual_bias and not has_residual:
@@ -1072,15 +1155,15 @@ def compile_conv_prep(
     # Distinct symbols: current, history, padded, and cache row counts differ.
     tensors = [
         make_fake_compact_tensor(
-            cutlass.BFloat16,
+            storage_type(storage_dtype),
             (cute.sym_int64(), channels),
             stride_order=(1, 0),
             assumed_align=2,
         )
         for _ in range(4)
     ]
-    weight = make_fake_compact_tensor(cutlass.BFloat16, (channels,), assumed_align=2)
-    return cute.compile(
+    weight = make_fake_compact_tensor(storage_type(storage_dtype), (channels,), assumed_align=2)
+    return compile_kernel(
         conv_prep_host,
         tensors[0],
         weight,
@@ -1092,9 +1175,11 @@ def compile_conv_prep(
         tensors[1],
         tensors[2],
         tensors[3],
-        *shape,
-        0,
-        1,
+        cutlass.Int64(1),
+        cutlass.Int64(3),
+        cutlass.Int64(5),
+        cutlass.Int64(0),
+        cutlass.Int64(1),
         make_fake_stream(),
         channels,
         has_bias,
@@ -1104,6 +1189,7 @@ def compile_conv_prep(
         save_input,
         contiguous_reduction,
         *padding,
+        wide_index,
         options="--enable-tvm-ffi --ptxas-options=--fmad=false",
     )
 
@@ -1120,14 +1206,14 @@ def rmsnorm_silu_conv_prep(
     save_input: bool = False,
     contiguous_reduction: bool = True,
 ) -> PreparedConvInput:
-    """Return fused padded input and next two-frame cache, both BF16 NTHWC.
+    """Return padded input and next two-frame cache in the input NTHWC dtype.
 
     Padding is two leading temporal planes and one pixel on each spatial side.
     input_bias is the preceding convolution's optional C-vector, added and
-    rounded to BF16 before normalization. It is never added to history/padding.
-    When residual is present, add it after bias with a second BF16 rounding,
+    rounded to the input dtype before normalization. It is never added to history/padding.
+    When residual is present, add it after bias with a second storage-dtype rounding,
     and return that sum separately for the following block's skip connection.
-    residual_bias optionally biases the raw residual with its own BF16 rounding
+    residual_bias optionally biases the raw residual with its own storage-dtype rounding
     before the skip addition; it requires residual. save_input also returns the
     pre-normalization biased input when residual is absent. Neither option
     changes normalization arithmetic or allocates a separate biased branch.
@@ -1186,9 +1272,14 @@ def rmsnorm_silu_conv_prep(
                 contiguous_reduction,
                 input_bias is not None,
                 residual is not None,
-                (frames, height, width),
                 has_residual_bias=residual_bias is not None,
                 save_input=save_input,
+                storage_dtype=x.dtype,
+                wide_index=max(
+                    n * (frames + 2) * (height + 2) * (width + 2),
+                    n * (2 * (height + 2) * (width + 2) + frames * (2 * (width + 2) + 2 * height)) * (channels // 8),
+                )
+                >= 2**31,
             )(
                 x.view(-1, channels),
                 gamma,
@@ -1200,6 +1291,9 @@ def rmsnorm_silu_conv_prep(
                 (x if previous is None else previous).view(-1, channels),
                 padded.view(-1, channels),
                 cache.view(-1, channels),
+                frames,
+                height,
+                width,
                 previous_frames,
                 cache_frames,
                 stream,
@@ -1265,7 +1359,7 @@ def compile() -> None:
 def verify() -> None:
     """Check first/cached chunks on small, untimed inputs."""
     torch.manual_seed(42)
-    for channels in (160, 256, 320, 512, 640, 1024):
+    for channels in (96, 160, 192, 256, 320, 384, 512, 640, 1024):
         gamma = torch.randn(channels, device="cuda", dtype=torch.bfloat16)
         bias = torch.randn_like(gamma)
         for frames, history, has_residual in (
@@ -1293,7 +1387,7 @@ def verify() -> None:
     # Vector accesses must also accept 2B-aligned offset views and a
     # partial final CTA. Exercise every optional affine/residual input here.
     for channels, frames, history in (
-        (c, t, p) for c in (160, 256, 320, 512, 640, 1024) for t, p in ((1, 0), (1, 1), (4, 2))
+        (c, t, p) for c in (96, 160, 192, 256, 320, 384, 512, 640, 1024) for t, p in ((1, 0), (1, 1), (4, 2))
     ):
         shape = (1, frames, 3, 5, channels)
         x = torch.randn(frames * 3 * 5 * channels + 1, device="cuda", dtype=torch.bfloat16)[1:].view(shape)

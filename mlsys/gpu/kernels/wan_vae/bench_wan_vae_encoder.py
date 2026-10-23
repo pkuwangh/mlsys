@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 
-"""Reference runner for Wan2.2 VAE encode on synthetic video input.
+"""Benchmark Wan 2.1/2.2 VAE encoding on synthetic video input.
 
 The PyTorch/Diffusers baseline records shapes, timings, and numerical references.
-Always validate and benchmark MegaWanVaeEncoder in BF16. It fuses
-convolution bias, RMSNorm, SiLU, causal padding, and temporal-cache preparation
-inside mega_wan_vae, plus fused bias/residual epilogues.
-The input and residual 3x3x3 convolutions use our pipelined primitive kernels;
-other convolutions and remaining operations stay in Torch/cuDNN. Intermediate
+Validate and benchmark MegaWanVaeEncoder in BF16 or FP32 with explicit TF32 permission. Both architectures
+use fused normalization/SiLU/padding/cache preparation and custom convolutions
+where supported. Both versions integrate supported post-ops into convolution
+epilogues; Wan 2.1 retains cuDNN and separate preparation for C384.
+Other convolutions and remaining operations stay in Torch/cuDNN. Intermediate
 Mega implementations live in git history, not runtime configuration options.
-All four variants, including torch.compile, run and are profiled by default.
+Diffusers, compiled Torch and Mega are timed by default; eager Torch runs only
+for validation. Use --profile for an extra forward per timed variant in CUDA profiler ranges.
+Validation compares their final outputs against Diffusers. Exhaustive
+chunk/cache diagnostics require --validate-caches mega or torch-compiled.
 The default sweep is HxW=480x832/720x1280 and T=17/93/201.
-Without --batch-size, batches scale from N=16 at 17 frames and 720x1280:
-32/5/2 at 480p and 16/2/1 at 720p for the default frame counts.
+Without --batch-size, the reference batch scales with free GPU memory, up to
+N=16 at 17 frames and 720x1280, then scales by spatial size and frame count.
+Automatic batches halve and retry on OOM; the table reports the actual batch.
+FP32 automatic batches are divided by 2, then by another 4 with TF32 disabled.
+Estimates below MIN_AUTO_BATCH_SIZE are skipped before rounding.
 An explicit --batch-size uses that exact batch for every case, without scaling.
 Each case reports progress; one final table collects timings and validation.
 Torch and Diffusers baselines preserve channels-last storage. One channels-last
@@ -23,12 +29,12 @@ reference/baseline execution and validation still run outside the capture.
 Command to run:
 TMPDIR="$PWD/tmp" nsys profile \
     --capture-range=cudaProfilerApi --capture-range-end=stop \
-    -- python bench_wan22_vae.py \
+    -- python bench_wan_vae_encoder.py --profile \
        --model ../../../../checkpoints/Wan-AI/Wan2.2-TI2V-5B-Diffusers/ \
        --resolutions 480x832 --frames 17
 
 For a multi-case Nsight capture, use --capture-range-end=repeat instead of stop.
-Omit ``--model`` to instantiate the exact architecture with deterministic
+Omit ``--model`` to instantiate the Wan 2.2 architecture with deterministic
 random weights. That mode measures performance and numerical agreement, not
 caption or reconstruction quality.
 """
@@ -39,17 +45,32 @@ import math
 import statistics
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import replace
 
 import torch
+from bench_utils import (
+    MIN_AUTO_BATCH_SIZE,
+    BenchmarkCase,
+    BenchmarkResult,
+    add_arithmetic_arguments,
+    auto_batch_divisor,
+    compare_model_outputs,
+    configure_arithmetic,
+    print_case_header,
+    print_startup_header,
+    print_summary,
+    report_compilation,
+    report_strict_accuracy,
+    strict_accuracy_reference,
+    validate_cache_chunks,
+    validation_status,
+    validation_succeeded,
+)
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 from mega_wan_vae import MegaWanVaeEncoder
 from mega_wan_vae._utils import (
     FeatCache,
     validate_frame_count,
-)
-from mega_wan_vae._utils import (
-    canonicalize_cache as raw_canonicalize_cache,
 )
 from mega_wan_vae._utils import (
     patchify as raw_patchify,
@@ -59,6 +80,7 @@ from wan_vae_reference import TorchCompileChunkWanVaeEncoder, TorchWanVaeEncoder
 # Common end-to-end BF16 agreement gate; standalone kernels use tighter checks.
 COMPARE_ATOL = 0.25
 COMPARE_RTOL = 1e-3
+TOLERANCES = {"bf16": (COMPARE_ATOL, COMPARE_RTOL), "fp32": (1e-4, 1e-4)}
 REFERENCE_FRAMES = 17
 REFERENCE_HEIGHT = 720
 REFERENCE_WIDTH = 1280
@@ -82,40 +104,27 @@ SYNTHETIC_WAN22_CONFIG = {
 }
 
 
-@dataclass(frozen=True)
-class BenchmarkCase:
-    """One complete NCTHW video workload; resolution is height by width."""
-
-    height: int
-    width: int
-    frames: int
-    batch_size: int
-
-    @property
-    def label(self) -> str:
-        return f"{self.height}x{self.width}, T={self.frames}, N={self.batch_size}"
-
-
-def scaled_batch_size(base_batch_size: int, frames: int, height: int, width: int) -> int:
+def scaled_batch_size(
+    base_batch_size: int, frames: int, height: int, width: int, *, dtype: str = "bf16", allow_tf32: bool = False
+) -> int | None:
     """Choose a spatial batch, then scale it down for videos longer than 17 frames.
 
-    Spatial scaling is capped at twice the 720p batch, giving default 17-frame
-    batches of 32 at 480p and 16 at 720p. This is not a peak-VRAM guarantee.
+    Spatial scaling is capped at twice the memory-scaled 720p batch.
+    This is not a peak-VRAM guarantee.
     """
     spatial_batch = min(
         2 * base_batch_size,
         base_batch_size * REFERENCE_HEIGHT * REFERENCE_WIDTH // (height * width),
     )
-    return max(1, spatial_batch * REFERENCE_FRAMES // max(REFERENCE_FRAMES, frames))
+    scaled = spatial_batch * REFERENCE_FRAMES / max(REFERENCE_FRAMES, frames) / auto_batch_divisor(dtype, allow_tf32)
+    if dtype == "fp32" and scaled < MIN_AUTO_BATCH_SIZE:
+        return None
+    return max(1, int(scaled))
 
 
-@dataclass
-class BenchmarkResult:
-    """Median full-encode CUDA-event times and validation for one workload."""
-
-    case: BenchmarkCase
-    timings: dict[str, float]
-    status: str = "ALL PASS"
+def auto_reference_batch(free_bytes: int) -> int:
+    """Scale the original N16 workload to free memory; OOM retries handle peaks."""
+    return max(1, min(16, free_bytes * 16 // (256 * 2**30)))
 
 
 def resolution(value: str) -> tuple[int, int]:
@@ -138,29 +147,30 @@ class ArgumentDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sweep Wan2.2 VAE encode on deterministic synthetic video.",
+        description="Sweep Wan VAE encode on deterministic synthetic video.",
         formatter_class=ArgumentDefaultsHelpFormatter,
     )
+    add_arithmetic_arguments(parser)
     parser.add_argument(
         "--model",
         type=str,
         help=(
-            "Local Wan2.2 Diffusers model directory. When omitted, instantiate "
+            "Local Wan 2.1 or Wan 2.2 Diffusers model directory. When omitted, instantiate "
             "the production architecture with deterministic random weights."
         ),
     )
     parser.add_argument(
         "--dtype",
         default="bf16",
-        choices=["fp32", "fp16", "bf16"],
+        choices=("bf16", "fp32"),
         help="Torch dtype for VAE weights and input.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         help=(
-            "Fixed batch for every case, without scaling. When omitted, scale "
-            "from N=16 at 17 frames and 720x1280 (N=32 at 480x832)."
+            "Fixed batch for every case, without scaling or OOM retries. When omitted, "
+            "scale by free GPU memory and pixel-frame count, then halve on OOM."
         ),
     )
     parser.add_argument(
@@ -190,7 +200,15 @@ def parse_args() -> argparse.Namespace:
         "--torch-compile",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Include torch.compile in validation, benchmarking, and profiling.",
+        help="Include the compiled Torch baseline; Mega may still use torch.compile internally.",
+    )
+    parser.add_argument(
+        "--profile", action="store_true", help="Run an extra forward per variant in CUDA profiler ranges."
+    )
+    parser.add_argument(
+        "--validate-caches",
+        choices=("mega", "torch-compiled"),
+        help="Opt into expensive chunk/cache validation against eager for the selected implementation (default: disabled).",
     )
     parser.add_argument(
         "--profile-mega-only",
@@ -198,12 +216,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=("Capture only Mega; keep baseline runs and validation outside the CUDA profiler range."),
     )
-    parser.add_argument("--benchmark-repeats", type=int, default=4, help="benchmark iters")
+    parser.add_argument("--benchmark-repeats", type=int, default=3, help="Full-encode timing samples.")
     args = parser.parse_args()
     if args.benchmark_repeats < 1:
         parser.error("--benchmark-repeats must be positive")
-    if args.dtype != "bf16":
-        parser.error("Mega requires --dtype bf16")
+    if args.validate_caches == "torch-compiled" and not args.torch_compile:
+        parser.error("--validate-caches torch-compiled requires --torch-compile")
     if args.batch_size is not None and args.batch_size < 1:
         parser.error("--batch-size must be positive")
     if (args.height is None) != (args.width is None):
@@ -221,8 +239,6 @@ def parse_args() -> argparse.Namespace:
 def resolve_dtype(name: str) -> torch.dtype:
     if name == "fp32":
         return torch.float32
-    if name == "fp16":
-        return torch.float16
     if name == "bf16":
         return torch.bfloat16
     raise ValueError(f"Unsupported dtype: {name}")
@@ -257,65 +273,22 @@ def cuda_profiler_range(device: torch.device, *, enabled: bool = True) -> Iterat
         torch.cuda.cudart().cudaProfilerStop()
 
 
-def compare_tensors(name: str, actual: torch.Tensor, expected: torch.Tensor, *, atol: float, rtol: float) -> bool:
-    diff = (actual.detach().float() - expected.detach().float()).abs()
-    max_abs = float(diff.max().item())
-    mean_abs = float(diff.mean().item())
-    rms_abs = float(torch.sqrt(torch.mean(diff * diff)).item())
-    allclose = torch.allclose(actual, expected, atol=atol, rtol=rtol)
-    print(
-        f"  {'PASS' if allclose else 'FAIL'} {name}: atol={atol:g} rtol={rtol:g} "
-        f"max_abs={max_abs:.6e} mean_abs={mean_abs:.6e} rms_abs={rms_abs:.6e}",
-        flush=True,
-    )
-    if not allclose:
-        failed = ~torch.isclose(actual, expected, atol=atol, rtol=rtol)
-        count = int(failed.sum().item())
-        print(
-            f"    outside tolerance: {count}/{failed.numel()} ({100 * count / failed.numel():.4f}%)",
-            flush=True,
-        )
-        if actual.ndim == 5:
-            # Final posterior parameters are NCTHW; no extra encode is needed.
-            per_frame = failed.sum(dim=(0, 1, 3, 4))
-            failing_frames = per_frame.nonzero().flatten()
-            first, last = (int(failing_frames[i].item()) for i in (0, -1))
-            worst = int(per_frame.argmax().item())
-            for t in dict.fromkeys((first, worst, last)):
-                print(
-                    f"    latent frame {t}/{actual.shape[2] - 1}: "
-                    f"failed={int(per_frame[t].item())}/{failed[:, :, t].numel()} "
-                    f"max_abs={float(diff[:, :, t].max().item()):.6e} "
-                    f"rms_abs={float(diff[:, :, t].square().mean().sqrt().item()):.6e}",
-                    flush=True,
-                )
-    return bool(allclose)
-
-
-def cache_state_name(feat_cache: FeatCache) -> str:
-    first_tensor = next((entry for entry in feat_cache if isinstance(entry, torch.Tensor)), None)
-    if first_tensor is None:
-        return "cache_t=0"
-    return f"cache_t={first_tensor.shape[2]}"
-
-
-def tensor_error(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float, float]:
-    diff = (actual.detach().float() - expected.detach().float()).abs()
-    return (
-        float(diff.max().item()),
-        float(diff.mean().item()),
-        float(torch.sqrt(torch.mean(diff * diff)).item()),
-    )
-
-
-def debug_compiled_chunk_mismatch(
+def validate_chunk_caches(
     torch_encoder: TorchWanVaeEncoder,
-    compiled_torch_encoder: TorchCompileChunkWanVaeEncoder,
+    encode_chunk: Callable[[torch.Tensor, FeatCache], tuple[torch.Tensor, FeatCache]],
     video: torch.Tensor,
     *,
     atol: float,
     rtol: float,
+    label: str,
+    cache_nthwc: bool = False,
+    allow_bf16_neighbors: bool = False,
 ) -> bool:
+    """Compare each chunk from the same eager history; full encodes check accumulated drift.
+
+    Wan 2.2 Mega stores all tensor cache entries in NTHWC; other encoders use
+    NCTHW. Layout conversions here are views of channels-last storage.
+    """
     _, _, num_frame, height, width = video.shape
     x = video
     if torch_encoder.patch_size is not None:
@@ -327,56 +300,20 @@ def debug_compiled_chunk_mismatch(
         print("  rejected: tiling is enabled.")
         return False
 
-    feat_cache = torch_encoder.new_cache()
     iterations = 1 + (num_frame - 1) // 4
-    for i in range(iterations):
-        if i == 0:
-            chunk = x[:, :, :1, :, :]
-        else:
-            chunk = x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :]
-
-        cache_in = raw_canonicalize_cache(feat_cache)
-        eager_out, eager_cache = torch_encoder.encode_chunk(chunk, cache_in)
-        compiled_out, compiled_cache = compiled_torch_encoder.chunk_encoder(chunk, cache_in)
-
-        if not torch.allclose(compiled_out, eager_out, atol=atol, rtol=rtol):
-            max_abs, mean_abs, rms_abs = tensor_error(compiled_out, eager_out)
-            print(
-                f"  rejected: chunk[{i}] {cache_state_name(cache_in)} output mismatch "
-                f"max_abs={max_abs:.6e} mean_abs={mean_abs:.6e} rms_abs={rms_abs:.6e}"
-            )
-            return False
-
-        if len(compiled_cache) != len(eager_cache):
-            print(
-                f"  rejected: chunk[{i}] {cache_state_name(cache_in)} "
-                "cache length mismatch "
-                f"compiled={len(compiled_cache)} eager={len(eager_cache)}"
-            )
-            return False
-
-        for cache_idx, (actual, expected) in enumerate(zip(compiled_cache, eager_cache)):
-            if isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor):
-                if not torch.allclose(actual, expected, atol=atol, rtol=rtol):
-                    max_abs, mean_abs, rms_abs = tensor_error(actual, expected)
-                    print(
-                        f"  rejected: chunk[{i}] {cache_state_name(cache_in)} "
-                        f"cache[{cache_idx}] mismatch "
-                        f"shape={tuple(actual.shape)} max_abs={max_abs:.6e} "
-                        f"mean_abs={mean_abs:.6e} rms_abs={rms_abs:.6e}"
-                    )
-                    return False
-            elif actual != expected:
-                print(
-                    f"  rejected: chunk[{i}] {cache_state_name(cache_in)} "
-                    f"cache[{cache_idx}] mismatch "
-                    f"compiled={type(actual).__name__} eager={type(expected).__name__}"
-                )
-                return False
-
-        feat_cache = eager_cache
-
-    return True
+    chunks = (x[:, :, :1] if i == 0 else x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i] for i in range(iterations))
+    return validate_cache_chunks(
+        chunks,
+        torch_encoder.new_cache(),
+        lambda chunk, cache, index: torch_encoder.encode_chunk(chunk, cache),
+        lambda chunk, cache, index: encode_chunk(chunk, cache),
+        iterations=iterations,
+        atol=atol,
+        rtol=rtol,
+        label=label,
+        cache_nthwc=cache_nthwc,
+        allow_bf16_neighbors=allow_bf16_neighbors,
+    )
 
 
 def sample_video_channels(vae: AutoencoderKLWan) -> int:
@@ -427,30 +364,37 @@ def make_synthetic_video(
 def load_vae(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> AutoencoderKLWan:
     if args.model is None:
         torch.manual_seed(args.seed)
-        vae = AutoencoderKLWan(**SYNTHETIC_WAN22_CONFIG)
+        vae = AutoencoderKLWan(**SYNTHETIC_WAN22_CONFIG).to(dtype=dtype)
     else:
         vae = AutoencoderKLWan.from_pretrained(args.model, subfolder="vae", torch_dtype=dtype)
     # Prepare the single reference in place; do not retain an alternate layout.
     torch.nn.utils.convert_conv3d_weight_memory_format(vae, torch.channels_last_3d)
     torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
-    return vae.to(device=device, dtype=dtype).eval()
+    # Checkpoint loading already applies dtype while respecting FP32 modules.
+    return vae.to(device=device).eval()
 
 
 def median_timings(paths: dict[str, Callable[[], torch.Tensor]], repeats: int) -> dict[str, float]:
     """Alternate variant order; time full encodes, including ordinary launches."""
     samples: dict[str, list[float]] = {name: [] for name in paths}
+    peaks = {name: 0 for name in paths}
     for repeat in range(repeats):
         order = list(paths) if repeat % 2 == 0 else list(reversed(paths))
-        # print(f"  Timing round {repeat + 1}/{repeats}: {' -> '.join(order)}", flush=True)
         for name in order:
+            live_bytes = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
             start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
             start.record()
             output = paths[name]()
             end.record()
             end.synchronize()
             samples[name].append(start.elapsed_time(end))
+            peaks[name] = max(peaks[name], torch.cuda.max_memory_allocated() - live_bytes)
             del output
-            # print(f"    {name}: {samples[name][-1]:.3f} ms", flush=True)
+    print(
+        "  Peak additional allocated GiB: " + " | ".join(f"{name}={size / 2**30:.3f}" for name, size in peaks.items()),
+        flush=True,
+    )
     return {name: statistics.median(values) for name, values in samples.items()}
 
 
@@ -460,8 +404,9 @@ def run_case(
     case: BenchmarkCase,
     vae: AutoencoderKLWan,
     device: torch.device,
+    models: dict[str, torch.nn.Module],
 ) -> BenchmarkResult:
-    """Warm, validate, capture once, then measure all variants for one video."""
+    """Validate all variants, optionally profile, then time Diffusers/Compiled/Mega."""
     video = make_synthetic_video(
         batch_size=case.batch_size,
         channels=sample_video_channels(vae),
@@ -470,11 +415,11 @@ def run_case(
         width=case.width,
         seed=args.seed,
         device=device,
-        dtype=torch.bfloat16,
+        dtype=resolve_dtype(args.dtype),
     )
-    eager = TorchWanVaeEncoder(vae).eval()
-    mega = MegaWanVaeEncoder(vae).eval()
-    compiled = None
+    strict_reference = strict_accuracy_reference(args, lambda: vae.encode(video, return_dict=False)[0].parameters)
+    eager, mega = models["Torch"], models["Mega"]
+    compiled = models.get("Compiled")
     paths = {
         "Diffusers": lambda: vae.encode(video, return_dict=False)[0].parameters,
         "Torch": lambda: eager(video),
@@ -484,12 +429,16 @@ def run_case(
     status = []
     for name, fn in paths.items():
         print(f"  Warmup/validation: {name}", flush=True)
-        outputs[name] = fn()
-    if args.torch_compile:
-        print("  Compiling and warming up Torch (setup time not measured)", flush=True)
+        if name == "Mega":
+            with report_compilation(name, cute=True):
+                outputs[name] = fn()
+        else:
+            outputs[name] = fn()
+    if compiled is not None:
+        print("  Warmup/validation: Compiled", flush=True)
         try:
-            compiled = TorchCompileChunkWanVaeEncoder(vae).eval()
-            outputs["Compiled"] = compiled(video)
+            with report_compilation("Compiled"):
+                outputs["Compiled"] = compiled(video)
             paths["Compiled"] = lambda: compiled(video)
         except torch.cuda.OutOfMemoryError:
             raise
@@ -497,142 +446,154 @@ def run_case(
             print(f"  Compiled ERROR: {type(error).__name__}: {error}", flush=True)
             status.append("Compiled ERROR")
 
+    tolerances = TOLERANCES[args.dtype]
+    for name, output in outputs.items():
+        if not report_strict_accuracy(name, output, strict_reference, operation="encode"):
+            status.append(f"{name} TF32 accuracy FAIL")
+    del strict_reference
     for name, label, reference, atol, rtol in (
         (
             "Mega",
             "Mega vs Diffusers",
             outputs["Diffusers"],
-            COMPARE_ATOL,
-            COMPARE_RTOL,
+            tolerances[0],
+            tolerances[1],
         ),
         (
             "Torch",
             "Torch eager vs Diffusers",
             outputs["Diffusers"],
-            COMPARE_ATOL,
-            COMPARE_RTOL,
+            tolerances[0],
+            tolerances[1],
         ),
         (
             "Compiled",
             "Torch compiled vs Diffusers",
             outputs["Diffusers"],
-            COMPARE_ATOL,
-            COMPARE_RTOL,
+            tolerances[0],
+            tolerances[1],
         ),
     ):
         if name not in outputs:
             continue
         # Posterior mode is a slice of parameters; checking all parameters covers it.
-        matches = compare_tensors(label, outputs[name], reference, atol=atol, rtol=rtol)
+        matches = compare_model_outputs(
+            label,
+            outputs[name],
+            reference,
+            atol=atol,
+            rtol=rtol,
+            allow_tf32=args.dtype == "fp32" and args.allow_tf32,
+            accuracy_diagnostics=args.accuracy_diagnostics,
+            operation="encode",
+        )
         if not matches:
             status.append(f"{name} FAIL")
-    if compiled is not None and "Compiled" in outputs:
-        # Diagnostic only: stay quiet on success; failures print their location.
-        chunks_match = debug_compiled_chunk_mismatch(eager, compiled, video, atol=COMPARE_ATOL, rtol=COMPARE_RTOL)
-        if not chunks_match:
-            print("  FAIL Torch compiled chunk outputs/caches", flush=True)
-            status.append("Compiled cache FAIL")
-    del outputs
+    del outputs, reference
+    if args.validate_caches is not None:
+        is_mega = args.validate_caches == "mega"
+        label = "Mega" if is_mega else "Compiled"
+        # Compilation errors are already recorded above; do not invoke an invalid baseline.
+        if is_mega or "Compiled" in paths:
+            chunks_match = validate_chunk_caches(
+                eager,
+                mega.encode_chunk if is_mega else compiled.chunk_encoder,
+                video,
+                atol=tolerances[0],
+                rtol=tolerances[1],
+                label=label,
+                cache_nthwc=is_mega and bool(vae.config.is_residual),
+                allow_bf16_neighbors=not is_mega,
+            )
+            if not chunks_match:
+                print(f"  FAIL {label} chunk outputs/caches", flush=True)
+                status.append(f"{label} cache FAIL")
 
-    # A single-case command retains the existing Nsight capture semantics.
+    # Eager Torch remains a validation reference, not a timed baseline.
+    del paths["Torch"]
     # Multi-case Nsight recording needs --capture-range-end=repeat, not stop.
-    with cuda_profiler_range(device):
+    if args.profile or args.profile_mega_only:
         names = ["Mega"] if args.profile_mega_only else list(paths)
-        for name in names:
-            with nvtx_range(device, f"{case.label}/{name}"):
-                output = paths[name]()
-                del output
+        print("  Profiling: " + " -> ".join(names), flush=True)
+        with cuda_profiler_range(device):
+            for name in names:
+                with nvtx_range(device, f"{case.label}/{name}"):
+                    output = paths[name]()
+                    del output
     result = BenchmarkResult(case, median_timings(paths, args.benchmark_repeats))
-    result.status = "; ".join(status) if status else "ALL PASS"
+    result.status = validation_status(status, args)
     print(f"  Validation: {result.status}", flush=True)
     return result
 
 
-def print_summary(results: list[BenchmarkResult], repeats: int) -> None:
-    """Print all measured variants; failed or unavailable runs are never hidden."""
-    headers = [
-        "Resolution",
-        "Frames",
-        "Batch",
-        "Mega (ms)",
-        "Diffusers (ms)",
-        "Torch (ms)",
-        "Compiled (ms)",
-        "vs Torch",
-        "vs Compiled",
-        "Mega frames/s",
-        "Validation",
-    ]
-    rows = []
-    for result in results:
-        times = result.timings
-        mega_ms = times.get("Mega")
-        rows.append(
-            [
-                f"{result.case.height}x{result.case.width}",
-                str(result.case.frames),
-                str(result.case.batch_size),
-                *[
-                    f"{times[name]:.3f}" if name in times else "-"
-                    for name in ("Mega", "Diffusers", "Torch", "Compiled")
-                ],
-                *[
-                    f"{times[name] / mega_ms:.3f}x" if mega_ms and name in times else "-"
-                    for name in ("Torch", "Compiled")
-                ],
-                f"{result.case.batch_size * result.case.frames * 1000 / mega_ms:.1f}" if mega_ms else "-",
-                result.status,
-            ]
-        )
-    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
-    print(
-        "\nSummary: BF16, resolution=HxW, batch scaled by pixel-frame count, "
-        f"median of {repeats} full-encode CUDA-event samples.",
-        flush=True,
-    )
-    print("Speedup=baseline/Mega. Input generation, warmup, compilation and validation excluded.")
-    for index, row in enumerate([headers, *rows]):
-        print(
-            " | ".join(
-                value.ljust(width) if i in (0, len(headers) - 1) else value.rjust(width)
-                for i, (value, width) in enumerate(zip(row, widths))
-            ),
-            flush=True,
-        )
-        if index == 0:
-            print("-+-".join("-" * width for width in widths), flush=True)
+def run_case_with_retry(
+    args: argparse.Namespace,
+    case: BenchmarkCase,
+    vae: AutoencoderKLWan,
+    device: torch.device,
+    models: dict[str, torch.nn.Module],
+) -> BenchmarkResult:
+    """Retry automatic batches after OOM, retaining validation for every variant."""
+    while True:
+        result = None
+        oom = False
+        try:
+            result = run_case(args, case, vae, device, models)
+        except torch.cuda.OutOfMemoryError:
+            oom = True
+        finally:
+            # Release per-case activations after the exception traceback drops.
+            # Keep compiled graphs across successful cases; discard failed
+            # compiler state only when recovering from OOM.
+            vae.clear_cache()
+            if oom:
+                torch.compiler.reset()
+            gc.collect()
+            torch.cuda.empty_cache()
+        if result is not None:
+            return result
+        if args.batch_size is not None or case.batch_size == 1:
+            print("  CUDA OOM: requested workload does not fit; continuing sweep.", flush=True)
+            return BenchmarkResult(case, {}, "OOM")
+        smaller = max(1, case.batch_size // 2)
+        print(f"  CUDA OOM: auto batch {case.batch_size} -> {smaller}; retrying all variants.", flush=True)
+        case = replace(case, batch_size=smaller)
 
 
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda")
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    reference_batch = auto_reference_batch(free_bytes)
+    cases = []
+    for height, width in args.resolutions:
+        for frames in args.frames:
+            batch = args.batch_size
+            if batch is None:
+                batch = scaled_batch_size(
+                    reference_batch, frames, height, width, dtype=args.dtype, allow_tf32=args.allow_tf32
+                )
+            if batch is not None:
+                cases.append(BenchmarkCase(height, width, frames, batch))
+    if not cases:
+        print(f"No cases meet the automatic batch cutoff of {MIN_AUTO_BATCH_SIZE:g}.", flush=True)
+        return
+    effective_reference = reference_batch / auto_batch_divisor(args.dtype, args.allow_tf32)
     batch_label = (
-        "auto batch (reference N=16, T=17, HxW=720x1280)" if args.batch_size is None else f"fixed N={args.batch_size}"
+        f"auto batch (reference N={effective_reference:g}, T=17, HxW=720x1280, free={free_bytes / 2**30:.1f} GiB)"
+        if args.batch_size is None
+        else f"fixed N={args.batch_size}"
     )
-    print(
-        f"Wan2.2 VAE | {torch.cuda.get_device_name(device)} | {batch_label} | BF16 | repeats={args.benchmark_repeats}",
-        flush=True,
+    print_startup_header(
+        args,
+        operation="encoder",
+        device_name=torch.cuda.get_device_name(device),
+        batch_label=batch_label,
     )
-    if args.model is None:
-        print(
-            "Instantiating WAN 2.2 architecture with deterministic random weights",
-            flush=True,
-        )
-    else:
-        print(f"Loading local checkpoint {args.model}", flush=True)
+    configure_arithmetic(args)
     vae = load_vae(args, device, resolve_dtype(args.dtype))
     if vae.use_tiling:
         raise ValueError("This benchmark requires spatial tiling to be disabled.")
-    cases = [
-        BenchmarkCase(
-            height,
-            width,
-            frames,
-            args.batch_size if args.batch_size is not None else scaled_batch_size(16, frames, height, width),
-        )
-        for height, width in args.resolutions
-        for frames in args.frames
-    ]
     for case in cases:
         validate_frame_count(case.frames)
         for factor in (
@@ -645,29 +606,33 @@ def main() -> None:
         ):
             if factor and (case.height % int(factor) or case.width % int(factor)):
                 raise ValueError(f"{case.label}: resolution must be divisible by {factor}")
-    print(
-        "Validation: Mega, Torch eager and compiled vs channels-last Diffusers.\n"
-        f"Tolerances: atol={COMPARE_ATOL}, rtol={COMPARE_RTOL}.",
-        flush=True,
-    )
+    variants = "Mega, Torch eager and compiled" if args.torch_compile else "Mega and Torch eager"
+    print(f"Validation: {variants} vs channels-last Diffusers.", flush=True)
+    if not (args.dtype == "fp32" and args.allow_tf32):
+        atol, rtol = TOLERANCES[args.dtype]
+        print(f"Tolerances: atol={atol}, rtol={rtol}.", flush=True)
+    if args.validate_caches is None:
+        print("Cache validation: disabled (enable with --validate-caches mega or torch-compiled).", flush=True)
+    else:
+        print(f"Cache validation: {args.validate_caches} vs eager (expensive, outside timings).", flush=True)
+        if args.validate_caches == "torch-compiled" and args.dtype == "bf16":
+            print("Compiled caches also allow adjacent finite BF16 values; output tolerances are unchanged.")
+    with torch.inference_mode():
+        models = {"Torch": TorchWanVaeEncoder(vae).eval(), "Mega": MegaWanVaeEncoder(vae).eval()}
+        if args.torch_compile:
+            models["Compiled"] = TorchCompileChunkWanVaeEncoder(vae).eval()
     results = []
+    # Preserve the per-case graph budget across the sweep: chunk shapes and
+    # temporal-cache layouts can each introduce specializations.
+    graph_limit = torch._dynamo.config.recompile_limit * max(1, len(cases))
     try:
-        for index, case in enumerate(cases, 1):
-            print(f"\n[{index}/{len(cases)}] {case.label}", flush=True)
-            try:
-                results.append(run_case(args, case, vae, device))
-            except torch.cuda.OutOfMemoryError:
-                # Record the planned batch; never silently shrink it after OOM.
-                print("  CUDA OOM: workload does not fit; continuing sweep.", flush=True)
-                results.append(BenchmarkResult(case, {}, "OOM"))
-            finally:
-                # Drop compiled graphs and cached allocations between workloads.
-                torch._dynamo.reset()
-                gc.collect()
-                torch.cuda.empty_cache()
+        with torch._dynamo.config.patch(recompile_limit=graph_limit):
+            for index, case in enumerate(cases, 1):
+                print_case_header(index, len(cases), case)
+                results.append(run_case_with_retry(args, case, vae, device, models))
     finally:
-        print_summary(results, args.benchmark_repeats)
-    if any(result.status != "ALL PASS" for result in results):
+        print_summary(results, args.benchmark_repeats, dtype=args.dtype)
+    if any(not validation_succeeded(result.status) for result in results):
         raise SystemExit("Sweep contains failed validation, compilation, or OOM cases.")
 
 

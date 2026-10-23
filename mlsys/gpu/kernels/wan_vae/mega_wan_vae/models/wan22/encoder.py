@@ -18,7 +18,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanResidualDownBlock,
 )
 
-from ._utils import (
+from ..._utils import (
     FeatCache,
     canonicalize_cache,
     patchify,
@@ -26,13 +26,13 @@ from ._utils import (
     validate_frame_count,
     with_channels_last_weights,
 )
-from .kernels._utils import PreparedConvInput
-from .kernels.conv import WanConv3d, WanInputConv3d
-from .kernels.memory import pack_history
-from .kernels.norm import rmsnorm as primitive_norm
-from .kernels.norm import rmsnorm_silu_conv_prep as primitive_conv_prep
-from .kernels.residual import bias_residual as primitive_bias_residual
-from .kernels.residual import stage_add as primitive_stage_add
+from ...kernels._utils import PreparedConvInput
+from ...kernels.conv import WanConv3d, WanInputConv3d
+from ...kernels.memory import pack_history
+from ...kernels.norm import rmsnorm as primitive_norm
+from ...kernels.norm import rmsnorm_silu_conv_prep as primitive_conv_prep
+from ...kernels.residual import bias_residual as primitive_bias_residual
+from ...kernels.residual import stage_add as primitive_stage_add
 
 
 class _ConvWeights(torch.nn.Module):
@@ -703,7 +703,7 @@ class _Encoder3d(torch.nn.Module):
         return x, feat_cache
 
 
-class MegaWanVaeEncoder(torch.nn.Module):
+class Wan22Encoder(torch.nn.Module):
     """Inference-only Wan encoder constructed from a loaded AutoencoderKLWan.
 
     Call eval() and run under torch.inference_mode() with BF16 CUDA weights and
