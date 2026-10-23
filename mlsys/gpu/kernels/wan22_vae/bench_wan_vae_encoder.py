@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 
-"""Reference runner for Wan2.2 VAE encode on synthetic video input.
+"""Benchmark Wan 2.1/2.2 VAE encoding on synthetic video input.
 
 The PyTorch/Diffusers baseline records shapes, timings, and numerical references.
-Always validate and benchmark MegaWanVaeEncoder in BF16. It fuses
-convolution bias, RMSNorm, SiLU, causal padding, and temporal-cache preparation
-inside mega_wan_vae, plus fused bias/residual epilogues.
-The input and residual 3x3x3 convolutions use our pipelined primitive kernels;
-other convolutions and remaining operations stay in Torch/cuDNN. Intermediate
+Always validate and benchmark MegaWanVaeEncoder in BF16. Both architectures
+use fused normalization/SiLU/padding/cache preparation and custom convolutions
+where supported. Wan 2.2 also integrates supported post-ops into convolution
+epilogues; Wan 2.1 uses separate preparation kernels and retains cuDNN for C384.
+Other convolutions and remaining operations stay in Torch/cuDNN. Intermediate
 Mega implementations live in git history, not runtime configuration options.
 All four variants, including torch.compile, run and are profiled by default.
 The default sweep is HxW=480x832/720x1280 and T=17/93/201.
-Without --batch-size, batches scale from N=16 at 17 frames and 720x1280:
-32/5/2 at 480p and 16/2/1 at 720p for the default frame counts.
+Without --batch-size, the reference batch scales with free GPU memory, up to
+N=16 at 17 frames and 720x1280, then scales by spatial size and frame count.
+Automatic batches halve and retry on OOM; the table reports the actual batch.
 An explicit --batch-size uses that exact batch for every case, without scaling.
 Each case reports progress; one final table collects timings and validation.
 Torch and Diffusers baselines preserve channels-last storage. One channels-last
@@ -23,12 +24,12 @@ reference/baseline execution and validation still run outside the capture.
 Command to run:
 TMPDIR="$PWD/tmp" nsys profile \
     --capture-range=cudaProfilerApi --capture-range-end=stop \
-    -- python bench_wan22_vae.py \
+    -- python bench_wan_vae_encoder.py \
        --model ../../../../checkpoints/Wan-AI/Wan2.2-TI2V-5B-Diffusers/ \
        --resolutions 480x832 --frames 17
 
 For a multi-case Nsight capture, use --capture-range-end=repeat instead of stop.
-Omit ``--model`` to instantiate the exact architecture with deterministic
+Omit ``--model`` to instantiate the Wan 2.2 architecture with deterministic
 random weights. That mode measures performance and numerical agreement, not
 caption or reconstruction quality.
 """
@@ -39,7 +40,7 @@ import math
 import statistics
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
@@ -99,14 +100,19 @@ class BenchmarkCase:
 def scaled_batch_size(base_batch_size: int, frames: int, height: int, width: int) -> int:
     """Choose a spatial batch, then scale it down for videos longer than 17 frames.
 
-    Spatial scaling is capped at twice the 720p batch, giving default 17-frame
-    batches of 32 at 480p and 16 at 720p. This is not a peak-VRAM guarantee.
+    Spatial scaling is capped at twice the memory-scaled 720p batch.
+    This is not a peak-VRAM guarantee.
     """
     spatial_batch = min(
         2 * base_batch_size,
         base_batch_size * REFERENCE_HEIGHT * REFERENCE_WIDTH // (height * width),
     )
     return max(1, spatial_batch * REFERENCE_FRAMES // max(REFERENCE_FRAMES, frames))
+
+
+def auto_reference_batch(free_bytes: int) -> int:
+    """Scale the original N16 workload to free memory; OOM retries handle peaks."""
+    return max(1, min(16, free_bytes * 16 // (256 * 2**30)))
 
 
 @dataclass
@@ -138,14 +144,14 @@ class ArgumentDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sweep Wan2.2 VAE encode on deterministic synthetic video.",
+        description="Sweep Wan VAE encode on deterministic synthetic video.",
         formatter_class=ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--model",
         type=str,
         help=(
-            "Local Wan2.2 Diffusers model directory. When omitted, instantiate "
+            "Local Wan 2.1 or Wan 2.2 Diffusers model directory. When omitted, instantiate "
             "the production architecture with deterministic random weights."
         ),
     )
@@ -159,8 +165,8 @@ def parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         help=(
-            "Fixed batch for every case, without scaling. When omitted, scale "
-            "from N=16 at 17 frames and 720x1280 (N=32 at 480x832)."
+            "Fixed batch for every case, without scaling or OOM retries. When omitted, "
+            "scale by free GPU memory and pixel-frame count, then halve on OOM."
         ),
     )
     parser.add_argument(
@@ -299,13 +305,58 @@ def cache_state_name(feat_cache: FeatCache) -> str:
     return f"cache_t={first_tensor.shape[2]}"
 
 
+def tensor_blocks(
+    actual: torch.Tensor, expected: torch.Tensor, *, max_elements: int = 2**20
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Yield bounded views without flattening/copying a strided cache tensor."""
+    if actual.shape != expected.shape:
+        raise ValueError("Comparison shapes must match")
+    if max_elements < 1:
+        raise ValueError("Comparison block size must be positive")
+    if actual.numel() <= max_elements:
+        yield actual, expected
+        return
+    dim = max((d for d in range(actual.ndim) if actual.shape[d] > 1), key=lambda d: actual.stride(d))
+    length = max(1, max_elements // (actual.numel() // actual.shape[dim]))
+    for start in range(0, actual.shape[dim], length):
+        size = min(length, actual.shape[dim] - start)
+        yield from tensor_blocks(
+            actual.narrow(dim, start, size), expected.narrow(dim, start, size), max_elements=max_elements
+        )
+
+
 def tensor_error(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float, float]:
-    diff = (actual.detach().float() - expected.detach().float()).abs()
-    return (
-        float(diff.max().item()),
-        float(diff.mean().item()),
-        float(torch.sqrt(torch.mean(diff * diff)).item()),
-    )
+    maximum = torch.zeros((), device=actual.device)
+    total = torch.zeros((), dtype=torch.float64, device=actual.device)
+    squared = torch.zeros_like(total)
+    for a, b in tensor_blocks(actual, expected):
+        diff = (a.detach().float() - b.detach().to(device=a.device, dtype=torch.float32)).abs()
+        if diff.numel():
+            maximum = torch.maximum(maximum, diff.max())
+            total += diff.sum(dtype=torch.float64)
+            squared += diff.square().sum(dtype=torch.float64)
+    count = max(1, actual.numel())
+    return maximum.item(), (total / count).item(), (squared / count).sqrt().item()
+
+
+def cache_tolerance_counts(
+    actual: torch.Tensor, expected: torch.Tensor, *, atol: float, rtol: float, max_elements: int = 2**20
+) -> tuple[int, int]:
+    """Count rejected values and BF16 neighbors accepted beyond atol/rtol."""
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        raise ValueError("Cache shape and dtype must match")
+    failed = torch.zeros((), dtype=torch.int64, device=actual.device)
+    adjacent = torch.zeros_like(failed)
+    for a, b in tensor_blocks(actual, expected, max_elements=max_elements):
+        b = b.to(a.device)
+        finite = torch.isfinite(a) & torch.isfinite(b)
+        outside = ~(torch.isclose(a, b, atol=atol, rtol=rtol) & finite)
+        failed += outside.sum()
+        if actual.dtype == torch.bfloat16:
+            # nextafter handles unequal spacing at powers of two. All masks and
+            # CPU-reference transfers are bounded, even for multi-GiB caches.
+            adjacent += (outside & finite & (torch.nextafter(b, a) == a)).sum()
+    return int((failed - adjacent).item()), int(adjacent.item())
 
 
 def debug_compiled_chunk_mismatch(
@@ -335,11 +386,19 @@ def debug_compiled_chunk_mismatch(
         else:
             chunk = x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :]
 
-        cache_in = raw_canonicalize_cache(feat_cache)
+        cache_in = tuple(
+            entry.to(chunk.device) if isinstance(entry, torch.Tensor) else entry
+            for entry in raw_canonicalize_cache(feat_cache)
+        )
         eager_out, eager_cache = torch_encoder.encode_chunk(chunk, cache_in)
+        # Keep the reference on the host during compiled execution. Retaining
+        # both GPU cache sets adds tens of GiB beyond a normal encode's peak.
+        eager_out = eager_out.cpu()
+        eager_cache = tuple(entry.cpu() if isinstance(entry, torch.Tensor) else entry for entry in eager_cache)
+        feat_cache = eager_cache
         compiled_out, compiled_cache = compiled_torch_encoder.chunk_encoder(chunk, cache_in)
 
-        if not torch.allclose(compiled_out, eager_out, atol=atol, rtol=rtol):
+        if not torch.allclose(compiled_out, eager_out.to(compiled_out.device), atol=atol, rtol=rtol):
             max_abs, mean_abs, rms_abs = tensor_error(compiled_out, eager_out)
             print(
                 f"  rejected: chunk[{i}] {cache_state_name(cache_in)} output mismatch "
@@ -357,16 +416,28 @@ def debug_compiled_chunk_mismatch(
 
         for cache_idx, (actual, expected) in enumerate(zip(compiled_cache, eager_cache)):
             if isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor):
-                if not torch.allclose(actual, expected, atol=atol, rtol=rtol):
-                    max_abs, mean_abs, rms_abs = tensor_error(actual, expected)
+                if actual.shape != expected.shape or actual.dtype != expected.dtype:
                     print(
-                        f"  rejected: chunk[{i}] {cache_state_name(cache_in)} "
-                        f"cache[{cache_idx}] mismatch "
-                        f"shape={tuple(actual.shape)} max_abs={max_abs:.6e} "
-                        f"mean_abs={mean_abs:.6e} rms_abs={rms_abs:.6e}"
+                        f"  rejected: chunk[{i}] cache[{cache_idx}] shape/dtype mismatch "
+                        f"compiled={tuple(actual.shape)}/{actual.dtype} "
+                        f"eager={tuple(expected.shape)}/{expected.dtype}"
                     )
                     return False
-            elif actual != expected:
+                failed, adjacent = cache_tolerance_counts(actual, expected, atol=atol, rtol=rtol)
+                if failed or adjacent:
+                    max_abs, mean_abs, rms_abs = tensor_error(actual, expected)
+                    print(
+                        f"  {'rejected' if failed else 'accepted BF16 neighbors'}: "
+                        f"chunk[{i}] {cache_state_name(cache_in)} cache[{cache_idx}] "
+                        f"shape={tuple(actual.shape)} max_abs={max_abs:.6e} "
+                        f"mean_abs={mean_abs:.6e} rms_abs={rms_abs:.6e} "
+                        f"outside_atol_rtol={failed + adjacent}/{expected.numel()} "
+                        f"accepted_adjacent={adjacent} rejected={failed}",
+                        flush=True,
+                    )
+                if failed:
+                    return False
+            elif type(actual) is not type(expected) or actual != expected:
                 print(
                     f"  rejected: chunk[{i}] {cache_state_name(cache_in)} "
                     f"cache[{cache_idx}] mismatch "
@@ -374,7 +445,10 @@ def debug_compiled_chunk_mismatch(
                 )
                 return False
 
-        feat_cache = eager_cache
+        # Loop variables otherwise keep the previous compiled cache alive while
+        # Python evaluates the next encode's right-hand side.
+        actual = expected = None
+        del eager_cache, eager_out, compiled_cache, compiled_out, cache_in
 
     return True
 
@@ -427,30 +501,39 @@ def make_synthetic_video(
 def load_vae(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> AutoencoderKLWan:
     if args.model is None:
         torch.manual_seed(args.seed)
-        vae = AutoencoderKLWan(**SYNTHETIC_WAN22_CONFIG)
+        vae = AutoencoderKLWan(**SYNTHETIC_WAN22_CONFIG).to(dtype=dtype)
     else:
         vae = AutoencoderKLWan.from_pretrained(args.model, subfolder="vae", torch_dtype=dtype)
     # Prepare the single reference in place; do not retain an alternate layout.
     torch.nn.utils.convert_conv3d_weight_memory_format(vae, torch.channels_last_3d)
     torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
-    return vae.to(device=device, dtype=dtype).eval()
+    # Checkpoint loading already applies dtype while respecting FP32 modules.
+    return vae.to(device=device).eval()
 
 
 def median_timings(paths: dict[str, Callable[[], torch.Tensor]], repeats: int) -> dict[str, float]:
     """Alternate variant order; time full encodes, including ordinary launches."""
     samples: dict[str, list[float]] = {name: [] for name in paths}
+    peaks = {name: 0 for name in paths}
     for repeat in range(repeats):
         order = list(paths) if repeat % 2 == 0 else list(reversed(paths))
         # print(f"  Timing round {repeat + 1}/{repeats}: {' -> '.join(order)}", flush=True)
         for name in order:
+            live_bytes = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
             start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
             start.record()
             output = paths[name]()
             end.record()
             end.synchronize()
             samples[name].append(start.elapsed_time(end))
+            peaks[name] = max(peaks[name], torch.cuda.max_memory_allocated() - live_bytes)
             del output
             # print(f"    {name}: {samples[name][-1]:.3f} ms", flush=True)
+    print(
+        "  Peak additional allocated GiB: " + " | ".join(f"{name}={size / 2**30:.3f}" for name, size in peaks.items()),
+        flush=True,
+    )
     return {name: statistics.median(values) for name, values in samples.items()}
 
 
@@ -526,13 +609,14 @@ def run_case(
         matches = compare_tensors(label, outputs[name], reference, atol=atol, rtol=rtol)
         if not matches:
             status.append(f"{name} FAIL")
-    if compiled is not None and "Compiled" in outputs:
-        # Diagnostic only: stay quiet on success; failures print their location.
+    validate_chunks = compiled is not None and "Compiled" in outputs
+    del outputs, reference
+    if validate_chunks:
+        # Validate temporal state too; final posterior agreement is insufficient.
         chunks_match = debug_compiled_chunk_mismatch(eager, compiled, video, atol=COMPARE_ATOL, rtol=COMPARE_RTOL)
         if not chunks_match:
             print("  FAIL Torch compiled chunk outputs/caches", flush=True)
             status.append("Compiled cache FAIL")
-    del outputs
 
     # A single-case command retains the existing Nsight capture semantics.
     # Multi-case Nsight recording needs --capture-range-end=repeat, not stop.
@@ -586,8 +670,7 @@ def print_summary(results: list[BenchmarkResult], repeats: int) -> None:
         )
     widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
     print(
-        "\nSummary: BF16, resolution=HxW, batch scaled by pixel-frame count, "
-        f"median of {repeats} full-encode CUDA-event samples.",
+        f"\nSummary: BF16, resolution=HxW, actual batch shown, median of {repeats} full-encode CUDA-event samples.",
         flush=True,
     )
     print("Speedup=baseline/Mega. Input generation, warmup, compilation and validation excluded.")
@@ -603,14 +686,45 @@ def print_summary(results: list[BenchmarkResult], repeats: int) -> None:
             print("-+-".join("-" * width for width in widths), flush=True)
 
 
+def run_case_with_retry(
+    args: argparse.Namespace, case: BenchmarkCase, vae: AutoencoderKLWan, device: torch.device
+) -> BenchmarkResult:
+    """Retry automatic batches after OOM, retaining validation for every variant."""
+    while True:
+        result = None
+        try:
+            result = run_case(args, case, vae, device)
+        except torch.cuda.OutOfMemoryError:
+            pass
+        finally:
+            # Release model caches and graphs after the exception handler drops
+            # its traceback, including tensors in the failed run_case frame.
+            vae.clear_cache()
+            torch._dynamo.reset()
+            gc.collect()
+            torch.cuda.empty_cache()
+        if result is not None:
+            return result
+        if args.batch_size is not None or case.batch_size == 1:
+            print("  CUDA OOM: requested workload does not fit; continuing sweep.", flush=True)
+            return BenchmarkResult(case, {}, "OOM")
+        smaller = max(1, case.batch_size // 2)
+        print(f"  CUDA OOM: auto batch {case.batch_size} -> {smaller}; retrying all variants.", flush=True)
+        case = replace(case, batch_size=smaller)
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda")
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    reference_batch = auto_reference_batch(free_bytes)
     batch_label = (
-        "auto batch (reference N=16, T=17, HxW=720x1280)" if args.batch_size is None else f"fixed N={args.batch_size}"
+        f"auto batch (reference N={reference_batch}, T=17, HxW=720x1280, free={free_bytes / 2**30:.1f} GiB)"
+        if args.batch_size is None
+        else f"fixed N={args.batch_size}"
     )
     print(
-        f"Wan2.2 VAE | {torch.cuda.get_device_name(device)} | {batch_label} | BF16 | repeats={args.benchmark_repeats}",
+        f"Wan VAE | {torch.cuda.get_device_name(device)} | {batch_label} | BF16 | repeats={args.benchmark_repeats}",
         flush=True,
     )
     if args.model is None:
@@ -628,7 +742,9 @@ def main() -> None:
             height,
             width,
             frames,
-            args.batch_size if args.batch_size is not None else scaled_batch_size(16, frames, height, width),
+            args.batch_size
+            if args.batch_size is not None
+            else scaled_batch_size(reference_batch, frames, height, width),
         )
         for height, width in args.resolutions
         for frames in args.frames
@@ -645,26 +761,18 @@ def main() -> None:
         ):
             if factor and (case.height % int(factor) or case.width % int(factor)):
                 raise ValueError(f"{case.label}: resolution must be divisible by {factor}")
+    variants = "Mega, Torch eager and compiled" if args.torch_compile else "Mega and Torch eager"
     print(
-        "Validation: Mega, Torch eager and compiled vs channels-last Diffusers.\n"
-        f"Tolerances: atol={COMPARE_ATOL}, rtol={COMPARE_RTOL}.",
+        f"Validation: {variants} vs channels-last Diffusers.\nTolerances: atol={COMPARE_ATOL}, rtol={COMPARE_RTOL}.",
         flush=True,
     )
+    if args.torch_compile:
+        print("Compiled intermediate caches also allow adjacent finite BF16 values; output tolerances are unchanged.")
     results = []
     try:
         for index, case in enumerate(cases, 1):
             print(f"\n[{index}/{len(cases)}] {case.label}", flush=True)
-            try:
-                results.append(run_case(args, case, vae, device))
-            except torch.cuda.OutOfMemoryError:
-                # Record the planned batch; never silently shrink it after OOM.
-                print("  CUDA OOM: workload does not fit; continuing sweep.", flush=True)
-                results.append(BenchmarkResult(case, {}, "OOM"))
-            finally:
-                # Drop compiled graphs and cached allocations between workloads.
-                torch._dynamo.reset()
-                gc.collect()
-                torch.cuda.empty_cache()
+            results.append(run_case_with_retry(args, case, vae, device))
     finally:
         print_summary(results, args.benchmark_repeats)
     if any(result.status != "ALL PASS" for result in results):

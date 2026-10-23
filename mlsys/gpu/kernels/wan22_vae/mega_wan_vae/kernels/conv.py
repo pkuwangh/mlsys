@@ -14,8 +14,10 @@ For contiguous NTHWC input X and OTRSC filters W, this computes
         FP32(X[n,t+dt,h+dh,w+dw,c]) * FP32(W[o,dt,dh,dw,c]))
 
 Input already includes causal/spatial padding. The filter is 3x3x3;
-stride and dilation are one, groups is one. Encoder convolutions use N160
-tiles. Decoder convolutions use N256 tiles for 512->256, 256->256, and 48->1024.
+stride and dilation are one, groups is one. Wan 2.1 convolutions use N96
+tiles for C96 outputs and N192 tiles for C192/C384 outputs. Wan 2.2 encoder
+convolutions use N160 tiles. Decoder convolutions use N256 tiles for 512->256,
+256->256, and 48->1024.
 C256 supports fused normalization and next-input preparation.
 ``prepare`` returns this raw convolution. ``prepare_next`` additionally applies
 the C160/C256/C320 postprocessing below, with B denoting a separate BF16 rounding:
@@ -57,6 +59,10 @@ The CUTLASS host wrapper builds public tiled and im2col tensor maps directly
 from the bound tensor arguments. Descriptors travel as GridConstant arguments;
 module forwards retain their operands, allocate fresh outputs, and record the
 active CUDA stream.
+
+Running this file benchmarks both Wan versions. Use --model wan21 or
+--model wan22 to select one; --verify-only and --only-compile use the same
+selection. Timings exclude padding, weight packing, and compilation.
 """
 
 import argparse
@@ -198,8 +204,8 @@ def kernel(
     dilation_dhw = (1, 1, 1)
     if cutlass.const_expr(mma_tiler[0] != (256 if use_2cta_instrs else 128)):
         raise ValueError("Convolution core requires 128 rows per CTA")
-    if cutlass.const_expr(mma_tiler[1] not in (160, 256)):
-        raise ValueError("Wan convolution uses tile N=160 or N=256")
+    if cutlass.const_expr(mma_tiler[1] not in (96, 160, 192, 256)):
+        raise ValueError("Wan convolution uses tile N=96, N=160, N=192 or N=256")
     if cutlass.const_expr(mma_tiler[2] != 64):
         raise ValueError("Convolution core requires tile K=64")
     if cutlass.const_expr(mma_inst_shape_mnk != (mma_tiler[0], mma_tiler[1], 16)):
@@ -1328,6 +1334,7 @@ def kernel(
 
 _ENCODER_CHANNEL_PAIRS = ((160, 160), (160, 320), (320, 320), (320, 640), (640, 640))
 _DECODER_CHANNEL_PAIRS = ((512, 256), (256, 256), (48, 1024))
+_WAN21_CHANNEL_PAIRS = ((96, 96), (96, 192), (192, 192), (192, 384), (384, 384), (16, 384))
 
 
 @dataclass(frozen=True)
@@ -1344,8 +1351,10 @@ class ConvConfig:
 
     @property
     def tile_n(self) -> int:
-        """Preserve encoder N160 tiling and select N256 for decoder channels."""
-        return 256 if self.co in (256, 1024) else 160
+        """Use exact channel divisors; N192 halves repeated input loads vs N96."""
+        if self.co in (192, 384):
+            return 192
+        return 96 if self.co == 96 else (256 if self.co in (256, 1024) else 160)
 
     @property
     def input_shape(self) -> tuple[int, ...]:
@@ -1362,7 +1371,7 @@ class ConvConfig:
 
     def validate(self) -> None:
         """Reject geometry outside the supported Wan convolution families."""
-        if (self.ci, self.co) not in _ENCODER_CHANNEL_PAIRS + _DECODER_CHANNEL_PAIRS:
+        if (self.ci, self.co) not in _ENCODER_CHANNEL_PAIRS + _DECODER_CHANNEL_PAIRS + _WAN21_CHANNEL_PAIRS:
             raise ValueError("Unsupported Wan residual-convolution channel pair")
         if min(*self.output_shape, self.ctas) <= 0 or self.ctas % 2:
             raise ValueError("Expected nonempty output and complete 2CTA groups")
@@ -1429,6 +1438,11 @@ class _Launch:
         )
         grid = scheduler.grid_shape(cfg.ctas // groups)
         ab_stages, c_stages = (6 if cfg.tile_n == 256 else 8), 2
+        if cutlass.const_expr(cfg.tile_n == 192):
+            # Wider B tiles reuse each input across twice as many output
+            # channels. Seven AB stages fit alongside the two C store stages;
+            # eight would exceed the per-CTA shared-memory limit.
+            ab_stages = 7
         if cutlass.const_expr(self.fuse_norm and cfg.co == 320 and cfg.ci == 320):
             # The longer K135 convolution benefits from a deeper output-store
             # queue; C160->C320 keeps its measured faster eight/two schedule.
@@ -1918,12 +1932,13 @@ class WanConv3d(torch.nn.Module):
         if (
             weight.ndim != 5
             or tuple(weight.shape[2:]) != (3, 3, 3)
-            or (weight.shape[1], weight.shape[0]) not in _ENCODER_CHANNEL_PAIRS + _DECODER_CHANNEL_PAIRS
+            or (weight.shape[1], weight.shape[0])
+            not in _ENCODER_CHANNEL_PAIRS + _DECODER_CHANNEL_PAIRS + _WAN21_CHANNEL_PAIRS
         ):
             raise ValueError("WanConv3d requires a supported Wan residual 3x3x3 weight")
         self.in_channels = weight.shape[1]
         self.out_channels = weight.shape[0]
-        # Supported output channels are multiples of their N160/N256 tile.
+        # Supported output channels are multiples of their selected N tile.
         self.register_buffer(
             "weight",
             torch.nn.functional.pad(
@@ -2214,7 +2229,7 @@ class WanInputConv3d(torch.nn.Module):
         return result
 
 
-def compile() -> None:
+def _compile_wan22() -> None:
     """Compile raw, normalized, residual-prepared, spatial, and input kernels."""
     compile_input()
     for ci, co in _ENCODER_CHANNEL_PAIRS:
@@ -2300,7 +2315,7 @@ def _verify_decoder() -> None:
 
 
 @torch.inference_mode()
-def verify() -> None:
+def _verify_wan22() -> None:
     """Check small cases without timing them, including history and partial CTAs.
 
     Raw convolution uses an FP32 Torch oracle (TF32 off). Fused preparation
@@ -2591,7 +2606,7 @@ def _benchmark_input(cfg: InputConvConfig) -> None:
     print_benchmark_table([measure("input conv", reference, raw)])
 
 
-def benchmark_production() -> None:
+def _benchmark_wan22() -> None:
     """Measure production encoder and decoder convolution shapes.
 
     The batch-32 encoder's C160/C320 stages retain four warm frames; downsampling reduces
@@ -2599,16 +2614,8 @@ def benchmark_production() -> None:
     one frame. Decoder convolutions and C256 fusions use batch 1 and four output frames.
     Shape reduction belongs only in verify(), never in these timings.
     """
-    torch.manual_seed(44)
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-    print(
-        "\nProduction benchmark: BF16, prepared channels-last operands."
-        "\nMedian GPU ms from alternating CUDA-graph samples."
-        "\nCompilation, weight packing, and input preparation are excluded."
-        "\nTorch reference is eager, not torch.compile; speedup=reference/custom.",
-        flush=True,
-    )
-    print("\nEncoder: batch=32", flush=True)
+    print("\nWan 2.2 encoder: batch=32", flush=True)
     for ci, co, frames, height, width in (
         (160, 160, 4, 320, 240),
         (160, 320, 4, 160, 120),
@@ -2634,24 +2641,118 @@ def benchmark_production() -> None:
             )
     for frames in (1, 4):
         _benchmark_input(InputConvConfig(n=32, t=frames + 2, h=322, w=242, ctas=sm_count))
-    print("\nDecoder: batch=1, four output frames", flush=True)
+    print("\nWan 2.2 decoder: batch=1, four output frames", flush=True)
     for ci, co, height, width in (
         (512, 256, 360, 640),
         (256, 256, 360, 640),
     ):
         cfg = ConvConfig(n=1, t=6, h=height + 2, w=width + 2, ci=ci, co=co, ctas=sm_count // 2 * 2)
         _benchmark_conv(cfg, history=0, spatial=False)
-    print("\nDecoder latent input: batch=1, one latent frame", flush=True)
+    print("\nWan 2.2 decoder latent input: batch=1, one latent frame", flush=True)
     _benchmark_conv(
         ConvConfig(n=1, t=3, h=47, w=82, ci=48, co=1024, ctas=sm_count // 2 * 2),
         history=2,
         spatial=False,
     )
+
+
+@torch.inference_mode()
+def _verify_wan21() -> None:
+    """Check all Wan 2.1 pairs with batch/spatial tails and temporal chunks."""
+    torch.manual_seed(42)
+    for ci, co in _WAN21_CHANNEL_PAIRS:
+        weight = torch.randn(co, ci, 3, 3, 3, device="cuda", dtype=torch.bfloat16) * 0.02
+        conv = WanConv3d(weight).eval()
+        for n, t, h, w in ((1, 1, 3, 5), (2, 3, 5, 7)):
+            x = torch.randn(n, t + 2, h + 2, w + 2, ci, device="cuda", dtype=weight.dtype)
+            expected = torch.nn.functional.conv3d(x.permute(0, 4, 1, 2, 3), weight).permute(0, 2, 3, 4, 1)
+            torch.testing.assert_close(conv(x), expected, atol=0.03125, rtol=0.02)
+        print(f"Wan 2.1 C{ci}->C{co}: correctness PASS (batch/spatial tails, cold/warm geometry)", flush=True)
+
+
+def _benchmark_wan21() -> None:
+    """Benchmark supported 3x3x3 callsites for 480x832 video, batch 1.
+
+    Encoder warm chunks start with four video frames; decoder chunks start
+    with one latent frame. Include the single-frame first chunk at each stage.
+    Wider pairs are kernel experiments: the model retains cuDNN for C384.
+    """
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    stages = {
+        "encoder": (
+            (96, 96, 4, 480, 832),
+            (96, 192, 4, 240, 416),
+            (192, 192, 4, 240, 416),
+            (192, 384, 2, 120, 208),
+            (384, 384, 2, 120, 208),
+            (384, 384, 1, 60, 104),
+        ),
+        "decoder": (
+            (16, 384, 1, 60, 104),
+            (384, 384, 1, 60, 104),
+            (192, 384, 2, 120, 208),
+            (384, 384, 2, 120, 208),
+            (192, 192, 4, 240, 416),
+            (96, 96, 4, 480, 832),
+        ),
+    }
+    print("\nWan 2.1: raw convolution; C384 pairs remain on cuDNN in the model.", flush=True)
+    for direction, cases in stages.items():
+        print(f"\nWan 2.1 {direction}: batch=1, video resolution=480x832", flush=True)
+        for ci, co, frames, height, width in cases:
+            for current_frames in sorted({1, frames}):
+                cfg = ConvConfig(
+                    n=1,
+                    t=current_frames + 2,
+                    h=height + 2,
+                    w=width + 2,
+                    ci=ci,
+                    co=co,
+                    ctas=sm_count // 2 * 2,
+                )
+                _benchmark_conv(cfg, history=0 if current_frames == 1 else 2, spatial=False)
+
+
+def compile(model: str = "all") -> None:
+    """Compile convolution specializations for the selected Wan architecture."""
+    if model in ("all", "wan21"):
+        for ci, co in _WAN21_CHANNEL_PAIRS:
+            compile_conv(ConvConfig(ci=ci, co=co))
+    if model in ("all", "wan22"):
+        _compile_wan22()
+
+
+def verify(model: str = "all") -> None:
+    """Run untimed convolution correctness checks for the selected architecture."""
+    if model in ("all", "wan21"):
+        _verify_wan21()
+    if model in ("all", "wan22"):
+        _verify_wan22()
+
+
+def benchmark_production(model: str = "all") -> None:
+    """Measure the selected architectures with prepared channels-last operands."""
+    torch.manual_seed(44)
+    print(
+        "\nProduction benchmark: BF16, prepared channels-last operands."
+        "\nMedian GPU ms from alternating CUDA-graph samples."
+        "\nCompilation, weight packing, and input preparation are excluded."
+        "\nTorch reference is eager/cuDNN, not torch.compile; speedup=reference/custom."
+        f"\ncuDNN autotuning: {torch.backends.cudnn.benchmark}.",
+        flush=True,
+    )
+    if model in ("all", "wan21"):
+        _benchmark_wan21()
+    if model in ("all", "wan22"):
+        _benchmark_wan22()
     print("\nProduction benchmark: PASS", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model", choices=("all", "wan21", "wan22"), default="all", help="Wan architecture to exercise (default: all)"
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--only-compile", action="store_true")
     mode.add_argument(
@@ -2661,10 +2762,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     if args.only_compile:
-        compile()
+        compile(args.model)
         print("Convolution family compile: PASS", flush=True)
     elif args.verify_only:
         print("Correctness checks (small cases, untimed):", flush=True)
-        verify()
+        verify(args.model)
     else:
-        benchmark_production()
+        benchmark_production(args.model)

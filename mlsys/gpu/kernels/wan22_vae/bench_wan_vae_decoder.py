@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 
-"""Benchmark Wan2.2 decoding: Diffusers, eager/compiled Torch, and custom fusion.
+"""Benchmark Wan 2.1/2.2 decoding: Diffusers, eager/compiled Torch, and custom fusion.
 
 Shapes describe the output video, not the input latent. Latents are seeded
-Gaussian tensors; omitting --model uses the production architecture with random
+Gaussian tensors; omitting --model uses the Wan 2.2 architecture with random
 weights. This measures speed and numerical agreement, not reconstruction quality.
 All variants use the same channels-last weights and unnormalized latent input.
 Full-decode CUDA-event timings include chunk launches, unpatchify, and clamping;
 input generation, compilation, warmup, and validation are excluded.
 
-    python bench_wan22_vae_decoder.py --resolutions 480x832 --frames 17
-    python bench_wan22_vae_decoder.py --model /path/to/Wan2.2-TI2V-5B-Diffusers
+    python bench_wan_vae_decoder.py --resolutions 480x832 --frames 17
+    python bench_wan_vae_decoder.py --model /path/to/Wan2.1-T2V-1.3B-Diffusers
+    python bench_wan_vae_decoder.py --model /path/to/Wan2.2-TI2V-5B-Diffusers
 
     nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
-        python bench_wan22_vae_decoder.py --resolutions 480x832 --frames 17
+        python bench_wan_vae_decoder.py --resolutions 480x832 --frames 17
 
-Use --capture-range-end=repeat to profile multiple cases. The fused variant
-replaces input packing/convolution, attention post-processing, and C256
-convolutions; C512 convolutions use cuDNN with custom fused post-processing.
+Use --capture-range-end=repeat to profile multiple cases. Both architectures
+use fused preparation and attention post-processing. Wan 2.1 uses raw custom
+C96/C192 convolutions and cuDNN for C384. Wan 2.2 also replaces latent input
+packing/convolution and integrates C256 convolution post-ops; C512 uses cuDNN.
 It requires BF16 plus CUTLASS DSL.
 """
 
@@ -95,8 +97,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size and --benchmark-repeats must be positive")
     if any(t < 1 or (t - 1) % 4 for t in args.frames):
         parser.error("--frames must be positive and of the form 4n+1")
-    if any(h % 16 or w % 16 for h, w in args.resolutions):
-        parser.error("--resolutions must be divisible by 16")
     return args
 
 
@@ -124,27 +124,36 @@ def load_vae(args: argparse.Namespace) -> AutoencoderKLWan:
             patch_size=2,
             scale_factor_temporal=4,
             scale_factor_spatial=16,
-        )
+        ).to(dtype=dtype)
     torch.nn.utils.convert_conv3d_weight_memory_format(vae, torch.channels_last_3d)
     torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
-    return vae.to(device="cuda", dtype=dtype).eval()
+    # Checkpoint loading already applies dtype while respecting FP32 modules.
+    return vae.to(device="cuda").eval()
 
 
 def median_timings(paths: dict[str, Callable], repeats: int) -> dict[str, float]:
     """Alternate execution order and measure complete decodes without CUDA Graphs."""
     samples = {name: [] for name in paths}
+    peaks = {name: 0 for name in paths}
     for i in range(repeats):
         order = list(paths) if i % 2 == 0 else list(reversed(paths))
         # print(f"  Timing round {i + 1}/{repeats}: {' -> '.join(order)}", flush=True)
         for name in order:
+            live_bytes = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
             start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
             start.record()
             output = paths[name]()
             end.record()
             end.synchronize()
             samples[name].append(start.elapsed_time(end))
+            peaks[name] = max(peaks[name], torch.cuda.max_memory_allocated() - live_bytes)
             del output
             # print(f"    {name}: {samples[name][-1]:.3f} ms", flush=True)
+    print(
+        "  Peak additional allocated GiB: " + " | ".join(f"{name}={size / 2**30:.3f}" for name, size in peaks.items()),
+        flush=True,
+    )
     return {name: statistics.median(values) for name, values in samples.items()}
 
 
@@ -157,14 +166,17 @@ def run_case(
     width: int,
 ) -> Result:
     """Validate all variants, capture one warmed decode each, then benchmark."""
+    spatial = vae.spatial_compression_ratio
+    if height % spatial or width % spatial:
+        raise ValueError(f"Resolution must be divisible by model spatial compression {spatial}")
     shape = (args.batch_size, 3, frames, height, width)
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     latent = torch.randn(
         args.batch_size,
         vae.config.z_dim,
         1 + (frames - 1) // 4,
-        height // 16,
-        width // 16,
+        height // spatial,
+        width // spatial,
         generator=generator,
         device="cuda",
         dtype=DTYPES[args.dtype],
@@ -253,7 +265,7 @@ def print_summary(results: list[Result], args: argparse.Namespace) -> None:
 def main() -> None:
     """Run a sweep, releasing compiled variants and allocations between cases."""
     args = parse_args()
-    print(f"Wan2.2 decoder | {torch.cuda.get_device_name()} | {args.dtype}", flush=True)
+    print(f"Wan decoder | {torch.cuda.get_device_name()} | {args.dtype}", flush=True)
     print(f"Weights: {args.model or 'synthetic production architecture'}", flush=True)
     print(f"Validation tolerances: atol={TOLERANCES[args.dtype][0]}, rtol={TOLERANCES[args.dtype][1]}")
     vae = load_vae(args)

@@ -203,9 +203,10 @@ def rmsnorm_kernel(
             32,
             False,
         )
-        SLOTS = (CHANNELS + 127) // 128 * 4
+        VECTOR_REDUCE = CHANNELS >= 128 and CHANNELS % 4 == 0
+        SLOTS = (CHANNELS + 127) // 128 * 4 if VECTOR_REDUCE else (CHANNELS + 31) // 32
         for slot in cutlass.range_constexpr(SLOTS):
-            col = lane * 4 + (slot // 4) * 128 + slot % 4
+            col = lane * 4 + (slot // 4) * 128 + slot % 4 if VECTOR_REDUCE else lane + slot * 32
             if col < CHANNELS:
                 out[row, col] = values[slot]
 
@@ -235,7 +236,7 @@ def compile_rmsnorm(
     has_bias: bool = False,
 ) -> Callable:
     """Cache code by channel count, bias mode, and reference reduction order."""
-    if channels not in (160, 256, 320, 512, 640, 1024):
+    if channels not in (96, 160, 192, 256, 320, 384, 512, 640, 1024):
         raise ValueError("Unsupported Wan encoder/decoder RMSNorm channel count")
     tensor = make_fake_compact_tensor(
         cutlass.BFloat16,
@@ -291,7 +292,7 @@ def validate_rmsnorm_inputs(x: torch.Tensor, gamma: torch.Tensor, bias: torch.Te
     if x.ndim != 5 or not x.is_contiguous():
         raise ValueError("RMSNorm SiLU requires contiguous [N,T,H,W,C] input")
     channels = x.shape[-1]
-    if channels not in (160, 256, 320, 512, 640, 1024):
+    if channels not in (96, 160, 192, 256, 320, 384, 512, 640, 1024):
         raise ValueError("Unsupported Wan encoder/decoder RMSNorm channel count")
     tensors = (x, gamma) if bias is None else (x, gamma, bias)
     for tensor in tensors:
@@ -678,21 +679,36 @@ def _prep_contiguous_row(
         retained.store(value, group * 4)
         fp = value.to(cutlass.Float32)
         squares = fp * fp
-        if cutlass.const_expr(group >= VIRTUAL_GROUPS):
-            squares = partials.load((group % VIRTUAL_GROUPS) * 4, 4) + squares
-        partials.store(squares, (group % VIRTUAL_GROUPS) * 4)
-    groups = cutlass.Array(cutlass.Float32, VIRTUAL_GROUPS, space=cutlass.AddressSpace.rmem)
-    for group in cutlass.range_constexpr(VIRTUAL_GROUPS):
-        total = partials[group * 4]
-        for part in cutlass.range_constexpr(1, 4):
-            total = total + partials[group * 4 + part]
-        groups[group] = total
-    if cutlass.const_expr(LANES == 8):
-        total = (groups[0] + groups[2]) + (groups[1] + groups[3])
+        if cutlass.const_expr(CHANNELS == 96):
+            # Torch uses scalar lanes below C128: c, c+32, c+64.
+            # Each physical lane holds four adjacent virtual lanes.
+            if cutlass.const_expr(group > 0):
+                squares = partials.load(0, 4) + squares
+            partials.store(squares, 0)
+        else:
+            if cutlass.const_expr(group >= VIRTUAL_GROUPS):
+                squares = partials.load((group % VIRTUAL_GROUPS) * 4, 4) + squares
+            partials.store(squares, (group % VIRTUAL_GROUPS) * 4)
+    if cutlass.const_expr(CHANNELS == 96):
+        for part in cutlass.range_constexpr(4):
+            total = partials[part]
+            for offset in (4, 2, 1):
+                total = total + cute.arch.shuffle_sync_down(total, offset, mask=mask)
+            partials[part] = total
+        total = (partials[0] + partials[2]) + (partials[1] + partials[3])
     else:
-        total = groups[0]
-    for offset in (16, 8, 4, 2, 1) if LANES == 32 else (4, 2, 1):
-        total = total + cute.arch.shuffle_sync_down(total, offset, mask=mask)
+        groups = cutlass.Array(cutlass.Float32, VIRTUAL_GROUPS, space=cutlass.AddressSpace.rmem)
+        for group in cutlass.range_constexpr(VIRTUAL_GROUPS):
+            total = partials[group * 4]
+            for part in cutlass.range_constexpr(1, 4):
+                total = total + partials[group * 4 + part]
+            groups[group] = total
+        if cutlass.const_expr(LANES == 8):
+            total = (groups[0] + groups[2]) + (groups[1] + groups[3])
+        else:
+            total = groups[0]
+        for offset in (16, 8, 4, 2, 1) if LANES == 32 else (4, 2, 1):
+            total = total + cute.arch.shuffle_sync_down(total, offset, mask=mask)
     denominator = cute.math.sqrt(cute.arch.shuffle_sync(total, lane_base, mask=mask), fastmath=False)
     if denominator < 1e-12:
         denominator = cutlass.Float32(1e-12)
@@ -972,7 +988,7 @@ def conv_prep_host(
 ) -> None:
     """Use partitioned canonical CTAs, or the unchanged general row scheduler."""
     if cutlass.const_expr(
-        (CHANNELS in (160, 320, 640) or (CONTIGUOUS_REDUCTION and CHANNELS in (256, 512, 1024)))
+        (CHANNELS in (160, 320, 640) or (CONTIGUOUS_REDUCTION and CHANNELS in (96, 192, 256, 384, 512, 1024)))
         and (PAD_T, PAD_H, PAD_W) == (2, 1, 1)
     ):
         row_lanes = (
@@ -1265,7 +1281,7 @@ def compile() -> None:
 def verify() -> None:
     """Check first/cached chunks on small, untimed inputs."""
     torch.manual_seed(42)
-    for channels in (160, 256, 320, 512, 640, 1024):
+    for channels in (96, 160, 192, 256, 320, 384, 512, 640, 1024):
         gamma = torch.randn(channels, device="cuda", dtype=torch.bfloat16)
         bias = torch.randn_like(gamma)
         for frames, history, has_residual in (
@@ -1293,7 +1309,7 @@ def verify() -> None:
     # Vector accesses must also accept 2B-aligned offset views and a
     # partial final CTA. Exercise every optional affine/residual input here.
     for channels, frames, history in (
-        (c, t, p) for c in (160, 256, 320, 512, 640, 1024) for t, p in ((1, 0), (1, 1), (4, 2))
+        (c, t, p) for c in (96, 160, 192, 256, 320, 384, 512, 640, 1024) for t, p in ((1, 0), (1, 1), (4, 2))
     ):
         shape = (1, frames, 3, 5, channels)
         x = torch.randn(frames * 3 * 5 * channels + 1, device="cuda", dtype=torch.bfloat16)[1:].view(shape)
