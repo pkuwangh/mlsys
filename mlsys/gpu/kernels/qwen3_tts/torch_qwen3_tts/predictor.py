@@ -5,9 +5,10 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 import torch
-from qwen3_tts_reference import RMSNorm, TalkerConfig, TalkerLayer
 from torch import nn
 from torch.nn import functional as F
+
+from .talker import RMSNorm, TalkerConfig, TalkerLayer
 
 
 @dataclass(frozen=True)

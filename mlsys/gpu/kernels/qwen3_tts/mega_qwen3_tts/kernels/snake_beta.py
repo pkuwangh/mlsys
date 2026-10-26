@@ -36,16 +36,16 @@ def snake_beta_kernel(
     inverse_beta,
     sine_table,
     output,
-    elements: cutlass.Constexpr,
+    elements: cutlass.Int64,
     channels: cutlass.Constexpr,
-    length: cutlass.Constexpr,
+    length: cutlass.Int32,
     channels_last: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     vector: cutlass.Constexpr,
 ):
     block, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
-    offset = (block * threads + tid) * vector
+    offset = (cutlass.Int64(block) * threads + tid) * vector
     if offset < elements:
         iket.range_push("input_coefficients")
         values = (x.iterator.raw_ptr() + offset).load(count=vector, alignment=vector * 2)
@@ -83,18 +83,23 @@ def snake_beta_host(
     output,
     stream,
     channels: cutlass.Constexpr,
-    length: cutlass.Constexpr,
+    length: cutlass.Int32,
+    elements: cutlass.Int64,
     channels_last: cutlass.Constexpr,
     threads: cutlass.Constexpr,
     vector: cutlass.Constexpr,
 ):
+    # CUTLASS 4.8 shape extraction narrows to Int32; keep numel a separate Int64 argument.
+    blocks = cutlass.Int32((elements + threads * vector - 1) // (threads * vector))
     snake_beta_kernel(
-        x, alpha, inverse_beta, sine_table, output, x.shape[0], channels, length, channels_last, threads, vector
-    ).launch(grid=(cute.ceil_div(x.shape[0], threads * vector), 1, 1), block=(threads, 1, 1), stream=stream)
+        x, alpha, inverse_beta, sine_table, output, elements, channels, length, channels_last, threads, vector
+    ).launch(grid=(blocks, 1, 1), block=(threads, 1, 1), stream=stream)
 
 
 @cache
-def compile_kernel(elements, channels, length, channels_last, threads, vector, arch, lookup=False):
+def compile_kernel(channels, channels_last, threads, vector, arch, lookup=False):
+    elements = cutlass.sym_int64(divisibility=vector)
+
     def fake(n):
         return make_fake_compact_tensor(cutlass.BFloat16, (n,), stride_order=(0,))
 
@@ -107,7 +112,8 @@ def compile_kernel(elements, channels, length, channels_last, threads, vector, a
         fake(elements),
         make_fake_stream(),
         channels,
-        length,
+        cutlass.Int32(0),
+        cutlass.Int64(0),
         channels_last,
         threads,
         vector,
@@ -157,15 +163,15 @@ class SnakeBeta(torch.nn.Module):
             vector //= 2
         table = self.sine_table if (self.lookup if self.lookup is not None else x.numel() >= 4 * 1024**2) else None
         if x.numel():
-            compile_kernel(
-                x.numel(), x.shape[1], x.shape[2], channels_last, self.threads, vector, self.arch, table is not None
-            )(
+            compile_kernel(x.shape[1], channels_last, self.threads, vector, self.arch, table is not None)(
                 physical.view(-1),
                 self.alpha,
                 self.inverse_beta,
                 table,
                 output.view(-1),
-                cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+                cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
+                x.shape[2],
+                x.numel(),
             )
         return output.transpose(1, 2) if channels_last else output
 

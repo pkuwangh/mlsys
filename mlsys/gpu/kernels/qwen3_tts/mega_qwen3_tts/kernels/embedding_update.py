@@ -84,7 +84,9 @@ def embedding_update_host(
 
 
 @cache
-def compile_kernel(batch, vocab, width, projected_width, token_type, arch, threads, token_stride=1):
+def compile_kernel(width, projected_width, token_type, arch, threads, token_stride=1):
+    batch, vocab = cutlass.sym_int64(), cutlass.sym_int64()
+
     def fake(dtype, *shape):
         return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))))
 
@@ -129,8 +131,6 @@ def embedding_update(tokens, table, accumulated, projected_table=None, *, thread
     gathered = torch.empty_like(accumulated)
     projected = table.new_empty(batch, projected_width) if projected_width else None
     compile_kernel(
-        batch,
-        table.shape[0],
         width,
         projected_width,
         cutlass.Int32 if tokens.dtype == torch.int32 else cutlass.Int64,
@@ -144,7 +144,7 @@ def embedding_update(tokens, table, accumulated, projected_table=None, *, thread
         gathered,
         projected_table,
         projected,
-        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        cuda.CUstream(torch.cuda.current_stream(tokens.device).cuda_stream),
     )
     return gathered, projected
 

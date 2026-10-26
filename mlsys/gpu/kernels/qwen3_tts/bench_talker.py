@@ -12,7 +12,7 @@ from functools import partial
 import torch
 from mega_qwen3_tts import MegaQwen3TTSTalker
 from mega_qwen3_tts.kernels._utils import measure, print_summary, report_difference
-from qwen3_tts_reference import TalkerConfig, TorchQwen3TTSTalker
+from torch_qwen3_tts.talker import TalkerConfig, TorchQwen3TTSTalker
 
 
 @torch.inference_mode()

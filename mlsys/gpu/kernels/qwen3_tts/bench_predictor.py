@@ -12,7 +12,7 @@ from functools import partial
 import torch
 from mega_qwen3_tts import MegaQwen3TTSPredictor
 from mega_qwen3_tts.kernels._utils import measure, print_summary, report_difference
-from qwen3_tts_predictor_reference import PredictorConfig, TorchQwen3TTSPredictor
+from torch_qwen3_tts.predictor import PredictorConfig, TorchQwen3TTSPredictor
 
 
 @torch.inference_mode()

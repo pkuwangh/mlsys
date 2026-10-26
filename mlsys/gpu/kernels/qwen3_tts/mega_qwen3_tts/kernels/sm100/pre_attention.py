@@ -23,9 +23,9 @@ def pre_attention_kernel(
     kv: cute.Tensor,
     q: cute.Tensor,
     mask: cute.Tensor | None,
-    B: cutlass.Constexpr,
+    B: cutlass.Int32,
     N: cutlass.Constexpr,
-    CAPACITY: cutlass.Constexpr,
+    CAPACITY: cutlass.Int64,
     EPS: cutlass.Constexpr,
     H: cutlass.Constexpr,
     cache_slots: cute.Tensor | None = None,
@@ -223,8 +223,8 @@ def pre_attention_kernel(
         # Rank 1 of the first cluster is free while rank 0 finishes its epilogue.
         if bid == 1:
             position = positions[0]
-            for col in cutlass.range(tid, CAPACITY, 512):
-                mask[0, col] = cutlass.BFloat16(cutlass.select_(col <= position, 0.0, -float("inf")))
+            for mask_col in cutlass.range(cutlass.Int64(tid), CAPACITY, 512):
+                mask[0, mask_col] = cutlass.BFloat16(cutlass.select_(mask_col <= position, 0.0, -float("inf")))
     p.barrier_cluster_arrive_relaxed()
     p.barrier_cluster_wait()
     if tid >= 128 and tid < 160:
@@ -245,14 +245,14 @@ def pre_attention_host(
     q: cute.Tensor,
     mask: cute.Tensor | None,
     stream: cuda.CUstream,
-    B: cutlass.Constexpr,
     N: cutlass.Constexpr,
-    CAPACITY: cutlass.Constexpr,
     EPS: cutlass.Constexpr,
     H: cutlass.Constexpr,
     cache_slots: cute.Tensor | None = None,
     value_cache: cute.Tensor | None = None,
 ):
+    B = cutlass.Int32(x.shape[0])
+    CAPACITY = cutlass.Int64(kv.shape[3]) if value_cache is None else cutlass.Int64(0)
     weight_map = tensor_map.create_tensor_map_tiled_from_view(
         weights, (1, H // 128, 64, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
     )

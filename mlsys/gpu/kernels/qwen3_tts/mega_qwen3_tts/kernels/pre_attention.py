@@ -26,8 +26,9 @@ from mega_qwen3_tts.kernels._utils import device_arch, measure, report_error
 
 
 @cache
-def compile_kernel(batch, bucket, capacity, eps, write_mask, arch, hidden=1024):
-    """Specialize the decode bucket and contiguous KV-cache strides."""
+def compile_kernel(bucket, eps, write_mask, arch, hidden=1024):
+    """Specialize the decode tile, keeping live rows and cache capacity dynamic."""
+    batch, capacity = cutlass.sym_int64(), cutlass.sym_int64()
     if arch == "sm_90a":
         from mega_qwen3_tts.kernels.sm90.pre_attention import pre_attention_host
     else:
@@ -50,9 +51,7 @@ def compile_kernel(batch, bucket, capacity, eps, write_mask, arch, hidden=1024):
         fake(cutlass.BFloat16, batch, 16, 1, 128),
         fake(cutlass.BFloat16, 1, capacity) if write_mask else None,
         make_fake_stream(),
-        batch,
         bucket,
-        capacity,
         eps,
         hidden,
         # Preserve the BF16 multiply rounding before the RoPE add.
@@ -61,8 +60,9 @@ def compile_kernel(batch, bucket, capacity, eps, write_mask, arch, hidden=1024):
 
 
 @cache
-def compile_slot_kernel(batch, hidden, slots, rope_positions, rope_dtype, slot_dtype, eps, arch):
+def compile_slot_kernel(bucket, hidden, rope_dtype, slot_dtype, eps, arch):
     """Use per-token positions and flat caller-owned K/V cache slots."""
+    batch, slots, rope_positions = cutlass.sym_int64(), cutlass.sym_int64(), cutlass.sym_int64()
     if arch == "sm_90a":
         from mega_qwen3_tts.kernels.sm90.pre_attention import pre_attention_host
     else:
@@ -87,9 +87,7 @@ def compile_slot_kernel(batch, hidden, slots, rope_positions, rope_dtype, slot_d
         fake(cutlass.BFloat16, batch, 16, 1, 128),
         None,
         make_fake_stream(),
-        batch,
-        16 if batch <= 16 else 32,
-        0,
+        bucket,
         eps,
         hidden,
         fake(slot_type, batch),
@@ -123,10 +121,8 @@ class SlotPreAttention(nn.Module):
             raise ValueError("Slot QKV supports 1 <= token rows <= 32")
         q = torch.empty((batch, 16, 1, 128), device=x.device, dtype=x.dtype)
         compile_slot_kernel(
-            batch,
+            16 if batch <= 16 else 32,
             self.hidden,
-            key_cache.shape[0],
-            rope_cache.shape[0],
             rope_cache.dtype,
             cache_slots.dtype,
             self.eps,
@@ -143,7 +139,7 @@ class SlotPreAttention(nn.Module):
             key_cache,
             q,
             None,
-            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
             cache_slots,
             value_cache,
         )
@@ -186,9 +182,7 @@ class FusedPreAttention(nn.Module):
         ):
             raise ValueError("Expected contiguous additive mask [1,capacity] matching the input dtype/device")
         q = torch.empty((batch, 16, 1, 128), device=x.device, dtype=x.dtype)
-        compile_kernel(
-            batch, 16 if batch <= 16 else 32, capacity, self.norm.eps, mask is not None, self.arch, self.hidden
-        )(
+        compile_kernel(16 if batch <= 16 else 32, self.norm.eps, mask is not None, self.arch, self.hidden)(
             x.reshape(batch, self.hidden),
             self.norm.weight,
             self.packed_weights,
@@ -200,7 +194,7 @@ class FusedPreAttention(nn.Module):
             kv,
             q,
             mask,
-            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream),
         )
         return q
 
@@ -226,7 +220,7 @@ def reference_args(layer, cos, sin, kv, positions):
 @torch.inference_mode()
 def trace_once(batch, capacity, write_mask=False, hidden=1024):
     """Launch one custom preparation block for IKET."""
-    from qwen3_tts_reference import TalkerConfig, TalkerLayer
+    from torch_qwen3_tts.talker import TalkerConfig, TalkerLayer
 
     torch.manual_seed(42)
     ref = TalkerLayer(TalkerConfig(hidden_size=hidden, intermediate_size=3 * hidden)).cuda().bfloat16().eval()
@@ -244,7 +238,7 @@ def trace_once(batch, capacity, write_mask=False, hidden=1024):
 @torch.inference_mode()
 def benchmark(batch, layers, capacity, profile=False, write_mask=False, hidden=1024):
     """Compare complete preparation blocks with rotating weights and fixed cache position."""
-    from qwen3_tts_reference import TalkerConfig, TalkerLayer, pre_attention, prepare_qkv
+    from torch_qwen3_tts.talker import TalkerConfig, TalkerLayer, pre_attention, prepare_qkv
 
     torch.manual_seed(42)
     refs = [

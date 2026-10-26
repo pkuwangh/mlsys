@@ -92,7 +92,7 @@ def project(
     tile,
     slot,
     MODE: cutlass.Constexpr,
-    B: cutlass.Constexpr,
+    B: cutlass.Int32,
     N: cutlass.Constexpr,
 ):
     """Double-buffer weights and operands between producer and MMA warpgroups."""
@@ -277,7 +277,7 @@ def post_attention_kernel(
     activation: cute.Tensor,
     epochs: cute.Tensor,
     output: cute.Tensor,
-    B: cutlass.Constexpr,
+    B: cutlass.Int32,
     N: cutlass.Constexpr,
     EPS: cutlass.Constexpr,
 ):
@@ -457,11 +457,11 @@ def post_attention_host(
     epochs: cute.Tensor,
     output: cute.Tensor,
     stream: cuda.CUstream,
-    B: cutlass.Constexpr,
     N: cutlass.Constexpr,
     EPS: cutlass.Constexpr,
 ):
     """Build K-stage tensor maps and launch the cooperative wide schedule."""
+    B = cutlass.Int32(attention.shape[0])
     wo_map = tensor_map.create_tensor_map_tiled_from_view(
         wo, (1, 4, 128, 64), swizzle=tensor_map.TensorMapSwizzle.s128b
     )

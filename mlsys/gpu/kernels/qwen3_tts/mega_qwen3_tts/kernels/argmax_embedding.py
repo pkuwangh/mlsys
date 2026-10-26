@@ -148,7 +148,9 @@ def argmax_embedding_host(logits, table, projected_table, codes, embeddings, pro
 
 
 @cache
-def compile_kernel(batch, vocab, width, projected_width, logits_dtype, embedding_dtype, arch, accumulate, code_stride):
+def compile_kernel(vocab, width, projected_width, logits_dtype, embedding_dtype, arch, accumulate, code_stride):
+    batch = cutlass.sym_int64()
+
     def fake(dtype, *shape):
         return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))))
 
@@ -205,7 +207,6 @@ def argmax_embedding(logits, table, projected_table=None, *, accumulated=None, o
     embeddings = table.new_empty(batch, table.shape[1])
     projected = projected_table.new_empty(batch, projected_table.shape[1]) if projected_table is not None else None
     compile_kernel(
-        batch,
         vocab,
         table.shape[1],
         projected_table.shape[1] if projected_table is not None else 0,
@@ -222,7 +223,7 @@ def argmax_embedding(logits, table, projected_table=None, *, accumulated=None, o
         embeddings,
         projected,
         accumulated,
-        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        cuda.CUstream(torch.cuda.current_stream(logits.device).cuda_stream),
     )
     return codes, embeddings, projected
 

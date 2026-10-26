@@ -317,7 +317,9 @@ def sample_host(
 
 
 @cache
-def compile_kernel(batch, top_k, width, projected_width, accumulate, code_stride, warps, arch):
+def compile_kernel(top_k, width, projected_width, accumulate, code_stride, warps, arch):
+    batch = cutlass.sym_int64()
+
     def fake(dtype, *shape):
         return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))))
 
@@ -400,7 +402,9 @@ def sorted_sample_host(logprobs, indices, seeds, positions, output, stream):
 
 
 @cache
-def compile_sorted(batch, count, arch):
+def compile_sorted(count, arch):
+    batch = cutlass.sym_int64()
+
     def fake(dtype, *shape):
         return make_fake_compact_tensor(dtype, shape, stride_order=tuple(reversed(range(len(shape)))))
 
@@ -435,8 +439,13 @@ def sample_sorted(logprobs, indices, seeds, positions):
     ):
         raise ValueError("Expected contiguous INT64 indices, seeds and positions on the same CUDA device")
     output = indices.new_empty(batch)
-    compile_sorted(batch, count, device_arch(logprobs.device))(
-        logprobs, indices, seeds, positions, output, cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compile_sorted(count, device_arch(logprobs.device))(
+        logprobs,
+        indices,
+        seeds,
+        positions,
+        output,
+        cuda.CUstream(torch.cuda.current_stream(logprobs.device).cuda_stream),
     )
     return output
 
@@ -509,7 +518,6 @@ def sample_logits(
     gathered = logits.new_empty(batch, width) if width else None
     projected = logits.new_empty(batch, projected_width) if projected_width else None
     compile_kernel(
-        batch,
         max_top_k,
         width,
         projected_width,
@@ -530,7 +538,7 @@ def sample_logits(
         gathered,
         projected_table,
         projected,
-        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        cuda.CUstream(torch.cuda.current_stream(logits.device).cuda_stream),
     )
     return codes, gathered, projected
 

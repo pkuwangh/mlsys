@@ -338,7 +338,7 @@ matching Torch. The kernel accepts independent vocabulary/embedding dimensions
 embeddings of an independent width, without a runtime projection GEMM. The
 0.6B predictor needs only the original table; feedback summation stays unchanged.
 
-`qwen3_tts_predictor_reference.py` follows upstream residual/normalization rounding,
+`torch_qwen3_tts/predictor.py` follows upstream residual/normalization rounding,
 including one final embedding reduction rather than sequential BF16 additions.
 The benchmark compiles a transformer pass with the output-head weight as a tensor
 argument, avoiding a separate specialization for every code group. A CUDA graph

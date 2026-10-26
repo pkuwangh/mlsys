@@ -32,7 +32,8 @@ PAYLOAD_EMPTY = -2147450880
 
 
 @cache
-def compile_kernel(batch, bucket, eps, arch, hidden=1024):
+def compile_kernel(bucket, eps, arch, hidden=1024):
+    batch = cutlass.sym_int64()
     tile_m = 128 if hidden == 2048 else 64
     gate_channels = tile_m // 2
     if arch == "sm_90a":
@@ -62,7 +63,6 @@ def compile_kernel(batch, bucket, eps, arch, hidden=1024):
         fake(cutlass.Int32, 112 if hidden == 1024 else 96),
         fake(cutlass.BFloat16, batch, hidden),
         make_fake_stream(),
-        batch,
         bucket,
         eps,
         options=f"--enable-tvm-ffi --gpu-arch={arch}",
@@ -70,7 +70,13 @@ def compile_kernel(batch, bucket, eps, arch, hidden=1024):
 
 
 class PackedPostAttention(nn.Module):
-    """Inference-only replacement; each instance owns a serialized workspace."""
+    """Inference-only replacement; each instance owns a serialized workspace.
+
+    The cooperative launch requires all 24 four-CTA clusters to be resident at
+    the compiled kernel's occupancy. An architecture match alone is insufficient
+    on smaller or partitioned GPUs. Calls sharing an instance must be serialized,
+    including CUDA graph replays; concurrent streams need separate instances.
+    """
 
     def __init__(self, o_weight, gate_weight, up_weight, down_weight, norm_weight, eps):
         super().__init__()
@@ -134,7 +140,7 @@ class PackedPostAttention(nn.Module):
                 torch.zeros(112 if self.hidden == 1024 else 96, device=device, dtype=torch.int32),
             )
         output = torch.empty_like(residual, memory_format=torch.contiguous_format)
-        fn = compile_kernel(batch, bucket, self.eps, self.arch, self.hidden)
+        fn = compile_kernel(bucket, self.eps, self.arch, self.hidden)
         fn(
             attention.reshape(batch, 2048),
             residual.reshape(batch, self.hidden),
@@ -144,7 +150,7 @@ class PackedPostAttention(nn.Module):
             self.norm_weight,
             *self.workspaces[batch],
             output.reshape(batch, self.hidden),
-            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            cuda.CUstream(torch.cuda.current_stream(attention.device).cuda_stream),
         )
         return output
 
@@ -172,7 +178,7 @@ class FusedPostAttention(PackedPostAttention):
 @torch.inference_mode()
 def trace_once(batch, hidden=1024):
     """Launch one fused block without reference GEMMs or benchmark replays."""
-    from qwen3_tts_reference import TalkerConfig, TorchPostAttention
+    from torch_qwen3_tts.talker import TalkerConfig, TorchPostAttention
 
     torch.manual_seed(42)
     reference = (
@@ -190,7 +196,7 @@ def trace_once(batch, hidden=1024):
 
 @torch.inference_mode()
 def benchmark(batch, layers, profile=False, hidden=1024):
-    from qwen3_tts_reference import TalkerConfig, TorchPostAttention, post_attention
+    from torch_qwen3_tts.talker import TalkerConfig, TorchPostAttention, post_attention
 
     torch.manual_seed(42)
     references = [
