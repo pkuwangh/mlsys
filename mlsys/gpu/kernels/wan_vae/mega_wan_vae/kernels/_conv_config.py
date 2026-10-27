@@ -91,6 +91,8 @@ class ConvConfig:
         if self.precision not in ("bf16", "ieee", "tf32", "tf32x3"):
             raise ValueError("Convolution precision must be bf16, ieee, tf32 or tf32x3")
         extra_pairs = ((16, 160),) if self.precision != "bf16" else ()
+        if self.precision == "ieee":
+            extra_pairs += ((12, 160),)
         if (
             self.ci,
             self.co,

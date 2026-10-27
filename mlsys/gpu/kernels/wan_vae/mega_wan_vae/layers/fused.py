@@ -229,7 +229,11 @@ class _FusedResidualBlock(torch.nn.Module):
         conv1, conv2 = block.conv1.conv, block.conv2.conv
         self.precision = resolve_precision(conv1.weight.dtype)
         norm2 = block.norm2.norm
-        self.fuse_conv = conv1.out_channels == 256 or (custom_conv and conv1.out_channels in (96, 192))
+        # C256 TF32 favors cuDNN plus preparation at the measured decoder shapes.
+        # Keep integrated BF16 and Wan 2.1 fusion; see BENCHMARKS.md.
+        self.fuse_conv = (conv1.out_channels == 256 and self.precision != "tf32") or (
+            custom_conv and conv1.out_channels in (96, 192)
+        )
         self.custom_conv = custom_conv or self.fuse_conv
         if norm2.bias != 0 or block.norm1.norm.bias != 0:
             raise ValueError("Expected Wan RMSNorm without affine bias")

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 import torch.nn.functional as F
-from mega_wan_vae.kernels import conv, norm, residual
+from mega_wan_vae.kernels import conv, memory, norm, residual
 from mega_wan_vae.kernels._compile import compile_stats
 from mega_wan_vae.kernels._precision import pack_components
 from mega_wan_vae.layers.fused import _conv_raw
@@ -188,6 +188,44 @@ def check_mode(policy, *, raw_only=False):
         print(f"{policy} {ci}->{co}: raw/prepared/residual/cache/spatial/graph/contracts PASS", flush=True)
 
 
+@torch.inference_mode()
+def check_input_convolution(policy):
+    """C12 packing and native-library input must preserve causal history and policy."""
+    dtype = torch.bfloat16 if policy == "bf16" else torch.float32
+    weight = torch.randn(160, 12, 3, 3, 3, device="cuda", dtype=dtype) * 0.02
+    module = conv.WanInputConv3d(weight, precision=policy).eval()
+    assert module.input_channels == (12 if policy == "ieee" else 16)
+    for frames, history in ((1, 0), (1, 1), (4, 2)):
+        source = torch.randn(2, 12, frames + 2, 7, 9, device="cuda", dtype=dtype) * 0.1
+        x = source[:, :, 1 : frames + 1]
+        previous = torch.randn(2, history, 7, 9, 12, device="cuda", dtype=dtype) * 0.1 if history else None
+
+        def run(x=x, previous=previous):
+            packed = memory.pack_history(x, previous, input_ncthw=True, pad_input_channels=module.input_channels == 16)
+            return module(packed.padded), packed.cache
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual, cache = run()
+        x.normal_(0, 0.1)
+        if previous is not None:
+            previous.normal_(0, 0.1)
+        graph.replay()
+        joined = x.permute(0, 2, 3, 4, 1)
+        if previous is not None:
+            joined = torch.cat((previous, joined), dim=1)
+        padded = F.pad(joined, (0, 0, 1, 1, 1, 1, 2 - history, 0))
+        # Strict library policy remains pinned even if the framework permits TF32.
+        with torch.backends.cudnn.flags(allow_tf32=True):
+            policy_output, _ = run()
+        expected = reference(padded, weight, policy)
+        close(actual, expected, policy)
+        close(policy_output, expected, policy)
+        torch.testing.assert_close(cache, joined[:, -2:], atol=0, rtol=0)
+    print(f"{policy}: C12 input, native channel count, history, policy and graph replay PASS", flush=True)
+
+
 def check_compile_rejection():
     cfg = conv.ConvConfig(precision="ieee")
     must_reject(lambda: conv.compile_conv(cfg))
@@ -209,3 +247,4 @@ if __name__ == "__main__":
     with patch.object(conv, "_needs_wide_index", return_value=True) if args.wide_index else nullcontext():
         for mode in args.modes:
             check_mode(mode, raw_only=args.raw_only)
+            check_input_convolution(mode)

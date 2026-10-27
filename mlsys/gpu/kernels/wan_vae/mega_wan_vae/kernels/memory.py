@@ -12,7 +12,7 @@ vector bias-add and shares the output/cache buffer. No shared memory, barriers,
 input mutation, or intermediate concatenation is needed.
 NCTHW inputs may be temporal views with noncompact batch/channel strides;
 packing reads those strides directly, without an intermediate contiguous copy.
-The initial C12 NCTHW input is padded to C16 for aligned convolution gathers;
+The initial C12 NCTHW input can be padded to C16 for aligned convolution gathers;
 its cache remains C12 and every extra output channel is zero.
 """
 
@@ -64,11 +64,12 @@ def input_pack_kernel(
     CT,
     STRIDES,
     divisors,
+    OUTPUT_CHANNELS: cutlass.Constexpr[int],
 ) -> None:
     """Pack C12 input: out=pad(concat(previous, NTHWC(x))), cache=last_CT.
 
     All other output elements are zero. Spatially adjacent lanes load the same
-    channel, coalescing NCTHW reads; register gathering yields C16 output vectors.
+    channel, coalescing NCTHW reads; register gathering yields C12 or C16 output.
     C12 cache pixels are 24 bytes apart in BF16 and 48 bytes in FP32;
     their vector stores promise only 8-byte alignment. One thread owns each
     output pixel and its optional cache pixel.
@@ -76,7 +77,7 @@ def input_pack_kernel(
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     pixel = cutlass.Int64(bid) * 256 + tid
-    if pixel < out_numel // 16:
+    if pixel < out_numel // OUTPUT_CHANNELS:
         n, t, h, w = divisors.coordinates(pixel, promote_batch=False)
         t -= 2
         h -= 1
@@ -100,8 +101,12 @@ def input_pack_kernel(
                 cache_offset = cutlass.Int64(((n * CT + t - T + CT) * H + h) * W + w) * 12
                 for part in cutlass.range_constexpr(3):
                     (cache.iterator.raw_ptr() + cache_offset + part * 4).store(values.load(part * 4, 4), alignment=8)
-        for part in cutlass.range_constexpr(2):
-            (out.iterator.raw_ptr() + pixel * 16 + part * 8).store(values.load(part * 8, 8), alignment=16)
+        if cutlass.const_expr(OUTPUT_CHANNELS == 16):
+            for part in cutlass.range_constexpr(2):
+                (out.iterator.raw_ptr() + pixel * 16 + part * 8).store(values.load(part * 8, 8), alignment=16)
+        else:
+            for part in cutlass.range_constexpr(3):
+                (out.iterator.raw_ptr() + pixel * 12 + part * 4).store(values.load(part * 4, 4), alignment=8)
 
 
 @cute.kernel
@@ -187,6 +192,7 @@ def causal_pack_kernel(
     divisors,
     VECTOR: cutlass.Constexpr[int] = 1,
     ALIGNMENT: cutlass.Constexpr[int] = 2,
+    PAD_INPUT_CHANNELS: cutlass.Constexpr[bool] = True,
 ) -> None:
     """Compute out=pad(concat(previous, B(x+bias))), cache=last_CT_frames.
 
@@ -197,7 +203,7 @@ def causal_pack_kernel(
     """
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
-    OC: cutlass.Constexpr = 16 if NCTHW and C == 12 else C
+    OC: cutlass.Constexpr = 16 if NCTHW and C == 12 and PAD_INPUT_CHANNELS else C
     i = (cutlass.Int64(bid) * 256 + tid) * VECTOR
     if i < out_numel:
         c = i % OC
@@ -236,6 +242,7 @@ class PackConfig:
     has_bias: bool
     vector: int
     wide_index: bool = False
+    pad_input_channels: bool = True
 
 
 @cute.jit
@@ -256,8 +263,11 @@ def causal_pack_host(
     c = config.channels
     divisors = SpatialDivisors(t + pt, h + 2 * ph, w + 2 * pw, wide=config.wide_index)
     if cutlass.const_expr(config.input_ncthw and c == 12 and not config.has_bias and config.padding == (2, 1, 1)):
-        input_pack_kernel(x, previous, out, cache, out_numel, t, h, w, p, ct, input_strides, divisors).launch(
-            grid=((out_numel // 16 + 255) // 256, 1, 1),
+        output_channels = 16 if config.pad_input_channels else 12
+        input_pack_kernel(
+            x, previous, out, cache, out_numel, t, h, w, p, ct, input_strides, divisors, output_channels
+        ).launch(
+            grid=((out_numel // output_channels + 255) // 256, 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )
@@ -291,6 +301,7 @@ def causal_pack_host(
             divisors,
             VECTOR=vector,
             ALIGNMENT=16,
+            PAD_INPUT_CHANNELS=config.pad_input_channels,
         ).launch(
             grid=((out_numel + 256 * vector - 1) // (256 * vector), 1, 1),
             block=(256, 1, 1),
@@ -319,6 +330,7 @@ def causal_pack_host(
             divisors,
             VECTOR=vector,
             ALIGNMENT=2,
+            PAD_INPUT_CHANNELS=config.pad_input_channels,
         ).launch(
             grid=((out_numel + 256 * vector - 1) // (256 * vector), 1, 1),
             block=(256, 1, 1),
@@ -357,13 +369,19 @@ def pack_history(
     padding: tuple[int, int, int] = (2, 1, 1),
     cache_frames: int = 2,
     input_ncthw: bool = False,
+    pad_input_channels: bool = True,
 ) -> PackedHistory:
-    """Fuse conversion/bias, padding, and cache writes; initial C12 pads to C16.
+    """Fuse conversion/bias, padding, and cache writes.
+
+    Initial NCTHW C12 input pads to C16 by default for Tensor Core gathers.
+    Set pad_input_channels=False for a library convolution that consumes C12.
 
     NCTHW input accepts nonnegative-stride views (including temporal slices).
     History, bias, and NTHWC input remain contiguous. The flattened input view
     spans storage gaps but the kernel reads only coordinates in the input view.
     """
+    if type(pad_input_channels) is not bool:
+        raise TypeError("pad_input_channels must be a bool")
     if x.ndim != 5:
         raise ValueError("Expected a five-dimensional activation")
     n, t, h, w, c = x.permute(0, 2, 3, 4, 1).shape if input_ncthw else x.shape
@@ -391,7 +409,7 @@ def pack_history(
         if torch.is_grad_enabled() and value.requires_grad:
             raise ValueError("History packing is inference-only")
     ct = min(cache_frames, p + t)
-    out_channels = 16 if input_ncthw and c == 12 else c
+    out_channels = 16 if input_ncthw and c == 12 and pad_input_channels else c
     out = torch.empty(
         (n, t + pt, h + 2 * ph, w + 2 * pw, out_channels),
         device=x.device,
@@ -422,6 +440,7 @@ def pack_history(
             bias is not None,
             8 if channel_contiguous and c % 8 == 0 else 1,
             n * (t + pt) * (h + 2 * ph) * (w + 2 * pw) >= 2**31,
+            pad_input_channels,
         )
         compile_pack(config, storage_dtype=x.dtype)(
             flat_input,

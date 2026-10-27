@@ -2313,6 +2313,7 @@ class WanConv3d(torch.nn.Module):
         super().__init__()
         if weight.dtype not in (torch.bfloat16, torch.float32) or not weight.is_cuda:
             raise ValueError("WanConv3d requires BF16 or FP32 CUDA weights")
+        precision = resolve_precision(weight.dtype, precision)
         if (
             weight.ndim != 5
             or tuple(weight.shape[2:]) != (3, 3, 3)
@@ -2321,11 +2322,12 @@ class WanConv3d(torch.nn.Module):
             + _DECODER_CHANNEL_PAIRS
             + _WAN21_CHANNEL_PAIRS
             + (((16, 160),) if weight.dtype == torch.float32 else ())
+            + (((12, 160),) if precision == "ieee" else ())
         ):
             raise ValueError("WanConv3d requires a supported Wan residual 3x3x3 weight")
         self.in_channels = weight.shape[1]
         self.out_channels = weight.shape[0]
-        self.precision = resolve_precision(weight.dtype, precision)
+        self.precision = precision
         # Supported output channels are multiples of their selected N tile.
         logical_k = {"bf16": 64, "ieee": 1, "tf32": 32, "tf32x3": 16}[self.precision]
         packed = torch.nn.functional.pad(
@@ -2613,7 +2615,11 @@ def prepare_input(x: torch.Tensor, weight: torch.Tensor, cfg: InputConvConfig) -
 
 
 class WanInputConv3d(torch.nn.Module):
-    """Inference-only C12->C160 module with prepacked constant weights."""
+    """Inference-only C12->C160 convolution with policy-specific input packing.
+
+    Strict FP32 consumes C12 directly through cuDNN. Tensor Core paths consume
+    C16 packed input. ``input_channels`` tells the caller which packing to use.
+    """
 
     def __init__(self, weight: torch.Tensor, *, precision: str | None = None) -> None:
         super().__init__()
@@ -2621,6 +2627,10 @@ class WanInputConv3d(torch.nn.Module):
             raise ValueError("Expected input-convolution weights [160,12,3,3,3]")
         self.general_conv = None
         precision = resolve_precision(weight.dtype, precision)
+        self.input_channels = 12 if precision == "ieee" else 16
+        if precision == "ieee":
+            self.general_conv = WanConv3d(weight, precision=precision)
+            return
         if weight.dtype == torch.float32:
             padded = torch.zeros((160, 16, 3, 3, 3), device=weight.device, dtype=weight.dtype)
             padded[:, :12].copy_(weight)
@@ -3112,16 +3122,16 @@ def _benchmark_input(cfg: InputConvConfig, precision: str = "bf16") -> None:
     """Time the production C12 input convolution with prepacked operands."""
     print(f"\nC12->C160 input | output NTHWC={cfg.output_shape}", flush=True)
     dtype = torch.bfloat16 if precision == "bf16" else torch.float32
-    x = torch.randn(cfg.input_shape, device="cuda", dtype=dtype) * 0.1
-    x[..., 12:] = 0
-    weight = (torch.randn(160, 12, 3, 3, 3, device="cuda", dtype=x.dtype) * 0.1).contiguous(
+    weight = (torch.randn(160, 12, 3, 3, 3, device="cuda", dtype=dtype) * 0.1).contiguous(
         memory_format=torch.channels_last_3d
     )
     module = WanInputConv3d(weight, precision=precision).eval()
+    x = torch.randn((*cfg.input_shape[:-1], module.input_channels), device="cuda", dtype=dtype) * 0.1
+    x[..., 12:] = 0
     if module.general_conv is None:
         raw = prepare_input(x, module.weight, cfg)
     else:
-        general_cfg = ConvConfig(cfg.n, cfg.t, cfg.h, cfg.w, 16, 160, cfg.ctas // 2 * 2, precision)
+        general_cfg = ConvConfig(cfg.n, cfg.t, cfg.h, cfg.w, module.input_channels, 160, cfg.ctas // 2 * 2, precision)
         raw = prepare(x, module.general_conv.weight, general_cfg)
     torch_x = x[..., :12].contiguous().permute(0, 4, 1, 2, 3)
 

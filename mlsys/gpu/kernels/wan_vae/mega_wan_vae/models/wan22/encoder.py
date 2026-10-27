@@ -672,7 +672,12 @@ class _Encoder3d(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, feat_cache: FeatCache) -> tuple[torch.Tensor, FeatCache]:
         feat_cache = canonicalize_cache(feat_cache, torch.contiguous_format)
-        packed = pack_history(x, feat_cache[0], input_ncthw=True)
+        packed = pack_history(
+            x,
+            feat_cache[0],
+            input_ncthw=True,
+            pad_input_channels=self.primitive_input_conv.input_channels == 16,
+        )
         conv = self.conv_in.conv
         x = self.primitive_input_conv(packed.padded)
         feat_cache = update_cache(feat_cache, 0, packed.cache)

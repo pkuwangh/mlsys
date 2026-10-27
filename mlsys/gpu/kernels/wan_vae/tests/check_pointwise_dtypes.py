@@ -75,24 +75,36 @@ def check_stage_and_residual():
 @torch.inference_mode()
 def check_pack_graph_and_reuse():
     for dtype in (torch.bfloat16, torch.float32):
-        count = None
-        for n, t, h, w in ((1, 3, 3, 5), (2, 4, 5, 7)):
-            x = torch.randn(n, 12, t + 2, h, w, device="cuda", dtype=dtype)[:, :, 1 : t + 1]
-            previous = torch.randn(n, 2, h, w, 12, device="cuda", dtype=dtype)
-            memory.pack_history(x, previous, input_ncthw=True)
-            current = compile_stats().compiled
-            if count is not None:
-                assert current == count, "Geometry-only change compiled a new packing kernel"
-            count = current
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                actual = memory.pack_history(x, previous, input_ncthw=True)
-            x.normal_()
-            previous.normal_()
-            graph.replay()
-            joined = torch.cat((previous, x.permute(0, 2, 3, 4, 1)), dim=1)
-            torch.testing.assert_close(actual.padded, F.pad(joined, (0, 4, 1, 1, 1, 1)), atol=0, rtol=0)
-            torch.testing.assert_close(actual.cache, joined[:, -2:], atol=0, rtol=0)
+        for pad_channels in (False, True):
+            count = None
+            for n, t, h, w in ((1, 3, 3, 5), (2, 4, 5, 7)):
+                x = torch.randn(n, 12, t + 2, h, w, device="cuda", dtype=dtype)[:, :, 1 : t + 1]
+                previous = torch.randn(n, 2, h, w, 12, device="cuda", dtype=dtype)
+                memory.pack_history(x, previous, input_ncthw=True, pad_input_channels=pad_channels)
+                current = compile_stats().compiled
+                if count is not None:
+                    assert current == count, "Geometry-only change compiled a new packing kernel"
+                count = current
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual = memory.pack_history(x, previous, input_ncthw=True, pad_input_channels=pad_channels)
+                x.normal_()
+                previous.normal_()
+                graph.replay()
+                joined = torch.cat((previous, x.permute(0, 2, 3, 4, 1)), dim=1)
+                torch.testing.assert_close(
+                    actual.padded, F.pad(joined, (0, 4 if pad_channels else 0, 1, 1, 1, 1)), atol=0, rtol=0
+                )
+                torch.testing.assert_close(actual.cache, joined[:, -2:], atol=0, rtol=0)
+                # Bias takes the generic packing path; preserve the same channel contract.
+                bias = torch.randn(12, device="cuda", dtype=dtype)
+                actual = memory.pack_history(x, previous, bias, input_ncthw=True, pad_input_channels=pad_channels)
+                joined = torch.cat((previous, x.permute(0, 2, 3, 4, 1) + bias), dim=1)
+                torch.testing.assert_close(
+                    actual.padded, F.pad(joined, (0, 4 if pad_channels else 0, 1, 1, 1, 1)), atol=0, rtol=0
+                )
+                torch.testing.assert_close(actual.cache, joined[:, -2:], atol=0, rtol=0)
+                count = compile_stats().compiled
         print(f"{dtype}: strided packing, graph replay and geometry reuse PASS", flush=True)
 
 

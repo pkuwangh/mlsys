@@ -20,7 +20,7 @@ BF16 remains the default. FP32 storage supports both framework convolution polic
 |---|---|---|
 | BF16 | Either | BF16 Tensor Core kernels and fusion |
 | FP32 | `False` | Strict cuDNN convolution followed by separate fused post-ops |
-| FP32 | `True` | Ordinary single-product TF32 kernels, with supported integrated fusion |
+| FP32 | `True` | Ordinary single-product TF32 kernels with selected fusion; cuDNN plus post-ops for Wan 2.2 C256 decoder convolutions |
 
 Configure the framework policy **before constructing** a full model and keep it
 stable throughout inference and CUDA graph replay. Both model constructors accept
@@ -203,9 +203,10 @@ Cache tensors are compared in bounded CPU blocks, outside latency and memory
 measurements. The compiled diagnostic alone allows adjacent finite BF16 cache
 values; chunk outputs use the elementwise atol/rtol gate.
 
-Measured performance, the optional BF16 cache discrepancy, recovered cuDNN
-workspace allocation warnings, and the tensor-operation sanitizer limitation
-are documented in [BENCHMARKS.md](BENCHMARKS.md#validation-limitations).
+Measured performance, the isolated compiled-reference failure, optional BF16
+cache discrepancy, recovered cuDNN workspace allocation warnings, and the
+tensor-operation sanitizer limitation
+are documented in [BENCHMARKS.md](BENCHMARKS.md).
 B200 FP32 capacity, reconstruction quality and serving-framework integration
 remain unvalidated.
 
@@ -224,7 +225,7 @@ the normal CUDA/CuTe environment and a supported Blackwell GPU.
 | `check_cache_tolerance.py --device cpu` | CPU; also accepts `--device cuda` | Cache tolerances, bounded comparisons, ownership and OOM recovery |
 | `check_conv_indexing.py` | CPU; optional `--device cuda` | Index-width boundaries and large-offset arithmetic |
 | `check_torch_layouts.py` | CPU; optional CUDA `--model CHECKPOINT` | Shortcut grouping/layouts; Wan 2.2 compiled encoder regression with a checkpoint |
-| `check_arithmetic_modes.py --wide-index` | GPU | BF16/strict FP32/TF32 arithmetic, independent TF32 rounding, histories and graph replay |
+| `check_arithmetic_modes.py --wide-index` | GPU | BF16/strict FP32/TF32 arithmetic, independent TF32 rounding, native/padded C12 input, histories and graph replay |
 | `check_conv_contracts.py` | GPU | Inference-only bindings, dtype/device validation, output ownership and streams |
 | `check_conv_outputs.py` | GPU | Bitwise BF16 prepared outputs and executable reuse; also run `--operation spatial` |
 | `check_pointwise_dtypes.py` | GPU | FP32 norm/residual/stage math, BF16/FP32 packing and dtype separation |
@@ -284,32 +285,39 @@ stages fuse conv1 preparation, conv2 residual/next-input preparation, and final
 spatial padding or head preparation. Fused and separate entry points remain
 available; measured benefit should determine upstream dispatch.
 
-## Next investigation: strict FP32 encoder post-op performance
+## FP32/TF32 performance and next steps
 
-Wan 2.2 strict FP32 encoding shows parity between Mega and Compiled: at N=2,
-T=17, 720x1280, Mega takes 7129.020 ms and Compiled takes 7123.947 ms.
-The local run is recorded in
-`logs/20261026-final/Wan2.2-TI2V-5B-Diffusers-encoder-fp32.log`.
+Matched profiles resolve the strict FP32 encoder question: our post-ops are
+faster, but cuDNN occupies 98.5–99.5% of GPU execution time across the four
+model paths. Saving tens of milliseconds in postprocessing changes a 7–12 second
+forward by only a few tenths of a percent. The Wan 2.2 strict input convolution
+consumes native C12; unnecessary C16 padding would cost another 14.6 ms at
+N=2, T=17, 720p and offset most of its post-op saving.
 
-Keep this investigation focused on Mega versus Compiled. Both paths use cuDNN
-convolution; Mega uses our custom fused post-ops and Compiled uses Torch's fused
-post-processing kernels. Earlier post-op studies showed a clear advantage for
-our kernels. Why that advantage does not appear in the full encoder remains
-unresolved; using the same convolution backend alone does not explain it.
+Wan 2.2 TF32 decoding has a different limitation: custom C256 convolution and
+activation packing offset the post-op advantage. The adapter uses cuDNN plus
+our preparation kernels at those sites, supported by full-model A/B measurements
+at 256x320, 480x832 and 720x1280. BF16 integrated fusion and the generic TF32
+fused primitives remain available. See [the performance analysis](BENCHMARKS.md#fp32tf32-performance-analysis)
+for operator accounting, matched post-op measurements and hardware counters.
 
-Next steps:
+Further performance work should target:
 
-1. Profile matched strict FP32 encoder runs and account separately for cuDNN
-   convolution, fused post-processing, and remaining execution overhead.
-2. Verify matching convolution calls, selected kernels and durations, then compare
-   the actual post-op workloads and timings at corresponding encoder sites.
-3. Locate where the previously measured post-op advantage is lost or offset,
-   and reconcile that accounting with the end-to-end timing before drawing a conclusion.
+1. Eliminating the separate TF32 activation-rounding pass by producing the rounded
+   convolution input during preparation, while preserving full FP32 cache and
+   residual values and the independent rounding oracle.
+2. Improving C256 TF32 convolution throughput before selecting integrated fusion
+   there again. Compare the complete convolution/post-op path, including packing,
+   against cuDNN; a fusion-only microbenchmark does not establish an end-to-end win.
+3. Measuring the dispatch choices on B200 and serving workloads, including
+   reconstruction quality. Current performance evidence is from B300.
 
 ## Upstream integration
 
 The next work is to port reusable arithmetic/validation/compilation contracts
-into cuDNN's existing `conv3d_postops` API and improve TF32 performance before
-claiming a meaningful decoder speedup. The isolated sanitizer tool limitation
-needs an upstream fix. Keep Wan-specific cache/model wiring in framework adapters. vLLM-Omni and SGLang integration then
-needs their own tests, serving-shape benchmarks and reconstruction-quality checks.
+into cuDNN's existing `conv3d_postops` API and validate dispatch and performance
+on its supported GPUs and serving shapes. The isolated compiler-reference and
+sanitizer findings have local standalone reproducers for upstream investigation.
+Keep Wan-specific cache/model wiring in framework adapters. vLLM-Omni and SGLang
+integration needs their own tests, serving-shape benchmarks and reconstruction-quality
+checks.
