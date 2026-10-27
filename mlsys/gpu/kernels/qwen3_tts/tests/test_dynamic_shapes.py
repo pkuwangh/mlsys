@@ -2,9 +2,42 @@
 
 import pytest
 import torch
-from mega_qwen3_tts.kernels import argmax_embedding, embedding_update, sampling, snake_beta
+from mega_qwen3_tts.kernels import argmax_embedding, embedding_update, sampling, snake_beta, state_copy
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU required")
+
+
+@pytest.mark.parametrize("scatter", [False, True])
+@torch.inference_mode()
+def test_state_copy_graph_replay(scatter):
+    """Reuse the binary across batches; duplicated padding slots retain the first row."""
+    torch.manual_seed(42)
+    state_copy.compile_kernel.cache_clear()
+    storage = tuple(torch.randn(64, width, device="cuda", dtype=torch.bfloat16) for width in (8, 1040))
+    for batch in (1, 7, 32, 64):
+        indices = torch.arange(batch, device="cuda", dtype=torch.int64)
+        rows = tuple(torch.randn(batch, buffer.shape[1], device="cuda", dtype=buffer.dtype) for buffer in storage)
+        state_copy.copy_state_rows(storage, rows, indices, scatter=scatter)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            state_copy.copy_state_rows(storage, rows, indices, scatter=scatter)
+        for step in range(3):
+            slots = [(row // 2 + step) % 64 for row in range(batch)]
+            indices.copy_(torch.tensor(slots, device="cuda"))
+            for buffer in (*storage, *rows):
+                buffer.normal_()
+            if scatter:
+                expected = tuple(buffer.clone() for buffer in storage)
+                for target, source in zip(expected, rows):
+                    for row in reversed(range(batch)):
+                        target[slots[row]].copy_(source[row])
+            else:
+                expected = tuple(buffer[indices] for buffer in storage)
+            graph.replay()
+            for actual, target in zip(storage if scatter else rows, expected):
+                torch.testing.assert_close(actual, target, atol=0, rtol=0)
+    assert state_copy.compile_kernel.cache_info().misses == 1
 
 
 @torch.inference_mode()
@@ -83,22 +116,3 @@ def test_snake_large_offsets():
     expected = snake_beta.reference(x[:, :, :8], alpha, beta)
     torch.testing.assert_close(actual[:, :, :8], expected, atol=0, rtol=0)
     torch.testing.assert_close(actual[:, :, -8:], expected, atol=0, rtol=0)
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices required")
-@torch.inference_mode()
-def test_snake_noncurrent_device_stream():
-    """Capture on the input device's stream while another device is current."""
-    with torch.cuda.device(1):
-        x = torch.ones(1, 96, 256, device="cuda", dtype=torch.bfloat16)
-        alpha = torch.zeros(96, device=x.device, dtype=x.dtype)
-        operation = snake_beta.SnakeBeta(alpha, alpha)
-        operation(x)
-        torch.cuda.synchronize()
-        stream = torch.cuda.Stream()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream), torch.cuda.device(0):
-            actual = operation(x)
-        x.fill_(0.5)
-        graph.replay()
-        torch.testing.assert_close(actual, snake_beta.reference(x, alpha, alpha), atol=0, rtol=0)

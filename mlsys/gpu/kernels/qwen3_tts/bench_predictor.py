@@ -3,6 +3,8 @@
 Includes the two-token prefix, 14 decode steps, greedy selection, embeddings,
 and feedback sum. Uses synthetic hidden states or captured talker outputs;
 this is not an end-to-end speech-quality benchmark.
+Free-running code agreement is diagnostic: transformer rounding differences can
+change greedy choices. Selector correctness is tested separately on identical logits.
 """
 
 import argparse

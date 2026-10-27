@@ -472,6 +472,8 @@ def sample_logits(
     at least one finite value per row. Equal logits use ascending token IDs,
     independent of PyTorch's unspecified topk tie ordering. Temperatures must
     be finite and are clamped to at least 1e-5.
+    Disabled top-k needs full-vocabulary filtering followed by sample_sorted;
+    clamping it to max_top_k would change the sampling distribution.
     """
     if logits.ndim != 2 or logits.shape[1] != 2048 or logits.dtype != torch.bfloat16 or not logits.is_cuda:
         raise ValueError("Expected CUDA BF16 logits [B,2048]")

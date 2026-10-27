@@ -516,6 +516,9 @@ def post_attention_kernel(
             B=B,
             N=N,
         )
+        # Down consumes the normalized activation, which needs every residual
+        # publication. Those publications follow the phase-0 mailbox reads,
+        # so all peers have finished reading before this mailbox is reused.
         scatter_partial(acc, mailbox, ready, 1, tid, rank, N)
         for j in cutlass.range_constexpr(N // 16):
             idx = tid + j * 256

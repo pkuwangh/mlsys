@@ -10,9 +10,10 @@ Target: **0.6B/1.7B talker, Hopper/Blackwell, BF16, TP1, single-token decode, B=
 Both backbones have 28 layers, 16 query heads, 8 KV heads, and head dimension 128.
 Hidden/SwiGLU widths are 1024/3072 for 0.6B and 2048/6144 for 1.7B.
 Projections have no bias. Both five-layer code predictors retain the 1024/3072
-blocks and add fused greedy selection. Training, stochastic sampling, and
-vocoder are outside scope. The detailed schedules below describe 0.6B unless
-noted otherwise.
+blocks and add fused greedy selection. This document covers the transformer
+blocks; see README for [auxiliary sampling](README.md#auxiliary-semantics)
+and [vocoder kernels](README.md#vocoder). Training is unsupported.
+The detailed schedules below describe 0.6B unless noted otherwise.
 
 The default layer runs:
 

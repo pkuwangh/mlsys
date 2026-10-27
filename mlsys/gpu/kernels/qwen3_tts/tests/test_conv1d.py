@@ -5,12 +5,41 @@ import torch
 from mega_qwen3_tts.kernels.conv1d import _compile, conv1d
 from mega_qwen3_tts.kernels.snake_beta import SnakeBeta
 from torch.nn import functional as F
+from torch_qwen3_tts.vocoder import ChannelsLastConv1d
 from torch_qwen3_tts.vocoder import SnakeBeta as TorchSnakeBeta
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3)),
     reason="Hopper or datacenter Blackwell GPU required",
 )
+
+
+@torch.inference_mode()
+def test_bias_rounding():
+    """cuDNN's BF16 convolution output is rounded before the separate bias add."""
+    # This pins Torch's current separate bias add. If an upgrade fuses it,
+    # revisit the reference contract rather than loosening this exact check.
+    x = torch.zeros(1, 1, 32, device="cuda", dtype=torch.bfloat16)
+    x[..., :2] = 1
+    weight = torch.zeros(32, 1, 32, device="cuda", dtype=x.dtype)
+    weight[:, 0, 0] = 1
+    weight[:, 0, 1] = 1 / 256
+    bias = torch.full((32,), 1 / 256, device=x.device, dtype=x.dtype)
+
+    def reference(x, weight, bias):
+        return F.conv1d(x.transpose(1, 2), weight.permute(0, 2, 1), bias).transpose(1, 2)
+
+    expected = torch.ones_like(x)
+    torch.testing.assert_close(reference(x, weight, bias), expected, atol=0, rtol=0)
+    conv = torch.nn.Conv1d(32, 32, 1, device=x.device, dtype=x.dtype)
+    conv.weight.copy_(weight.permute(0, 2, 1))
+    conv.bias.copy_(bias)
+    torch.testing.assert_close(ChannelsLastConv1d(conv)(x), expected, atol=0, rtol=0)
+    compiled = torch.compile(reference, fullgraph=True, options={"emulate_precision_casts": True})
+    torch.testing.assert_close(compiled(x, weight, bias), expected, atol=0, rtol=0)
+    torch.testing.assert_close(conv1d(x, weight, bias), expected, atol=0, rtol=0)
+    single_round = reference(x.float(), weight.float(), bias.float()).to(x.dtype)
+    assert torch.all(single_round == 1 + 1 / 128)
 
 
 @torch.inference_mode()

@@ -49,6 +49,8 @@ GPUs. There is no noncooperative fallback.
 Move reference models to their final CUDA device and BF16 before constructing
 fused modules. Packed weights and activation coefficients are immutable;
 changing weights, dtype, or device requires rebuilding the fused module.
+Norm weights are borrowed tensors, not snapshots; leave the source weights
+unchanged too. Input and Q/K head norms use Qwen3-TTS's common RMSNorm epsilon.
 Training is unsupported. Calls sharing a post-attention instance must be
 serialized, including graph replays; concurrent streams need separate instances.
 
@@ -58,6 +60,8 @@ or RoPE table length. Conv1D/SnakeBeta keep batch and audio length dynamic;
 channel geometry, tiling, vector width, layout, tail masking, dtype, architecture,
 and fusion flags remain specialization keys. Post-attention workspaces are
 per-batch allocations, separate from the shared compiled binary.
+Warm each batch size before CUDA graph capture so workspace initialization
+and compilation stay outside graph replay.
 
 ## Run
 
@@ -158,6 +162,10 @@ and optional embedding updates. Equal logits use ascending token IDs, not
 Torch's unspecified `topk` tie order; cutoff rounding can also affect same-seed
 parity. Prefiltered sampling preserves the supplied candidate order.
 
+Gumbel draws remain FP64 to match SGLang-Omni's CUDA/Triton sampler, including
+its zero/one hash endpoint handling. This is a deliberate compatibility choice
+on Blackwell too: the faster FP32 variant changes seeded draws.
+
 SnakeBeta preserves eager BF16 rounding after each arithmetic operation.
 Small tensors use direct sine; large tensors use a shared 128 KiB lookup table
 covering all BF16 inputs. Coefficients and the table are prepared before capture.
@@ -169,8 +177,8 @@ baselines enable `emulate_precision_casts`. Individual kernels use tolerance
 checks, and fused Conv1D post-ops are checked bitwise against Torch applied to
 the same custom convolution output. Tests cover causal tails, irregular
 batches, dynamic-size binary reuse, changing cache slots, and graph replay.
-The large-offset SnakeBeta regression needs 12 GiB free memory; the noncurrent
-device/stream check requires two GPUs. They skip when those resources are absent.
+The large-offset SnakeBeta regression needs 12 GiB free memory and skips when
+that memory is unavailable. Tests target one GPU per process.
 
 Full-model benchmarks report numerical differences and top-code agreement,
 rejecting shape mismatches and non-finite values rather than applying a

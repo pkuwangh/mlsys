@@ -2,8 +2,9 @@
 
 The kernel includes left zero padding through TMA bounds checks, optional bias,
 residual addition, and SnakeBeta. Every epilogue operation rounds to BF16,
-including the raw convolution before bias. Both channel counts must be multiples
-of 32. Only stride-one, groups-one convolution is supported. Inference only;
+including the raw convolution before bias, matching Torch's cuDNN convolution
+followed by bias addition. Both channel counts must be multiples of 32.
+Only stride-one, groups-one convolution is supported. Inference only;
 autograd is not implemented.
 """
 

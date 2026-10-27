@@ -30,11 +30,16 @@ def state_copy_kernel(
     slot = indices[row]
     owns_slot = True
     if cutlass.const_expr(scatter):
-        for previous in cutlass.range(row):
-            if indices[previous] == slot:
-                owns_slot = False
+        # Padded graph rows may share a scratch slot. Compare prior rows in
+        # parallel while retaining first-row ownership of each destination.
+        for first in cutlass.range(0, row, 32):
+            previous = first + thread % 32
+            duplicate = False
+            if previous < row:
+                duplicate = indices[previous] == slot
             else:
                 pass
+            owns_slot = owns_slot & ~cute.arch.vote_any_sync(duplicate)
     else:
         pass
     first_tile = 0

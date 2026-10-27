@@ -22,6 +22,8 @@ def test_cache_slots_graph_replay(hidden, batch):
     torch.manual_seed(42)
     layer = TalkerLayer(TalkerConfig(hidden_size=hidden, intermediate_size=3 * hidden)).cuda().bfloat16().eval()
     attention = layer.self_attn
+    for norm in (layer.input_layernorm, attention.q_norm, attention.k_norm):
+        norm.weight.uniform_(0.5, 1.5)
     fused = SlotPreAttention(
         layer.input_layernorm.weight,
         torch.cat((attention.q_proj.weight, attention.k_proj.weight, attention.v_proj.weight)),
@@ -29,8 +31,6 @@ def test_cache_slots_graph_replay(hidden, batch):
         attention.k_norm.weight,
         layer.input_layernorm.eps,
     )
-    for norm in (layer.input_layernorm, attention.q_norm, attention.k_norm):
-        norm.weight.uniform_(0.5, 1.5)
     x = torch.randn(batch, hidden, device="cuda", dtype=torch.bfloat16)
     positions = torch.arange(batch, device="cuda", dtype=torch.int64)
     slots = positions * 2 + 1
@@ -163,3 +163,56 @@ def test_dynamic_sizes_reuse_compilation(hidden):
         torch.testing.assert_close(post(attn, x[:, 0]), reference(attn, x[:, 0]), atol=0.02, rtol=0.02)
     for compile in compilers:
         assert compile.cache_info().misses == 2
+
+
+@pytest.mark.parametrize("hidden,batch", [(1024, 7), (2048, 17)])
+@torch.inference_mode()
+def test_contiguous_rope_graph_replay(hidden, batch):
+    """Replay real rotations at the first, middle and last cache positions."""
+    torch.manual_seed(42)
+    layer = TalkerLayer(TalkerConfig(hidden_size=hidden, intermediate_size=3 * hidden)).cuda().bfloat16().eval()
+    attention = layer.self_attn
+    fused = FusedPreAttention(layer.input_layernorm, attention)
+    capacity = 65
+    x = torch.randn(batch, 1, hidden, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(2, batch, 8, capacity, 128, device="cuda", dtype=x.dtype)
+    position = torch.zeros(1, device="cuda", dtype=torch.int64)
+    cos, sin = torch.empty(128, device="cuda", dtype=x.dtype), torch.empty(128, device="cuda", dtype=x.dtype)
+    angles = (
+        torch.arange(capacity, device="cuda")[:, None]
+        * (1_000_000.0 ** (-torch.arange(0, 128, 2, device="cuda").float() / 128))[None, :]
+    )
+    angles = torch.cat((angles, angles), dim=-1)
+    cos.copy_(angles[0].cos())
+    sin.copy_(angles[0].sin())
+    mask = torch.empty(1, capacity, device="cuda", dtype=x.dtype)
+    fused(x, kv, position, cos, sin, mask)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        q = fused(x, kv, position, cos, sin, mask)
+    for index in (0, capacity // 2, capacity - 1):
+        x.normal_()
+        position.fill_(index)
+        cos.copy_(angles[index].cos())
+        sin.copy_(angles[index].sin())
+        before = kv.clone()
+        graph.replay()
+        expected = prepare_qkv(
+            x,
+            layer.input_layernorm.weight,
+            attention.q_proj.weight,
+            attention.k_proj.weight,
+            attention.v_proj.weight,
+            attention.q_norm.weight,
+            attention.k_norm.weight,
+            cos,
+            sin,
+            layer.input_layernorm.eps,
+        )
+        for actual, target in zip((q, kv[0, :, :, index : index + 1], kv[1, :, :, index : index + 1]), expected):
+            torch.testing.assert_close(actual, target, atol=0.02, rtol=0.02)
+        before[:, :, :, index] = kv[:, :, :, index]
+        torch.testing.assert_close(kv, before, atol=0, rtol=0)
+        expected_mask = torch.where(torch.arange(capacity, device="cuda") <= index, 0.0, float("-inf"))
+        torch.testing.assert_close(mask[0], expected_mask.to(x.dtype), atol=0, rtol=0)
