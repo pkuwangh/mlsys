@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
-"""Generate one WAV file with SGLang-Omni's Qwen3-TTS CustomVoice pipeline."""
+"""Generate one WAV with Qwen3-TTS; Base checkpoints use the first English Seed-TTS reference voice."""
 
 import argparse
 import asyncio
+import sys
 from pathlib import Path
 
 from utils import get_model_path
@@ -16,21 +17,26 @@ async def run(args):
     from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
     from sglang_omni.proto import OmniRequest
 
+    inputs = {"text": args.text}
+    params = {"language": "English", "max_new_tokens": 1024}
+    if Path(args.model).name.endswith("-Base"):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sglang-omni"))
+        from benchmarks.dataset.seedtts import load_seedtts_samples
+
+        reference = load_seedtts_samples("zhaochenyang20/seed-tts-eval-arrow", 1, split="en")[0]
+        inputs["references"] = [{"audio_path": reference.ref_audio, "text": reference.ref_text}]
+        params["task_type"] = "Base"
+        print(f"Reference voice: Seed-TTS {reference.sample_id}", flush=True)
+    else:
+        params.update(task_type="CustomVoice", voice="Ryan")
+
     runner = MultiProcessPipelineRunner(Qwen3TTSPipelineConfig(model_path=args.model))
     print(f"Loading {args.model}", flush=True)
     try:
         await runner.start(timeout=600)
         data = await runner.coordinator.submit(
             "tts-quickstart",
-            OmniRequest(
-                inputs={"text": args.text},
-                params={
-                    "task_type": "CustomVoice",
-                    "voice": "Ryan",
-                    "language": "English",
-                    "max_new_tokens": 1024,
-                },
-            ),
+            OmniRequest(inputs=inputs, params=params),
         )
         waveform = np.frombuffer(data["audio_waveform"], dtype=data["audio_waveform_dtype"])
         sample_rate = data["sample_rate"]

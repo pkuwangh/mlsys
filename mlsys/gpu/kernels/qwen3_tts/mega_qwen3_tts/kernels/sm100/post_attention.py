@@ -175,13 +175,14 @@ def gemm(
                     p.mbarrier_arrive(bars.subview(stage))
                 iket.range_pop()
         else:
-            for stage in range(2):
-                iket.range_push("operand_wait", stage)
-                wait_barrier(bars.subview(stage), 0)
-                iket.range_pop()
-                iket.range_push("mma_issue", stage)
-                p.tcgen05_fence(p.Tcgen05Fence.AFTER_THREAD_SYNC)
-                if tid == 128:
+            # Only the issuer follows reusable phases; a delayed reader warp can miss a full cycle.
+            if tid == 128:
+                for stage in range(2):
+                    iket.range_push("operand_wait", stage)
+                    wait_barrier(bars.subview(stage), 0)
+                    iket.range_pop()
+                    iket.range_push("mma_issue", stage)
+                    p.tcgen05_fence(p.Tcgen05Fence.AFTER_THREAD_SYNC)
                     da_base = descriptor(weights, stage * group * 4096)
                     db_base = descriptor(operands, stage * group * N * 64)
                     for slab in cutlass.range_constexpr(group):
@@ -190,15 +191,17 @@ def gemm(
                         for k in cutlass.range_constexpr(4):
                             mma(tmem, da + 2 * k, db + 2 * k, N, stage != 0 or slab != 0 or k != 0)
                     p.tcgen05_commit(mma_done)
-                iket.range_pop()
-                iket.range_push("mma_drain", stage)
-                wait_barrier(mma_done, stage)
-                iket.range_pop()
-                if cutlass.const_expr(MODE == "output"):  # noqa: SIM102
-                    if stage == 0 and rank == 3 and tid == 128:
-                        # Scheduling hint only: the norm still polls every
-                        # residual word. No payload ordering or release fence.
-                        p.store_ext(epoch.ir_value(), epochs.iterator.raw_ptr() + 96 + cluster, order="volatile")
+                    iket.range_pop()
+                    iket.range_push("mma_drain", stage)
+                    wait_barrier(mma_done, stage)
+                    iket.range_pop()
+                    if cutlass.const_expr(MODE == "output"):  # noqa: SIM102
+                        if stage == 0 and rank == 3:
+                            # Scheduling hint only: the norm still polls every
+                            # residual word. No payload ordering or release fence.
+                            p.store_ext(epoch.ir_value(), epochs.iterator.raw_ptr() + 96 + cluster, order="volatile")
+            p.barrier_cta_sync(barrier_id=2, thread_count=128)
+            p.tcgen05_fence(p.Tcgen05Fence.AFTER_THREAD_SYNC)
             load_accumulator(acc, tmem, tid - 128, N)
         p.barrier_cta_sync()
 

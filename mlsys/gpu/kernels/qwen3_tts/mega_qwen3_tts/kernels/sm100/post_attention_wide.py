@@ -196,14 +196,15 @@ def project(
             if tid == 0:
                 p.mbarrier_arrive(bar.subview(buffer))
     else:
-        for stage in cutlass.range_constexpr(stages):
-            buffer = stage % 2
-            iket.range_push("operand_wait", stage)
-            wait_barrier(bar.subview(buffer), (stage // 2) & 1)
-            iket.range_pop()
-            p.tcgen05_fence(p.Tcgen05Fence.AFTER_THREAD_SYNC)
-            iket.range_push("mma", stage)
-            if tid == 128:
+        # Keep phase tracking on the issuer so delayed reader warps cannot miss buffer reuse.
+        if tid == 128:
+            for stage in cutlass.range_constexpr(stages):
+                buffer = stage % 2
+                iket.range_push("operand_wait", stage)
+                wait_barrier(bar.subview(buffer), (stage // 2) & 1)
+                iket.range_pop()
+                p.tcgen05_fence(p.Tcgen05Fence.AFTER_THREAD_SYNC)
+                iket.range_push("mma", stage)
                 da_base = descriptor(weights, buffer * 128 * K)
                 db_base = descriptor(operands, buffer * N * K)
                 for slab in cutlass.range_constexpr(K // 64):
@@ -218,9 +219,11 @@ def project(
                 # Hardware releases the buffer; the next MMA need not wait for this one.
                 p.tcgen05_commit(free.subview(buffer))
 
-            iket.range_pop()
+                iket.range_pop()
 
-        wait_barrier(free.subview((stages - 1) % 2), ((stages - 1) // 2 + 1) & 1)
+            wait_barrier(free.subview((stages - 1) % 2), ((stages - 1) // 2 + 1) & 1)
+        p.barrier_cta_sync(barrier_id=2, thread_count=128)
+        p.tcgen05_fence(p.Tcgen05Fence.AFTER_THREAD_SYNC)
         load_accumulator(acc, tmem, N)
     p.barrier_cta_sync()
     iket.range_pop()
