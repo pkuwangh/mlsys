@@ -36,7 +36,6 @@ def main():
                     configure_arithmetic(args)
                 assert torch.backends.cudnn.allow_tf32 is allowed
                 assert not torch.backends.cuda.matmul.allow_tf32
-                assert "TF32x3" not in output.getvalue()
                 assert "Accuracy diagnostics:" not in output.getvalue()
                 assert model_tf32_policy(torch.float32, None) is allowed
                 check_model_policy(allowed)

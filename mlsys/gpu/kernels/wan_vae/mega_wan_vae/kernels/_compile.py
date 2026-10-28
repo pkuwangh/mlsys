@@ -16,7 +16,11 @@ _compile_seconds = 0.0
 
 
 def compile_cache(*, maxsize=None):
-    """Register an ordinary LRU executable cache for diagnostic snapshots."""
+    """Register an LRU cache; callers must use consistent argument forms/order.
+
+    No signature binding is added to the launch path. Precompile helpers use
+    the same explicit arguments as runtime calls.
+    """
 
     def decorate(function):
         @wraps(function)

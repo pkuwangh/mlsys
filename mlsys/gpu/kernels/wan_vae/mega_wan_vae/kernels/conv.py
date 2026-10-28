@@ -63,7 +63,8 @@ the wider channels use its vectorized reduction order.
 C12 BF16 input uses a 1CTA gather producer and seven K64 tiles over C16-padded
 activations and [160,448] weights. General convolutions use TMA im2col with
 27*ceil(Ci/64) reduction tiles for BF16. FP32 C12 input uses the general TMA
-path over zero-padded C16 input; FP32 reductions use 27*ceil(Ci/16) tiles.
+path over zero-padded C16 input for TF32, with 27*ceil(Ci/32) tiles;
+strict FP32 uses cuDNN on native C12.
 BF16 paths use two TMEM accumulators; epilogue warps
 drain them into 64B-swizzled SMEM for TMA stores. Halo/cache writers are
 disjoint from the epilogue's interior writers. A padded peer CTA must still
@@ -108,7 +109,7 @@ if __package__:
     from ._conv_config import needs_wide_index as _needs_wide_index
     from ._precision import pack_components, resolve_precision
     from ._scheduler import TileSchedule
-    from ._utils import PreparedConvInput, measure, measure_group, print_benchmark_table
+    from ._utils import PreparedConvInput, measure, measure_group, print_benchmark_table, round_tf32_reference
 else:
     from _compile import compile_cache, compile_kernel
     from _conv_config import (
@@ -123,7 +124,7 @@ else:
     from _conv_config import needs_wide_index as _needs_wide_index
     from _precision import pack_components, resolve_precision
     from _scheduler import TileSchedule
-    from _utils import PreparedConvInput, measure, measure_group, print_benchmark_table
+    from _utils import PreparedConvInput, measure, measure_group, print_benchmark_table, round_tf32_reference
 
 
 def _contiguous_tma_layout(
@@ -1851,7 +1852,7 @@ def _fake_geometry(wide_index: bool) -> tuple:
     return tuple(integer(value) for value in (1, 3, 3, 3))
 
 
-@compile_cache(maxsize=32)
+@compile_cache()
 def _compile_conv(config: ConvSpecialization, wide_index: bool = False) -> Callable:
     """Compile one channel/tile/index-width variant, independent of N/T/H/W."""
     return compile_kernel(
@@ -1864,7 +1865,7 @@ def _compile_conv(config: ConvSpecialization, wide_index: bool = False) -> Calla
     )
 
 
-@compile_cache(maxsize=32)
+@compile_cache()
 def _compile_prepared(
     config: ConvSpecialization,
     has_residual: bool = False,
@@ -1900,7 +1901,7 @@ def _compile_prepared(
     )
 
 
-@compile_cache(maxsize=32)
+@compile_cache()
 def _compile_spatial_residual(
     config: ConvSpecialization,
     has_residual_bias: bool = False,
@@ -2000,9 +2001,11 @@ class PreparedConv:
     Weights use the packed shape/layout for the selected arithmetic mode:
     K64-padded OTRSC for BF16, K32-padded rounded values for TF32, interleaved
     high/low K16 components for experimental TF32x3, and ordinary OTRSC for IEEE.
+    Packed weight tails must be zero; use the matching weight packer.
     TF32/TF32x3 activations are packed on every launch, including graph replay.
     The IEEE library path allocates fresh outputs on each eager call. During
     CUDA graph replay its captured allocations are reused by the graph.
+    Use the call return value for outputs across both backends.
     Outputs, caches, and residuals always use ordinary storage in the input dtype.
     """
 
@@ -2543,7 +2546,7 @@ class _InputLaunch:
         )
 
 
-@compile_cache(maxsize=32)
+@compile_cache()
 def compile_input(ctas: int = 148) -> Callable:
     """Compile the C12 gather pipeline; launch geometry is bounded by its binding."""
     if ctas <= 0:
@@ -2577,6 +2580,8 @@ class PreparedInputConv:
 
     Each launch reuses output; concurrent calls on different streams are not
     supported. The module wrapper creates a fresh binding/output per forward.
+    C16 input tails must be finite zeros, as produced by pack_history.
+    Weights must be zero-tailed pack_weight output.
     """
 
     def __init__(self, x: torch.Tensor, weight: torch.Tensor, cfg: InputConvConfig) -> None:
@@ -2618,7 +2623,8 @@ class WanInputConv3d(torch.nn.Module):
     """Inference-only C12->C160 convolution with policy-specific input packing.
 
     Strict FP32 consumes C12 directly through cuDNN. Tensor Core paths consume
-    C16 packed input. ``input_channels`` tells the caller which packing to use.
+    C16 packed input with finite zeros in channels 12:16 (use pack_history).
+    ``input_channels`` tells the caller which packing to use.
     """
 
     def __init__(self, weight: torch.Tensor, *, precision: str | None = None) -> None:
@@ -2943,25 +2949,20 @@ def _print_fusion_costs(results: list[tuple[str, tuple[float, float | None, floa
             print("-+-".join("-" * width for width in widths), flush=True)
 
 
-def _check_benchmark_convolution(actual: torch.Tensor, expected: torch.Tensor, precision: str) -> None:
-    """Check BF16/IEEE agreement; report TF32-vs-permitted-cuDNN as a diagnostic.
+def _benchmark_convolution_reference(x: torch.Tensor, weight: torch.Tensor, precision: str) -> torch.Tensor:
+    """Untimed oracle; TF32 uses independent operand rounding and strict convolution."""
+    if precision == "tf32":
+        x, weight = round_tf32_reference(x), round_tf32_reference(weight)
+    with torch.backends.cudnn.flags(allow_tf32=False):
+        return torch.nn.functional.conv3d(x, weight).permute(0, 2, 3, 4, 1)
 
-    cuDNN may use a different permitted algorithm when TF32 is allowed. The
-    independent rounded-operand oracle is exercised by check_arithmetic_modes.py.
-    """
+
+def _check_benchmark_convolution(actual: torch.Tensor, expected: torch.Tensor, precision: str) -> None:
+    """Fail the benchmark on mismatch against the selected arithmetic oracle."""
     if not bool(torch.isfinite(actual).all() & torch.isfinite(expected).all()):
         raise AssertionError("Nonfinite convolution benchmark output")
     atol, rtol = (0.02, 0.02) if precision == "bf16" else (1e-4, 1e-4)
-    if precision != "tf32":
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
-        return
-    close = torch.isclose(actual, expected, atol=atol, rtol=rtol).all()
-    max_abs = (actual - expected).abs().max().item()
-    print(
-        f"  {'PASS' if close else 'FAIL'} TF32 vs permitted cuDNN (elementwise diagnostic): "
-        f"atol={atol:g} rtol={rtol:g} max_abs={max_abs:.6e}",
-        flush=True,
-    )
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
 @torch.inference_mode()
@@ -2997,7 +2998,7 @@ def _benchmark_conv(cfg: ConvConfig, history: int, spatial: bool, *, residual_bi
     def torch_conv() -> torch.Tensor:
         return torch.nn.functional.conv3d(torch_x, weight).permute(0, 2, 3, 4, 1)
 
-    _check_benchmark_convolution(raw(), torch_conv(), cfg.precision)
+    _check_benchmark_convolution(raw(), _benchmark_convolution_reference(torch_x, weight, cfg.precision), cfg.precision)
     torch_results = [measure("conv", torch_conv, raw)]
     fusion_results = []
 
@@ -3114,7 +3115,7 @@ def benchmark_matched(model: str, shapes: list[tuple[int, ...]], histories: list
                 torch.manual_seed(44)
                 cfg = ConvConfig(n=n, t=frames + 2, h=h + 2, w=w + 2, ci=c, co=c, ctas=ctas, precision=precision)
                 _benchmark_conv(cfg, history, spatial=False, residual_bias=False)
-    print("\nMatched geometry benchmark: fusion checks PASS; TF32/cuDNN diagnostics reported separately", flush=True)
+    print("\nMatched geometry benchmark: convolution and fusion checks PASS", flush=True)
 
 
 @torch.inference_mode()
@@ -3138,7 +3139,7 @@ def _benchmark_input(cfg: InputConvConfig, precision: str = "bf16") -> None:
     def reference() -> torch.Tensor:
         return torch.nn.functional.conv3d(torch_x, weight).permute(0, 2, 3, 4, 1)
 
-    _check_benchmark_convolution(raw(), reference(), precision)
+    _check_benchmark_convolution(raw(), _benchmark_convolution_reference(torch_x, weight, precision), precision)
     print_benchmark_table([measure("input conv", reference, raw)])
 
 
@@ -3331,7 +3332,7 @@ def benchmark_production(model: str = "all", precision: str = "bf16") -> None:
         _benchmark_wan21(precision)
     if model in ("all", "wan22"):
         _benchmark_wan22(precision)
-    print("\nProduction benchmark: fusion checks PASS; TF32/cuDNN diagnostics reported separately", flush=True)
+    print("\nProduction benchmark: convolution and fusion checks PASS", flush=True)
 
 
 if __name__ == "__main__":

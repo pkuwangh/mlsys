@@ -27,6 +27,9 @@ stable throughout inference and CUDA graph replay. Both model constructors accep
 an optional `allow_tf32` argument that checks the framework setting. Model entry
 points reject subsequent policy mismatches because their remaining Torch layers
 also use that setting. They never change process-wide backend flags.
+Matmul/attention precision remains caller-controlled; set
+`torch.backends.cuda.matmul.allow_tf32 = False` for strict FP32 matmul, as the
+benchmarks do.
 
 Primitive `WanConv3d(weight, precision="ieee" | "tf32" | "bf16")` objects pin
 their policy at construction and remain independent of later backend changes.
@@ -100,7 +103,8 @@ model adapters handle causal caches and architecture-specific wiring.
 
 The custom convolutions target Blackwell B200 (SM100) and B300 (SM103).
 The full BF16/FP32/TF32 validation matrix uses B300, PyTorch 2.13.0+cu132 and
-the repository's CuTe DSL environment. B200 FP32 validation remains outstanding.
+the repository's CuTe DSL environment. Targeted B200 encoder checks cover all
+three policies; a complete B200 validation matrix remains outstanding.
 
 ## Running
 
@@ -119,24 +123,9 @@ python mlsys/gpu/kernels/wan_vae/mega_wan_vae/kernels/conv.py \
   --dtype fp32 --allow-tf32 --matched-shape 1 4 64 148 --history 0 2
 ```
 
-Run the complete two-model, two-operation, three-policy matrix with:
-
-```bash
-MODEL_ROOT="$PWD/models/Wan-AI" PYTHON=python \
-  bash mlsys/gpu/kernels/wan_vae/run-all.sh
-```
-
-Each invocation creates a new timestamped directory under `logs/`, with one
-stdout/stderr log per model/operation/policy and a `summary.tsv` containing exit
-statuses. Set `LOG_DIR` to choose a new destination. The runner completes the
-matrix even if a benchmark fails, then returns nonzero if any run failed.
-Set `OPERATION=encoder` or `OPERATION=decoder` to run only that half of the matrix.
-Set `POLICY=bf16`, `fp32` or `tf32` to restrict the arithmetic policy as well.
-
-For remote execution, use `./run_cute_dsl.py --node NODE SCRIPT ARGS` with an
-absolute checkpoint path. Add `--nsys` before the script and `--profile` after it
-to run and capture an extra forward per variant; encoder `--profile-mega-only`
-restricts capture to Mega. Multiple cases require Nsight's repeat capture mode.
+Add `--profile` to capture an extra forward per timed variant with Nsight;
+encoder `--profile-mega-only` restricts capture to Mega. Multiple cases require
+Nsight's repeat capture mode.
 
 The encoder can choose a batch from available memory and halve it after OOM,
 rerunning all variants and validation. Explicit `--batch-size` is never reduced.
@@ -157,6 +146,7 @@ all policies require 13 full forwards including validation. TF32 runs with
 `--accuracy-diagnostics` add one strict FP32 reference forward.
 Profiling and cache validation add untimed work only when requested.
 The summary reports Mega speedups versus Diffusers and compiled Torch.
+Synthetic encoder inputs use distinct spatial phases per batch element.
 
 `--no-torch-compile` disables only the Compiled baseline. Wan 2.1 encode/decode
 and Wan 2.2 decode still compile Mega's internal chunk implementations; Wan 2.2
@@ -207,7 +197,7 @@ Measured performance, the isolated compiled-reference failure, optional BF16
 cache discrepancy, recovered cuDNN workspace allocation warnings, and the
 tensor-operation sanitizer limitation
 are documented in [BENCHMARKS.md](BENCHMARKS.md).
-B200 FP32 capacity, reconstruction quality and serving-framework integration
+Full B200 coverage, reconstruction quality and serving-framework integration
 remain unvalidated.
 
 ## Tests
@@ -229,17 +219,17 @@ the normal CUDA/CuTe environment and a supported Blackwell GPU.
 | `check_conv_contracts.py` | GPU | Inference-only bindings, dtype/device validation, output ownership and streams |
 | `check_conv_outputs.py` | GPU | Bitwise BF16 prepared outputs and executable reuse; also run `--operation spatial` |
 | `check_pointwise_dtypes.py` | GPU | FP32 norm/residual/stage math, BF16/FP32 packing and dtype separation |
-| `check_dynamic_shapes.py` | GPU | BF16 pointwise/C12 geometry reuse, wide indexing and cache writes |
+| `check_dynamic_shapes.py` | GPU | Precompile reuse, BF16 pointwise/C12 geometry reuse, wide indexing and cache writes |
 | `check_kernels.py` | GPU | Wan 2.1 BF16 normalization and convolution smoke checks |
 | `check_tf32x3.py` | GPU, experimental | Compensated TF32x3 packing/convolution against strict FP32 |
-| `check_checkpoint.py --model CHECKPOINT` | GPU + either Wan checkpoint | BF16 encoder/decoder output agreement, fresh-cache repeatability and reference immutability |
+| `check_checkpoint.py --model CHECKPOINT` | GPU + either Wan checkpoint | BF16 encoder/decoder output agreement, fresh-cache repeatability and reference padding preservation |
 | `check_conv_memory.py --precision bf16` / `--precision tf32` | GPU + Compute Sanitizer | Small raw/fused/history/graph memory-check workload |
 | `repro_tma_peer_barrier.cu` | B300 + nvcc + Compute Sanitizer | Standalone reproducer for the tensor-operation instrumentation false positive |
 
 `check_pointwise_dtypes.py --large` adds full-buffer checks around and above
 2^31 elements and needs about 40 GiB of VRAM. The optional checkpoint case in
-`check_torch_layouts.py` uses N=16 at 480x832 to exercise the compiled layout
-regression. These heavier checks are explicit opt-ins.
+`check_torch_layouts.py` uses N=16 at 480x832 plus cached T=17 chunks to exercise
+the compiled layout regression. These heavier checks are explicit opt-ins.
 
 Run `check_conv_memory.py` under `compute-sanitizer --tool memcheck` for the
 ordinary memory checks. The C++ reproducer includes its build command; run its
@@ -270,6 +260,12 @@ Runtime modules never import benchmark references. Model adapters own causal
 cache ordering and stage wiring; kernel specializations depend on arithmetic,
 channels, layout, fusion, tiling, pipeline and index width.
 
+The eager/compiled Torch encoder reduces Wan 2.2 average-downsampling shortcuts
+directly through strided views. It avoids materializing the permuted input,
+skips padding when none is needed, and returns identity shortcuts directly.
+Grouping remains in channel/time/height/width order; uncommon groups that cross
+factor boundaries retain the general Torch formulation.
+
 General convolution, C12 input gathering, history packing, standalone preparation
 and stage shortcuts carry geometry at runtime. Changing supported batch,
 frame/spatial sizes, history length or input strides reuses executables when
@@ -277,6 +273,8 @@ capabilities are unchanged. CPU-visible metadata builds tensor maps and divisors
 without GPU synchronization. Addresses use 64 bits; coordinate ranges select
 narrow or wide variants. Each CUDA graph still captures particular geometry and
 buffers. Torch chunk compilation retains its separate static-shape policy.
+Executable caches retain encountered variants for the process lifetime. Precompile
+helpers cover common variants; warm the actual workload before CUDA graph capture.
 
 Wan 2.1 uses N96 tiles for C96 and N192 tiles for C192/C384. Its model adapters
 retain cuDNN at C384 because differing BF16 accumulation order can amplify in

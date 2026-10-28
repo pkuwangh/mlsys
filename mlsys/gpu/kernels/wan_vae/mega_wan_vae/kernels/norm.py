@@ -253,7 +253,7 @@ def compile_rmsnorm(
         assumed_align=2,
     )
     weight = make_fake_compact_tensor(storage_type(storage_dtype), (channels,), assumed_align=2)
-    # Keep the BF16 gamma multiply and bias addition separately rounded.
+    # Explicit BF16 casts preserve the affine-stage rounding boundaries.
     return compile_kernel(
         rmsnorm_host,
         tensor,
@@ -263,7 +263,7 @@ def compile_rmsnorm(
         make_fake_stream(),
         channels,
         has_bias,
-        options="--enable-tvm-ffi --ptxas-options=--fmad=false",
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1190,7 +1190,7 @@ def compile_conv_prep(
         contiguous_reduction,
         *padding,
         wide_index,
-        options="--enable-tvm-ffi --ptxas-options=--fmad=false",
+        options="--enable-tvm-ffi",
     )
 
 
@@ -1334,24 +1334,32 @@ def torch_reference(
     )
 
 
-def compile() -> None:
-    """Compile the live widths, post-attention reduction, and residual modes."""
-    compile_rmsnorm(640)
+def compile(storage_dtype: torch.dtype = torch.bfloat16) -> None:
+    """Precompile common encoder variants using the runtime cache keys."""
+    compile_rmsnorm(640, False, storage_dtype=storage_dtype)
     for channels in (160, 320, 640):
         for residual in (False, True):
             compile_conv_prep(
                 channels,
-                has_input_bias=True,
-                has_residual=residual,
+                False,
+                True,
+                True,
+                residual,
                 has_residual_bias=residual and channels != 160,
                 save_input=True,
+                storage_dtype=storage_dtype,
+                wide_index=False,
             )
     compile_conv_prep(
         640,
-        contiguous_reduction=True,
-        has_input_bias=True,
-        has_residual=True,
+        False,
+        True,
+        True,
+        True,
+        has_residual_bias=False,
         save_input=True,
+        storage_dtype=storage_dtype,
+        wide_index=False,
     )
 
 

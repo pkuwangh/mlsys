@@ -20,14 +20,8 @@ import torch.nn.functional as F
 from mega_wan_vae.kernels import conv, memory, norm, residual
 from mega_wan_vae.kernels._compile import compile_stats
 from mega_wan_vae.kernels._precision import pack_components
+from mega_wan_vae.kernels._utils import round_tf32_reference as round_tf32
 from mega_wan_vae.layers.fused import _conv_raw
-
-
-def round_tf32(x):
-    bits = x.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-    rounded = (bits + 4095 + ((bits >> 13) & 1)) & 0xFFFFE000
-    rounded = torch.where((bits & 0x7F800000) == 0x7F800000, bits, rounded)
-    return rounded.to(torch.int32).view(torch.float32)
 
 
 def reference(x, weight, policy):
@@ -166,6 +160,9 @@ def check_mode(policy, *, raw_only=False):
                     else:
                         assert actual.residual is None
             # Replay must observe updated source and history, not stale packed activations.
+            options = {"residual": skip, "residual_bias": rb}
+            bound = conv.prepare_next(x, module.weight, bias, gamma, cfg, previous, save_residual=True, **options)
+            bound()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 actual = bound()

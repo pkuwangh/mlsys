@@ -346,14 +346,15 @@ def make_synthetic_video(
     video = torch.empty(batch_size, channels, frames, height, width, device=device, dtype=dtype)
     y = torch.linspace(-1.0, 1.0, height).view(1, 1, height, 1)
     x = torch.linspace(-1.0, 1.0, width).view(1, 1, 1, width)
+    phase = (torch.arange(batch_size) * 0.61803398875).remainder(1).view(-1, 1, 1, 1)
     for index, t in enumerate(torch.linspace(0.0, 1.0, frames)):
         base = [
-            torch.sin(2.0 * math.pi * (x + t)).expand(1, 1, height, width),
-            torch.cos(2.0 * math.pi * (y - t)).expand(1, 1, height, width),
-            torch.sin(math.pi * (x + y + 0.5 * t)).expand(1, 1, height, width),
+            torch.sin(2.0 * math.pi * (x + t + phase)).expand(batch_size, 1, height, width),
+            torch.cos(2.0 * math.pi * (y - t + phase)).expand(batch_size, 1, height, width),
+            torch.sin(math.pi * (x + y + 0.5 * t + 2 * phase)).expand(batch_size, 1, height, width),
         ]
         while len(base) < channels:
-            base.append(torch.randn(1, 1, height, width, generator=generator))
+            base.append(torch.randn(batch_size, 1, height, width, generator=generator))
         frame = torch.cat(base[:channels], dim=1)
         noise = torch.randn(batch_size, channels, height, width, generator=generator)
         frame = (frame + 0.02 * noise).clamp_(-1.0, 1.0)

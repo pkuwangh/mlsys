@@ -1,4 +1,6 @@
 /output*
-
 /.work/
 /logs/
+/run*.sh
+/run*.py
+/panel-review.md

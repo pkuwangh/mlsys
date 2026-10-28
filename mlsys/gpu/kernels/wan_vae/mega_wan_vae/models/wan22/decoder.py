@@ -50,6 +50,8 @@ class Wan22Decoder(torch.nn.Module):
         if not self.fused_blocks:
             raise ValueError("No supported decoder blocks found")
         self.raw_decoder.decoder = _FusedDecoder(self.raw_decoder.decoder)
+        # Wan 2.2 passes the output gates with Inductor norms and division;
+        # keep those fusions instead of applying Wan 2.1's numerics workaround.
         self.chunk_decoder = torch.compile(
             self.raw_decoder.decoder,
             fullgraph=True,

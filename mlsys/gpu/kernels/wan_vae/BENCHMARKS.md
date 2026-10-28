@@ -3,15 +3,19 @@
 Current runtime contracts and commands are in [README.md](README.md). This file
 records the measured results and remaining validation limitations.
 
+Current Torch shortcut measurements are in
+[Torch average-downsampling baseline](#torch-average-downsampling-baseline).
+The complete B300 matrix below retains its recorded source snapshot.
+
 ## Complete validation matrix (2026-10-27)
 
-The recorded `run-all.sh` matrix covers all 12 model/operation/policy
+The recorded local benchmark matrix covers all 12 model/operation/policy
 combinations with exit status zero: **32 measured cases, all output gates passing**.
 The matrix covers Wan 2.1 and Wan 2.2 encoders/decoders in BF16, strict FP32 and
 FP32 with TF32 allowed. Local stdout/stderr logs are indexed in
 `logs/20261027-b300-cudnn-dispatch/summary.tsv`, with `environment.txt` and `source.sha256`
 alongside them. These generated artifacts are ignored by Git and are not included
-in a fresh checkout; use `run-all.sh` below to generate a new set.
+in a fresh checkout. Run the benchmark commands in README for new measurements.
 Validation uses the same-policy Diffusers reference. TF32's optional extra strict
 FP32 reference and elementwise diagnostics are disabled in this matrix; enable
 `--accuracy-diagnostics` for that additional check. The earlier baseline remains
@@ -22,11 +26,13 @@ CUDA 13.2, cuDNN 9.20. Local Diffusers checkpoints and deterministic synthetic
 video/latents were used. These are numerical and performance checks, not a
 natural-video quality evaluation. Each row is the median of three full forwards
 after compilation and warmup, including activation packing and normal launches.
+Only medians were retained; sample spread is unavailable for this matrix.
 Baselines and Mega use the same storage dtype, convolution permission, strict
 FP32 matmul, input and output geometry. Speedup is Compiled / Mega.
 
-Representative **T=17, 720x1280** results follow. Encoder batch sizes intentionally
-differ by arithmetic policy; compare implementations within a row. The full logs
+Representative **T=17, 720x1280** results follow (Torch baseline: `2978d0b`,
+before the shortcut rewrite; complete source hashes are in the log directory).
+Encoder batch sizes intentionally differ by arithmetic policy; compare implementations within a row. The full logs
 also cover 480x832 and longer encoder inputs, subject to the automatic batch cutoff.
 
 | Model/path | Policy | Batch | Mega ms | Diffusers ms | Compiled ms | Speedup |
@@ -54,6 +60,59 @@ BF16 uses `atol=0.25, rtol=0.001` for encoding and
 Additional coverage includes the large-batch compiled Wan 2.2 encoder and
 independent full-buffer packing, history, residual and initial-bias checks above
 2^31 elements in BF16/FP32.
+
+## Torch average-downsampling baseline
+
+The Torch encoder reduces average-downsampling groups directly through strided
+views, skips zero-width temporal padding, and returns identity shortcuts directly.
+It uses native `Tensor.mean`; no custom kernel is inserted into the Torch baseline.
+The independent Diffusers reference is unchanged. Eager Torch remains a validation
+reference in both benchmark scripts; routine timings cover Diffusers, Mega and
+Compiled. The dedicated `ab_encoder.py` experiment includes eager timing to
+isolate this optimization.
+
+Paired Wan 2.2 encoder measurements use **B200, 1000 W, T=17, 720x1280** on
+`umbriel-b200-094`, PyTorch 2.13.0+cu132 and cuDNN 9.20. Old and new wrappers share
+one checkpoint and input in the same process, with eight samples alternating
+forward/reverse variant order.
+The control is `raw_avg_down3d` from commit `2978d0b`; only that shortcut function
+changes between each pair. Compilation and validation are excluded, and no new
+graphs compile during timing. A negative latency change is an improvement.
+
+| Policy | Batch | Old eager ms | New eager ms | Change | Old Compiled ms | New Compiled ms | Change |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| BF16 | 16 | 2716.828 | 2613.354 | -3.81% | 1268.168 | 1276.459 | +0.65% |
+| FP32 / TF32 | 8 | 1787.222 | 1744.794 | -2.37% | 1098.488 | 1100.882 | +0.22% |
+| FP32 strict | 2 | 7566.208 | 7556.579 | -0.13% | 7380.608 | 7381.525 | +0.01% |
+
+This primarily benefits eager execution. Compiled does not gain full-model
+performance here; BF16 has a small measured slowdown, while TF32 and strict FP32
+remain close to their previous latency.
+
+All old/new eager and compiled outputs pass their existing same-policy Diffusers
+gates. The large-batch TF32 compiled layout regression (N=16, one cold frame,
+480x832) also passes. The regular encoder benchmark passes in all three policies;
+Wan 2.1 encoding and Wan 2.2 decoding pass the BF16 reporting smoke checks.
+The same B200 run also checks Mega at T=17, 720x1280 against Diffusers:
+
+| Policy | Batch | Mega ms | Compiled ms | Validation |
+|---|---:|---:|---:|---|
+| BF16 | 16 | 931.309 | 1285.894 | PASS |
+| FP32 / TF32 | 8 | 935.818 | 1097.849 | PASS |
+| FP32 strict | 2 | 7368.463 | 7385.249 | PASS |
+
+The largest isolated shortcut, input C/T/H/W=160/4/360/640, improves from
+27.986 to 4.107 ms in BF16 (N=16) and 11.721 to 1.525 ms in FP32 (N=8).
+Its isolated compiled latency is already small: 0.861 to 0.849 ms in BF16 and
+0.849 to 0.841 ms in FP32. Other shortcut geometries have different gains.
+Isolated compilation and full-model compilation have different fusion boundaries;
+these operator numbers should not be added to predict the full-model speedup.
+
+Local logs, all timing samples, the committed control function, reproducing
+scripts, environment and source hashes are in `logs/20261027-torch-avg-downsample/`,
+indexed by `summary.tsv`. The B300 full matrix above and operator profiles below
+predate this Torch-baseline update;
+they remain identified by their original source snapshots.
 
 ## FP32/TF32 performance analysis
 
@@ -244,10 +303,9 @@ disabled, prepared API and explicit separate post-ops timings agree within
 BF16 integrated fusion at the same geometry is 1.03–1.07x faster than separate
 post-ops across those channel widths.
 
-Reproduce the full-model matrix and the primitive checks separately:
+Use the README commands for full-model benchmarks. Primitive checks:
 
 ```bash
-MODEL_ROOT="$PWD/models/Wan-AI" PYTHON=python bash mlsys/gpu/kernels/wan_vae/run-all.sh
 python mlsys/gpu/kernels/wan_vae/tests/check_arithmetic_modes.py --wide-index
 python mlsys/gpu/kernels/wan_vae/tests/check_conv_contracts.py
 python mlsys/gpu/kernels/wan_vae/mega_wan_vae/kernels/conv.py \

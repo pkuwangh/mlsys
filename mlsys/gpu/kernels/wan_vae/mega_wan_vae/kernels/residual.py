@@ -191,7 +191,7 @@ def compile_bias_residual(
         pad_spatial,
         alignment,
         wide_index,
-        options="--enable-tvm-ffi --ptxas-options=--fmad=false",
+        options="--enable-tvm-ffi",
     )
 
 
@@ -528,7 +528,7 @@ def compile_stage(config: StageConfig, storage_dtype: torch.dtype = torch.bfloat
         tuple((cutlass.Int64 if config.wide_index else cutlass.Int32)(1) for _ in range(3)),
         make_fake_stream(),
         config,
-        options="--enable-tvm-ffi --ptxas-options=--fmad=false",
+        options="--enable-tvm-ffi",
     )
 
 
@@ -604,18 +604,26 @@ def torch_stage_add(
     return value + groups.mean(-1)
 
 
-def compile() -> None:
-    """Compile the encoder's residual widths and four stage shortcuts."""
+def compile(storage_dtype: torch.dtype = torch.bfloat16) -> None:
+    """Precompile common encoder residual variants using the runtime cache keys."""
     for c in (160, 320, 640):
-        compile_bias_residual(c)
-        compile_bias_residual(c, pad_spatial=True)
+        for pad_spatial in (False, True):
+            compile_bias_residual(
+                c,
+                True,
+                pad_spatial,
+                has_residual_bias=False,
+                alignment=16,
+                storage_dtype=storage_dtype,
+                wide_index=False,
+            )
     for ci, co, ft, fs in (
         (160, 160, 1, 2),
         (160, 320, 2, 2),
         (320, 640, 2, 2),
         (640, 640, 1, 1),
     ):
-        compile_stage(StageConfig(ci, co, ft, fs, fs == 1, fs == 1))
+        compile_stage(StageConfig(ci, co, ft, fs, fs == 1, fs == 1), storage_dtype=storage_dtype)
 
 
 @torch.inference_mode()

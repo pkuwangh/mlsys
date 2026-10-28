@@ -235,7 +235,7 @@ class _FusedResidualBlock(torch.nn.Module):
             custom_conv and conv1.out_channels in (96, 192)
         )
         self.custom_conv = custom_conv or self.fuse_conv
-        if norm2.bias != 0 or block.norm1.norm.bias != 0:
+        if any(isinstance(bias, torch.Tensor) or bias != 0 for bias in (norm2.bias, block.norm1.norm.bias)):
             raise ValueError("Expected Wan RMSNorm without affine bias")
         weights = (conv1.weight.detach(), conv2.weight.detach())
         if self.custom_conv:

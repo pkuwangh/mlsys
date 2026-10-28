@@ -124,11 +124,9 @@ def print_benchmark_table(results: list[BenchmarkResult], reference_name: str = 
             print("-+-".join("-" * width for width in widths), flush=True)
 
 
-def benchmark(label: str, reference: Callable, custom: Callable) -> None:
-    """Print a single paired result for the other standalone kernel families."""
-    result = measure(label, reference, custom)
-    print(
-        f"{label}: reference={result.reference_ms:.4f} ms custom={result.custom_ms:.4f} ms "
-        f"speedup={result.speedup:.3f}x",
-        flush=True,
-    )
+def round_tf32_reference(x: torch.Tensor) -> torch.Tensor:
+    """Independent integer rounding oracle for tests and untimed validation."""
+    bits = x.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    rounded = (bits + 4095 + ((bits >> 13) & 1)) & 0xFFFFE000
+    rounded = torch.where((bits & 0x7F800000) == 0x7F800000, bits, rounded)
+    return rounded.to(torch.int32).view(torch.float32)

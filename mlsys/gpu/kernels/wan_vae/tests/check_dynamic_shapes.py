@@ -13,6 +13,31 @@ from mega_wan_vae.kernels._compile import compile_family_stats, compile_stats
 
 
 @torch.inference_mode()
+def check_precompile_reuse():
+    for dtype in (torch.bfloat16, torch.float32):
+        norm.compile(dtype)
+        memory.compile(dtype)
+        residual.compile(dtype)
+        before = compile_stats().compiled
+        x = torch.randn(2, 1, 4, 6, 640, device="cuda", dtype=dtype)
+        bias = torch.randn(640, device="cuda", dtype=dtype)
+        norm.rmsnorm(x, bias)
+        norm.rmsnorm_silu_conv_prep(x, bias, input_bias=bias, residual=x, save_input=True)
+        memory.pack_history(x, bias=bias, padding=(0, 0, 0))
+        for pad in (False, True):
+            residual.bias_residual(x, x, bias, pad_spatial=pad)
+        residual.stage_add(x, x, 1, 1, bias, x)
+        for channels, vector in ((12, False), (48, False), (48, True)):
+            source = torch.randn(2, channels, 4, 6, 8, device="cuda", dtype=dtype)
+            if vector:
+                source = source.contiguous(memory_format=torch.channels_last_3d)
+            memory.pack_history(source, input_ncthw=True)
+        torch.cuda.synchronize()
+        assert compile_stats().compiled == before, "Precompiled variants missed the runtime executable cache"
+        print(f"{dtype}: precompile -> runtime reuse PASS", flush=True)
+
+
+@torch.inference_mode()
 def check_primitives():
     torch.manual_seed(51)
     for c in (96, 160, 192, 256, 320):
@@ -156,6 +181,7 @@ def check_input():
 
 if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = False
+    check_precompile_reuse()
     check_primitives()
     check_stage()
     check_input()

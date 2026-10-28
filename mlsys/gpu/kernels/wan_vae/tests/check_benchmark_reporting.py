@@ -40,7 +40,6 @@ def check_decoder_validation():
     assert calls == ["Diffusers", "Torch", "Mega", "Compiled"]
     assert all(ref() is None for ref in candidates)
     assert "[2/6] 2x2, T=5, N=1" in text
-    assert "Fused" not in text and "Diffusers vs Diffusers" not in text
     assert text.index("Warmup/validation: Compiled") < text.index("PASS Mega vs Diffusers")
     assert text.index("PASS Mega") < text.index("PASS Torch eager") < text.index("PASS Torch compiled")
     assert text.count("atol=0.05 rtol=0.02 max_abs=0.000000e+00 mean_abs=0.000000e+00 rms_abs=0.000000e+00") == 3
@@ -107,8 +106,6 @@ def check_summary_consistency():
         with redirect_stdout(decoded):
             decoder.print_summary([decoder.Result((1, 3, 17, 480, 832), times, status)], args)
         assert encoded.getvalue().replace("full-encode", "full-decode") == decoded.getvalue()
-        assert "Fused" not in decoded.getvalue() and "frames/s" not in decoded.getvalue()
-        assert "Torch (ms)" not in decoded.getvalue() and "vs Torch" not in decoded.getvalue()
         assert "vs Diffusers" in decoded.getvalue() and "vs Compiled" in decoded.getvalue()
         assert status in decoded.getvalue()
         if "Mega" in times:

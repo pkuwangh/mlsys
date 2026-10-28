@@ -165,7 +165,7 @@ def compile_initial_bias(channels: int, alignment: int, storage_dtype: torch.dty
         make_fake_stream(),
         channels,
         alignment,
-        options="--enable-tvm-ffi --ptxas-options=--fmad=false",
+        options="--enable-tvm-ffi",
     )
 
 
@@ -357,7 +357,7 @@ def compile_pack(config: PackConfig, storage_dtype: torch.dtype = torch.bfloat16
         tuple(cutlass.Int64(1) for _ in range(5)),
         make_fake_stream(),
         config,
-        options="--enable-tvm-ffi --ptxas-options=--fmad=false",
+        options="--enable-tvm-ffi",
     )
 
 
@@ -456,18 +456,18 @@ def pack_history(
     return PackedHistory(out, cache)
 
 
-def compile() -> None:
-    """Compile the live packing capabilities, independent of video geometry."""
+def compile(storage_dtype: torch.dtype = torch.bfloat16) -> None:
+    """Precompile common encoder packing variants using the runtime cache keys."""
     for channels in (320, 640):
         for alignment in (2, 16):
-            compile_initial_bias(channels, alignment)
+            compile_initial_bias(channels, alignment, storage_dtype=storage_dtype)
     for channels, ncthw, padding, vector in (
         (12, True, (2, 1, 1), 1),
         (48, True, (2, 1, 1), 1),
         (48, True, (2, 1, 1), 8),
         (320, False, (1, 0, 0), 8),
     ):
-        compile_pack(PackConfig(channels, padding, ncthw, not ncthw, vector))
+        compile_pack(PackConfig(channels, padding, ncthw, not ncthw, vector), storage_dtype=storage_dtype)
 
 
 @torch.inference_mode()

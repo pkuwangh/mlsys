@@ -115,10 +115,47 @@ def raw_spatial_resample(resample: torch.nn.Module, x: torch.Tensor) -> torch.Te
 
 
 def raw_avg_down3d(avg: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """Group shortcut values and reduce in channels-last storage."""
+    """Reduce shortcut groups directly from strided views."""
     pad_t = (avg.factor_t - x.shape[2] % avg.factor_t) % avg.factor_t
-    x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
+    if pad_t:
+        x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
     batch_size, channels, frames, height, width = x.shape
+    ft, fs = avg.factor_t, avg.factor_s
+    if avg.group_size == 1 and ft == fs == 1:
+        return x
+
+    # Flattening order is (channel, dt, dh, dw). A group that divides these
+    # axes can be reduced directly, keeping output-channel subgroups as views.
+    # Wan uses groups of 1, 2 or 4; retain the general grouping fallback below.
+    remaining = avg.group_size
+    reductions = []
+    for size in (fs, fs, ft, channels):
+        reduced = min(size, remaining)
+        if size % reduced or remaining % reduced:
+            break
+        reductions.append(reduced)
+        remaining //= reduced
+    if len(reductions) == 4 and remaining == 1:
+        rw, rh, rt, rc = reductions
+        grouped = x.reshape(
+            batch_size,
+            channels // rc,
+            rc,
+            frames // ft,
+            ft // rt,
+            rt,
+            height // fs,
+            fs // rh,
+            rh,
+            width // fs,
+            fs // rw,
+            rw,
+        ).permute(0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11)
+        pooled = grouped.mean(dim=(8, 9, 10, 11))
+        return pooled.reshape(batch_size, frames // ft, height // fs, width // fs, avg.out_channels).permute(
+            0, 4, 1, 2, 3
+        )
+
     x = x.permute(0, 2, 3, 4, 1).reshape(
         batch_size,
         frames // avg.factor_t,
