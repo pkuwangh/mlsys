@@ -1,5 +1,8 @@
-nvbandwidth/build/
-cuda-demos/build/
-matmul/build/
 bin/
-log
+
+/nvbandwidth/build/
+/cuda-demos/build/
+/matmul/build/
+
+/wheels/
+
