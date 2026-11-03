@@ -89,7 +89,9 @@ def check_device_offsets():
         result = torch.empty(len(coordinates), dtype=torch.int64, device="cuda")
         operands = from_dlpack(values), from_dlpack(result)
         stream = driver.CUstream(torch.cuda.current_stream().cuda_stream)
-        executable = cute.compile(launch, *operands, stream, options="--enable-tvm-ffi")
+        executable = cute.compile(
+            launch, *operands, stream, options="--enable-tvm-ffi --divmod-semantics=python"
+        )
         executable(values, result, stream)
         assert result.cpu().tolist() == expected
     print("Production 64-bit offset arithmetic with narrow/wide coordinates: PASS")

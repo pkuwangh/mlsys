@@ -25,7 +25,7 @@ source source_me_install_deps.sh
 # install vllm
 # python install
 uv pip freeze | grep -E '^(torch|torchvision|torchaudio)==' | tee /tmp/vllm-torch-overrides.txt
-VLLM_USE_PRECOMPILED=1 uv pip install -e '.[bench]' --override /tmp/vllm-torch-overrides.txt
+VLLM_USE_PRECOMPILED=1 uv pip install -e '.[bench]' --config-settings editable_mode=compat --override /tmp/vllm-torch-overrides.txt
 
 # vllm full build
 uv pip install -r requirements/build.txt

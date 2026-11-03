@@ -321,7 +321,7 @@ def stage_add_kernel(
             j = c * GROUP + g
             ci = j // FACTOR
             q = j % FACTOR
-            ti = t * FT + q // (FS * FS) - ((FT - T % FT) % FT)
+            ti = t * FT + q // (FS * FS) - ((-T) % FT)
             hi = h * FS + q // FS % FS
             wi = w * FS + q % FS
             if ti >= 0:
@@ -376,7 +376,7 @@ def stage_add_vector(
             total = cutlass.vector.full((8 // RATIO,), 0, cutlass.Float32)
             for g in cutlass.range_constexpr(GROUP):
                 q = part * GROUP + g
-                ti = t * FT + q // (FS * FS) - ((FT - T % FT) % FT)
+                ti = t * FT + q // (FS * FS) - ((-T) % FT)
                 hi = h * FS + q // FS % FS
                 wi = w * FS + q % FS
                 if ti >= 0:
@@ -652,7 +652,7 @@ def verify() -> None:
         (320, 640, 2, 2),
         (640, 640, 1, 1),
     ):
-        for t in (1, 2, 4):
+        for t in (1, 2, 3, 4):
             skip = torch.randn(2, t, 8, 6, ci, device="cuda", dtype=torch.bfloat16)
             x = torch.randn(
                 2,

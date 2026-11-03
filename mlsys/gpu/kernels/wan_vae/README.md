@@ -108,7 +108,9 @@ three policies; a complete B200 validation matrix remains outstanding.
 
 ## Running
 
-From the repository root, use the existing GPU-enabled PyTorch/CuTe DSL environment:
+Use a GPU-enabled PyTorch/CuTe DSL environment supporting
+`--divmod-semantics=python` (validated with CUTLASS DSL 4.9.0a0).
+From the repository root:
 
 ```bash
 python mlsys/gpu/kernels/wan_vae/bench_wan_vae_encoder.py \

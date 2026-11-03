@@ -47,6 +47,8 @@ def compile_kernel(*args, **kwargs):
     """Time a successful CuTe compilation without intercepting global DSL APIs."""
     from cutlass import cute
 
+    # Opt in to Python division/remainder semantics before the DSL default changes.
+    kwargs["options"] = f'{kwargs.get("options", "")} --divmod-semantics=python'.strip()
     global _compiled, _compile_seconds
     start = perf_counter()
     executable = cute.compile(*args, **kwargs)

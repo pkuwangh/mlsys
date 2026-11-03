@@ -17,7 +17,7 @@ from torch._dynamo import utils
 
 def check_cute_accounting():
     # Use an isolated registry and a fake compiler: no DSL import or GPU work.
-    fake_cute = SimpleNamespace(compile=lambda value: ("executable", value))
+    fake_cute = SimpleNamespace(compile=lambda value, **kwargs: ("executable", value))
     with (
         patch.object(_compile, "_caches", []),
         patch.object(_compile, "_compiled", 0),

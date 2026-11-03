@@ -1269,11 +1269,13 @@ def kernel(
                                 scalar,
                             )
                         if cutlass.const_expr(residual is not None):
-                            # N96 benefits from full-sector residual transactions.
+                            # N96/N192 benefit from full-sector BF16 residual transactions.
                             # Exchange adjacent-lane BF16 pairs to move four values
                             # per lane; preserve the TMEM/reduction lane mapping.
-                            # Wider tiles retain the cheaper pairwise instruction path.
-                            if cutlass.const_expr(mma_tiler[1] == 96 and not fp32):
+                            # C192 without a saved residual retains the pairwise path.
+                            if cutlass.const_expr(
+                                not fp32 and (mma_tiler[1] == 96 or (mma_tiler[1] == 192 and prep_residual is not None))
+                            ):
                                 skip_row = row_base + lane // 4 + drain_half * 8
                                 skip_pixel = cutlass.Int64(m_off_cta) + skip_row
                                 if skip_pixel < PREP_SHAPE[0] * Z_out * P_out * Q_out:
