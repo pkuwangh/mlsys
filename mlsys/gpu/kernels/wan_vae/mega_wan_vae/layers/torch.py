@@ -46,8 +46,54 @@ from .._utils import (
 CACHE_T = 2
 
 
+def use_first_frame_shortcut(conv: torch.nn.Conv3d) -> bool:
+    """Elide zero temporal planes where BF16 accumulation preserves model accuracy."""
+    return conv.weight.dtype != torch.bfloat16 or (
+        conv.out_channels < 512 and (conv.in_channels, conv.out_channels) != (16, 384)
+    )
+
+
+def spatial_convolution(image, weight, bias=None, stride=(1, 1), padding=(0, 0), dilation=(1, 1), groups=1):
+    """Use one-plane native Conv3D for strict FP32 to avoid Conv2D FFT workspaces."""
+    if (
+        image.dtype == weight.dtype == torch.float32
+        and not torch.is_autocast_enabled("cuda")
+        and not torch.backends.cudnn.allow_tf32
+    ):
+        return (
+            F.conv3d(
+                image.unsqueeze(2).contiguous(),
+                weight.unsqueeze(2).contiguous(),
+                bias,
+                (1, *stride),
+                (0, *padding),
+                (1, *dilation),
+                groups,
+            )
+            .squeeze(2)
+            .contiguous(memory_format=torch.channels_last)
+        )
+    return F.conv2d(image, weight, bias, stride, padding, dilation, groups)
+
+
 def raw_causal_conv3d(conv: torch.nn.Conv3d, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
     padding = list(conv._padding)
+    # The first causal chunk contains only the current temporal plane. Reduce
+    # native convolution to its last filter plane, as the serving path does.
+    if (
+        x.shape[2] == 1
+        and cache_x is None
+        and use_first_frame_shortcut(conv)
+        and conv.kernel_size[0] == 3
+        and conv.stride[0] == conv.dilation[0] == 1
+        and conv.padding[0] == 0
+        and padding[4:] == [2, 0]
+    ):
+        image = F.pad(x[:, :, 0], padding[:4]).contiguous(memory_format=torch.channels_last)
+        weight = conv.weight[:, :, 2].contiguous(memory_format=torch.channels_last)
+        return spatial_convolution(
+            image, weight, conv.bias, conv.stride[1:], conv.padding[1:], conv.dilation[1:], conv.groups
+        ).unsqueeze(2)
     if cache_x is not None and padding[4] > 0:
         cache_x = cache_x.to(x.device)
         x = torch.cat([cache_x, x], dim=2)
@@ -94,7 +140,7 @@ def raw_rms_norm(norm: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 def raw_conv2d(conv: torch.nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
-    return F.conv2d(x, conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
+    return spatial_convolution(x, conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
 
 
 def raw_spatial_resample(resample: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:

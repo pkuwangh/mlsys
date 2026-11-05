@@ -18,9 +18,22 @@ BF16 remains the default. FP32 storage supports both framework convolution polic
 
 | Storage | `torch.backends.cudnn.allow_tf32` | Convolution and post-ops |
 |---|---|---|
-| BF16 | Either | BF16 Tensor Core kernels and fusion |
+| BF16 | Either | BF16 Tensor Core kernels and fusion; native Conv2D for initial C96/C192/C256 chunks |
 | FP32 | `False` | Strict cuDNN convolution followed by separate fused post-ops |
-| FP32 | `True` | Ordinary single-product TF32 kernels with selected fusion; cuDNN plus post-ops for Wan 2.2 C256 decoder convolutions |
+| FP32 | `True` | TF32 kernels with selected fusion; fused C160 normalization, separate C160 residual/C320 preparation, and native cuDNN plus post-ops at Wan 2.2 C256/C640 |
+
+Native BF16 convolutions with 512 or more output channels and Wan 2.1 latent
+input (C16→C384) retain Conv3D: first-frame Conv2D rounding errors amplify
+through the decoder. BF16 decoder compilation preserves normalization roundings.
+
+First-frame native convolutions omit the two zero temporal planes. TF32 uses
+this Conv2D path at all residual widths; BF16 keeps custom first-frame fusion
+at C160/C320/C640. Wan 2.1 C384 uses custom TF32 and native BF16 convolution.
+Strict FP32 runs spatial convolutions, including first-frame shortcuts, as
+one-plane native Conv3D with channels-first operands and channels-last output.
+This avoids the oversized Conv2D FFT workspaces without width-specific rules.
+Decoder preparation spans residual blocks within each stage.
+The Torch reference shares these first-frame policies.
 
 Configure the framework policy **before constructing** a full model and keep it
 stable throughout inference and CUDA graph replay. Both model constructors accept
@@ -139,12 +152,13 @@ rounding; retained fractional batches below one run with batch one.
 Use equal explicit batches for comparisons between GPUs. Compilation, warmup,
 input generation and validation are excluded from timings. Peak additional
 allocation excludes resident weights and retained compilation buffers; it is
-not total process VRAM. Validation also warms up each implementation; the default
-then runs only the requested timing samples, reported in the final summary.
+not total process VRAM. Each timed implementation runs two untimed forwards
+immediately before its consecutive samples, avoiding power/clock-state bias
+from switching implementations.
 The decoder defaults to 17 output frames. Both benchmarks time Diffusers, compiled
 Torch and Mega, with three samples each by default. Eager Torch runs only for
 validation and optional cache diagnostics. With the default variants and repeats,
-all policies require 13 full forwards including validation. TF32 runs with
+all policies require 19 full forwards including validation and warmup. TF32 runs with
 `--accuracy-diagnostics` add one strict FP32 reference forward.
 Profiling and cache validation add untimed work only when requested.
 The summary reports Mega speedups versus Diffusers and compiled Torch.
@@ -199,8 +213,9 @@ Measured performance, the isolated compiled-reference failure, optional BF16
 cache discrepancy, recovered cuDNN workspace allocation warnings, and the
 tensor-operation sanitizer limitation
 are documented in [BENCHMARKS.md](BENCHMARKS.md).
-Full B200 coverage, reconstruction quality and serving-framework integration
-remain unvalidated.
+The current B300 standalone/library/Omni measurements and BF16 real-pipeline
+quality evaluation are indexed in BENCHMARKS.md. Full B200 coverage and SGLang
+serving validation remain separate follow-ups.
 
 ## Tests
 
@@ -279,10 +294,11 @@ Executable caches retain encountered variants for the process lifetime. Precompi
 helpers cover common variants; warm the actual workload before CUDA graph capture.
 
 Wan 2.1 uses N96 tiles for C96 and N192 tiles for C192/C384. Its model adapters
-retain cuDNN at C384 because differing BF16 accumulation order can amplify in
-posterior outputs; primitive C384 remains available for experiments. Supported
+retain native cuDNN at C384 for BF16 because accumulation differences amplify
+in posterior outputs; TF32 uses the custom C384 convolution. Supported
 stages fuse conv1 preparation, conv2 residual/next-input preparation, and final
-spatial padding or head preparation. Fused and separate entry points remain
+spatial padding. Output heads prepare their input separately from the last residual block.
+Fused and separate entry points remain
 available; measured benefit should determine upstream dispatch.
 
 ## FP32/TF32 performance and next steps
@@ -309,15 +325,13 @@ Further performance work should target:
 2. Improving C256 TF32 convolution throughput before selecting integrated fusion
    there again. Compare the complete convolution/post-op path, including packing,
    against cuDNN; a fusion-only microbenchmark does not establish an end-to-end win.
-3. Measuring the dispatch choices on B200 and serving workloads, including
-   reconstruction quality. Current performance evidence is from B300.
+3. Extending the dispatch and quality validation to B200 and SGLang. The current
+   B300 evidence includes the public cuDNN demo and vLLM-Omni serving workloads.
 
 ## Upstream integration
 
-The next work is to port reusable arithmetic/validation/compilation contracts
-into cuDNN's existing `conv3d_postops` API and validate dispatch and performance
-on its supported GPUs and serving shapes. The isolated compiler-reference and
-sanitizer findings have local standalone reproducers for upstream investigation.
-Keep Wan-specific cache/model wiring in framework adapters. vLLM-Omni and SGLang
-integration needs their own tests, serving-shape benchmarks and reconstruction-quality
-checks.
+The reusable library implementation lives in
+[cuDNN `conv3d_postops`](../../backends/cudnn-frontend/python/cudnn/conv/cutedsl/conv3d_postops).
+Wan-specific cache ordering and model wiring remain in the framework adapters.
+The vLLM-Omni submodule provides an opt-in `cudnn` encoder/decoder fast path;
+SGLang integration still needs its own serving and reconstruction-quality checks.

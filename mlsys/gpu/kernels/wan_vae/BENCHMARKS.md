@@ -7,6 +7,108 @@ Current Torch shortcut measurements are in
 [Torch average-downsampling baseline](#torch-average-downsampling-baseline).
 The complete B300 matrix below retains its recorded source snapshot.
 
+## Current audited capture (2026-11-04)
+
+The complete fresh sweep is in `logs/20261104-audit/`, with twelve successful
+model/operation/precision logs, `summary.tsv`, environment and source hashes.
+The local cross-integration report is `tmp/wan_vae_audit/RESULTS.md`; it retains
+matched standalone/library/Omni results, kernel benchmarks, startup/memory,
+real-pipeline quality, profiles and reproduction commands.
+
+Strict spatial convolutions now use one-plane native Conv3D with contiguous
+operands to avoid the observed 73–131 GiB Conv2D FFT workspaces. Temporal
+convolutions retain their layout. The special decoder output-head preparation
+path is removed; ordinary head preparation follows the last residual block.
+The policy is shared by all three callers and remains outside the library API.
+Wan 2.1 strict N1/T17/720p standalone warm extra allocation is about 23.4 GiB,
+below the historical 24.7 GiB and the regressed 73.1 GiB. Wan 2.2 returns to
+18.5 GiB. Original Diffusers workspace retries remain visible in the logs.
+
+Timings are three consecutive full-forward CUDA-event samples after two
+own-implementation warmups. Same-GPU controls found predecessor power-state
+bias in the earlier interleaved schedule. The current capture uses a 1100 W
+B300, Torch 2.13.0+cu132, cuDNN 9.20 and CUTLASS DSL 4.9.0a0; older captures
+also differ in GPU and source, so their latency differences are not code-only
+speedups. Setup, validation and compilation are excluded.
+
+Representative T=17, 720×1280 results follow. Encoder batches differ by policy;
+speedup is Compiled/Mega. The compiled standalone reference shares the native
+spatial policy. Strict FP32 remains native-convolution dominated and near parity;
+original channels-first Omni can be faster on small strict workloads. The uniform
+spatial policy costs 15–19% for Wan 2.1 single-frame decoding versus the earlier
+C384-only workaround, but under 1% for the measured 17-frame controls. Those
+tradeoffs are retained in the local report without adding shape exceptions.
+The ordinary head costs 3.01% in the same-GPU Wan 2.1 BF16 T17/480p source
+control and 1.77% for Wan 2.2 T17/720p; the BF16 encoder controls show
+unchanged memory and no regression.
+
+| Model/path | Policy | Batch | Mega ms | Diffusers ms | Compiled ms | Speedup |
+|---|---|---:|---:|---:|---:|---:|
+| Wan 2.1 decoder | bf16 | 1 | 181.109 | 521.160 | 202.504 | 1.118x |
+| Wan 2.1 decoder | fp32 | 1 | 9697.759 | 10498.536 | 9723.666 | 1.003x |
+| Wan 2.1 decoder | tf32 | 1 | 324.734 | 669.532 | 366.828 | 1.130x |
+| Wan 2.1 encoder | bf16 | 16 | 1890.548 | 5362.350 | 2221.594 | 1.175x |
+| Wan 2.1 encoder | fp32 | 2 | 11274.900 | 12196.870 | 11308.836 | 1.003x |
+| Wan 2.1 encoder | tf32 | 8 | 1605.111 | 3226.037 | 1826.697 | 1.138x |
+| Wan 2.2 decoder | bf16 | 1 | 236.384 | 512.586 | 240.291 | 1.017x |
+| Wan 2.2 decoder | fp32 | 1 | 11471.498 | 12172.501 | 11485.446 | 1.001x |
+| Wan 2.2 decoder | tf32 | 1 | 425.082 | 719.448 | 434.224 | 1.022x |
+| Wan 2.2 encoder | bf16 | 16 | 885.222 | 2578.086 | 1150.922 | 1.300x |
+| Wan 2.2 encoder | fp32 | 2 | 6764.671 | 7312.531 | 6759.850 | 0.999x |
+| Wan 2.2 encoder | tf32 | 8 | 822.195 | 1693.398 | 975.105 | 1.186x |
+
+## Earlier TF32 attribution and C384-only workspace fix (2026-11-04)
+
+This section records the earlier November 4 revision, before the uniform strict
+spatial policy, decoder-head simplification and timing correction. Its source
+controls and measurements are retained below.
+
+Matched source controls on one 1100 W B300 compare pre-refresh commit `6452c34`
+with that earlier November 4 implementation under the same installed environment. At
+720x1280, T=17, N=8, TF32 encoder latency improves **894.751→842.113 ms**
+for Wan 2.2 and **1711.330→1643.609 ms** for Wan 2.1 (seven-sample medians).
+
+For Wan 2.2, reverting only the C160 norm-fusion register tuning costs 22.48 ms;
+the tuning removes measured register spills. Restoring the old prepared blocks
+with current register budgets costs 29.88 ms. That group includes first-frame
+shortcuts, separate C320/residual preparation and native C640 dispatch. The C640
+control alone costs 7.79 ms at N=8, but does not establish a win at N=1. For Wan
+2.1, first-frame shortcuts save 47.91 ms and the custom C384/preparation path
+saves a further 19.81 ms. These compare Mega revisions; the first-frame shortcut
+also benefits the compiled Torch reference.
+
+Wan 2.1's strict-FP32 memory regression comes from a native C384→C384 Conv2D
+FFT plan at 90x160: one convolution needs 72.82 GiB of extra workspace. Keeping
+the last temporal filter plane as a one-plane Conv3D selects implicit SGEMM,
+using 0.026 GiB and 2.024 ms instead of 54.863 ms. This caller policy is shared
+by standalone, the cuDNN e2e demo and Omni; BF16 and TF32 retain their paths.
+The matched standalone N=1/T=17/720p control improves **10140.555→9619.708 ms**
+and **73.122→24.716 GiB** peak additional allocation. Strict output checks pass.
+The uniform C384 policy costs 2.98 ms (3.6%) for single-frame 480x832 decoding;
+the corresponding 17-frame difference is 0.075%.
+
+The local report `tmp/wan_vae_followup/RESULTS.md` retains ablations, decoder
+measurements, profiles, raw samples, startup/memory data and reproduction
+instructions. Its TF32 controls include an allocator refill in the first sample;
+uniformly excluding that sample changes every median by less than 0.7%.
+These controls isolate source changes; the older October captures also differ
+in software and physical GPU. That revision’s strict-FP32 benchmark logs are in
+`logs/20261104-strict-fp32/`; BF16/TF32 matrix logs remain in
+`logs/20261103-refresh/` with their recorded source snapshot.
+
+The new strict capture passes all six cases across four model/operation jobs.
+Compared with the November 3 logs, Wan 2.1 at 720p/T=17 changes as follows:
+
+| Operation | Batch | Before / earlier Nov 4 Mega ms | Before / earlier Nov 4 Mega extra GiB | Before / earlier Nov 4 Compiled extra GiB |
+|---|---:|---:|---:|---:|
+| Encoder | 2 | 11765.659 / 11138.247 | 78.121 / 29.592 | 78.032 / 45.478 |
+| Decoder | 1 | 10148.005 / 9628.189 | 73.126 / 24.716 | 73.108 / 37.636 |
+
+These two log captures use different physical B300s; the matched controls above
+isolate the source effect. Wan 2.2 peak allocations are unchanged. Its Diffusers
+decoder still retries after the existing oversized workspace warning and then
+passes; the original warning remains in the captured log.
+
 ## Complete validation matrix (2026-10-27)
 
 The recorded local benchmark matrix covers all 12 model/operation/policy
@@ -248,7 +350,7 @@ residuals and the independent TF32 rounding contract.
 
 ## Validation limitations
 
-Wan 2.2 strict FP32 decoding completes at N=1, T=17, 720x1280. Its oversized
+Wan 2.2 strict FP32 decoding completes at N=1, T=17, 720x1280. The original Diffusers reference’s oversized
 cuDNN workspace allocation attempt can still print an OOM warning, but the plan
 selection recovers; it is not a failed benchmark. Strict FP32 remains slow and
 near Compiled latency. Wan 2.2 TF32 decoding has a modest measured benefit
@@ -259,8 +361,11 @@ Optional intermediate-cache validation is not part of the default matrix.
 Wan 2.2 BF16 intermediate caches can exceed `atol=0.05, rtol=0.02` despite passing
 final-output checks. Independent FP32 probes indicate BF16 rounding and
 cancellation differences; the cache diagnostic continues to report these failures.
-Reconstruction PSNR, B200 FP32 capacity and serving-framework integration have
-not been established.
+The current B300 Omni integration and BF16 real-pipeline quality evaluation
+are recorded in `tmp/wan_vae_audit/RESULTS.md`. Approximate Wan 2.2 image
+conditioning changes the generated trajectory; retain lossless encoding for the
+validated decoder-only configuration. Full B200 FP32 capacity and SGLang serving
+validation remain outside this capture.
 
 ## Primitive validation and matched convolution measurements
 

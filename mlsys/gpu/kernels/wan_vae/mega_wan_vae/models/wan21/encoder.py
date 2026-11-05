@@ -2,9 +2,9 @@
 
 import torch
 
-from ...layers.fused import _FusedMidBlock, _FusedResidualBlock
+from ...layers.fused import _FusedMidBlock, _FusedResidualBlock, compile_preserving_norms
 from ...layers.torch import RawWanResample, RawWanResidualBlock, TorchWanVaeEncoder
-from ._common import _CUSTOM_CONV_CHANNELS, _compile
+from ._common import _custom_channels
 
 
 class _EncoderResidual(_FusedResidualBlock):
@@ -61,7 +61,7 @@ class Wan21Encoder(torch.nn.Module):
         stages = []
         residuals = []
         for block in encoder.down_blocks:
-            if isinstance(block, RawWanResidualBlock) and block.conv1.conv.out_channels in _CUSTOM_CONV_CHANNELS:
+            if isinstance(block, RawWanResidualBlock) and block.conv1.conv.out_channels in _custom_channels(vae.dtype):
                 residuals.append(block)
                 continue
             if residuals:
@@ -74,8 +74,8 @@ class Wan21Encoder(torch.nn.Module):
         if residuals:
             stages.append(_EncoderResidualStage(residuals))
         encoder.down_blocks = torch.nn.ModuleList(stages)
-        encoder.mid_block = _FusedMidBlock(encoder.mid_block)
-        self.chunk_encoder = _compile(encoder)
+        encoder.mid_block = _FusedMidBlock(encoder.mid_block, custom_conv=384 in _custom_channels(vae.dtype))
+        self.chunk_encoder = compile_preserving_norms(encoder)
 
     def new_cache(self):
         return self.runtime.new_cache()

@@ -8,6 +8,7 @@ the comparison changes convolution permission alone.
 import argparse
 import math
 import os
+import statistics
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -29,6 +30,33 @@ def auto_batch_divisor(dtype: str, allow_tf32: bool) -> int:
     if dtype != "fp32":
         return 1
     return FP32_BATCH_DIVISOR * (1 if allow_tf32 else STRICT_FP32_EXTRA_BATCH_DIVISOR)
+
+
+def median_timings(paths: dict[str, Callable[[], torch.Tensor]], repeats: int) -> dict[str, float]:
+    """Warm each implementation before consecutive full-forward timing samples."""
+    samples = {name: [] for name in paths}
+    peaks = {name: 0 for name in paths}
+    for name, call in paths.items():
+        # Switching implementations changes the GPU's power/clock state.
+        for _ in range(2):
+            call()
+        torch.cuda.synchronize()
+        for _ in range(repeats):
+            live_bytes = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+            start.record()
+            output = call()
+            end.record()
+            end.synchronize()
+            samples[name].append(start.elapsed_time(end))
+            peaks[name] = max(peaks[name], torch.cuda.max_memory_allocated() - live_bytes)
+            del output
+    print(
+        "  Peak additional allocated GiB: " + " | ".join(f"{name}={size / 2**30:.3f}" for name, size in peaks.items()),
+        flush=True,
+    )
+    return {name: statistics.median(values) for name, values in samples.items()}
 
 
 # Result reporting

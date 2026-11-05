@@ -168,6 +168,9 @@ class LaunchPolicy:
             if fuse_norm and config.co == 320:
                 ab, c, auxiliary = 6, 4, 6
             budgets = ((80, 104, 32) if config.co == 320 else (96, 104, 64)) if fuse_norm else (0, 0, 0)
+            if config.precision == "tf32" and fuse_norm and config.co == 160 and not has_residual:
+                # C160 normalization spills at 104 registers; 144 removes that traffic.
+                budgets = (128, 144, 64)
             return cls(epilogue, 2, auxiliary, ab, c, *budgets)
         # Preserve the measured C192 budget: 512*104 + 128*64 == 640*96.
         budgets = (96, 104, 64) if fuse_norm and config.co == 192 else (0, 0, 0)

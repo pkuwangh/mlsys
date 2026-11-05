@@ -16,10 +16,12 @@ from ..kernels.memory import pack_history
 from ..kernels.norm import rmsnorm, rmsnorm_silu_conv_prep
 from .torch import (
     RawWanResidualBlock,
+    RawWanRMSNorm,
     raw_cached_causal_conv3d,
-    raw_canonicalize_cache,
     raw_conv2d,
     raw_dup_up3d,
+    spatial_convolution,
+    use_first_frame_shortcut,
 )
 
 
@@ -48,6 +50,27 @@ class _FusedRMSNorm(torch.nn.Module):
     def forward(self, x):
         bias = self.norm.bias
         return _rmsnorm(x, self.norm.gamma.reshape(-1), bias.reshape(-1) if isinstance(bias, torch.Tensor) else None)
+
+
+def compile_preserving_norms(module):
+    """Compile chunks with stable normalization reductions and BF16 rounding."""
+
+    # Inductor's reduction tree and approximate division can cross BF16 ties.
+    # Keep the remaining attention/head norms opaque, like residual preparation.
+    def replace_norms(parent):
+        for name, child in parent.named_children():
+            if isinstance(child, RawWanRMSNorm):
+                setattr(parent, name, _FusedRMSNorm(child.norm))
+            else:
+                replace_norms(child)
+
+    replace_norms(module)
+    return torch.compile(
+        module,
+        fullgraph=True,
+        dynamic=False,
+        options={"emulate_precision_casts": True, "eager_numerics.division_rounding": True},
+    )
 
 
 @torch.library.custom_op("wan_decoder::input_conv3d", mutates_args=())
@@ -249,10 +272,23 @@ class _FusedResidualBlock(torch.nn.Module):
             ("gamma1", block.norm1.norm.gamma.detach().reshape(-1)),
         ):
             self.register_buffer(name, value, persistent=False)
+        self.first_frame_shortcut = use_first_frame_shortcut(conv1) and (
+            conv1.out_channels in (96, 192, 256) or not self.custom_conv or self.precision != "bf16"
+        )
+        for name, conv in (("first_weight1", conv1), ("first_weight2", conv2)):
+            self.register_buffer(
+                name,
+                conv.weight[:, :, 2].detach().contiguous(memory_format=torch.channels_last)
+                if self.first_frame_shortcut
+                else None,
+                persistent=False,
+            )
         self.ctas = torch.cuda.get_device_properties(conv1.weight.device).multi_processor_count // 2 * 2
 
-    def _convolve(self, x, weight):
+    def _convolve(self, x, weight, first_weight=None):
         """Convolve already-padded input using the adapter's selected backend."""
+        if first_weight is not None:
+            return spatial_convolution(x[:, 2].permute(0, 3, 1, 2), first_weight).permute(0, 2, 3, 1).unsqueeze(1)
         if self.custom_conv:
             return _conv_raw(x, weight, self.ctas, self.precision)
         return F.conv3d(x.permute(0, 4, 1, 2, 3), weight).permute(0, 2, 3, 4, 1)
@@ -264,10 +300,11 @@ class _FusedResidualBlock(torch.nn.Module):
         feat_idx: int,
         prepared=None,
         next_gamma=None,
-        save_residual=True,
         spatial_output=False,
     ):
         """Preserve the reference's two causal-cache entries and BF16 additions."""
+        first1 = self.first_frame_shortcut and x.shape[2] == 1 and feat_cache[feat_idx] is None
+        first2 = self.first_frame_shortcut and x.shape[2] == 1 and feat_cache[feat_idx + 1] is None
         residual = x if self.shortcut is None else self.shortcut(x)
         if prepared is None:
             padded, cache1, _ = _norm_prepare(
@@ -278,18 +315,18 @@ class _FusedResidualBlock(torch.nn.Module):
         else:
             padded, cache1 = prepared
         previous2 = _history(feat_cache[feat_idx + 1])
-        if self.fuse_conv:
+        if self.fuse_conv and not first1:
             padded2, cache2 = _conv_norm_prepare(
                 padded, self.weight1, self.bias1, self.gamma, previous2, self.ctas, self.precision
             )
         else:
-            raw = self._convolve(padded, self.weight1)
+            raw = self._convolve(padded, self.weight1, self.first_weight1 if first1 else None)
             padded2, cache2, _ = _norm_prepare(raw, self.gamma, previous2, self.bias1)
         next_prepared = None
         if next_gamma is not None:
             previous = _history(feat_cache[feat_idx + 2])
             skip = residual.permute(0, 2, 3, 4, 1).contiguous()
-            if self.fuse_conv:
+            if self.fuse_conv and not first2:
                 padded3, cache3, result = _conv_residual_norm_prepare(
                     padded2,
                     self.weight2,
@@ -299,13 +336,15 @@ class _FusedResidualBlock(torch.nn.Module):
                     skip,
                     self.ctas,
                     self.precision,
-                    save_residual,
                 )
             else:
-                raw = self._convolve(padded2, self.weight2)
+                raw = self._convolve(padded2, self.weight2, self.first_weight2 if first2 else None)
                 padded3, cache3, result = _norm_prepare(raw, next_gamma, previous, self.bias2, skip)
             next_prepared = (padded3, cache3)
-            result = result.permute(0, 4, 1, 2, 3) if save_residual else None
+            result = result.permute(0, 4, 1, 2, 3)
+        elif spatial_output and first2:
+            raw = self._convolve(padded2, self.weight2, self.first_weight2)
+            result = F.pad((raw + self.bias2).permute(0, 4, 1, 2, 3) + residual, (0, 1, 0, 1))
         elif spatial_output:
             result = _conv_spatial_residual(
                 padded2,
@@ -316,7 +355,7 @@ class _FusedResidualBlock(torch.nn.Module):
                 self.precision,
             ).permute(0, 4, 1, 2, 3)
         else:
-            result = self._convolve(padded2, self.weight2)
+            result = self._convolve(padded2, self.weight2, self.first_weight2 if first2 else None)
             result = (result + self.bias2).permute(0, 4, 1, 2, 3) + residual
         feat_cache = update_cache(feat_cache, feat_idx, cache1.permute(0, 4, 1, 2, 3))
         feat_cache = update_cache(feat_cache, feat_idx + 1, cache2.permute(0, 4, 1, 2, 3))
@@ -353,67 +392,30 @@ class _FusedUpBlock(torch.nn.Module):
         return x, feat_cache, feat_idx
 
 
-class _DecoderWithPreparedHead(torch.nn.Module):
-    """Consume the last residual convolution directly as prepared head input."""
-
-    def __init__(self, decoder):
-        super().__init__()
-        self.decoder = decoder
-        stage = decoder.up_blocks[-1]
-        if stage.upsampler is not None or stage.avg_shortcut is not None:
-            raise ValueError("Prepared output head requires no intervening stage operation")
-        if not stage.resnets[-1].fuse_conv or decoder.norm_out.norm.bias != 0:
-            raise ValueError("Prepared output head requires a supported residual convolution and bias-free norm")
-        conv = decoder.conv_out.conv
-        if (
-            tuple(conv.kernel_size) != (3, 3, 3)
-            or tuple(conv._padding) != (1, 1, 1, 1, 2, 0)
-            or tuple(conv.stride) != (1, 1, 1)
-            or tuple(conv.dilation) != (1, 1, 1)
-            or tuple(conv.padding) != (0, 0, 0)
-            or conv.groups != 1
-        ):
-            raise ValueError("Prepared output head requires a unit-stride causal 3x3x3 convolution")
-
-    def forward(self, x, feat_cache, first_chunk=False):
-        """Preserve causal-cache order while bypassing the final head intermediates."""
-        decoder = self.decoder
-        x = x.contiguous(memory_format=torch.channels_last_3d)
-        feat_cache = raw_canonicalize_cache(feat_cache)
-        x, feat_cache, feat_idx = raw_cached_causal_conv3d(decoder.conv_in, x, feat_cache, 0)
-        x, feat_cache, feat_idx = decoder.mid_block(x, feat_cache, feat_idx)
-        for stage in decoder.up_blocks[:-1]:
-            x, feat_cache, feat_idx = stage(x, feat_cache, feat_idx, first_chunk)
-        blocks = decoder.up_blocks[-1].resnets
-        prepared = None
-        for index, block in enumerate(blocks):
-            last = index + 1 == len(blocks)
-            gamma = decoder.norm_out.norm.gamma.reshape(-1) if last else blocks[index + 1].gamma1
-            x, feat_cache, feat_idx, prepared = block(x, feat_cache, feat_idx, prepared, gamma, save_residual=not last)
-        padded, cache = prepared
-        conv = decoder.conv_out.conv
-        x = F.conv3d(
-            padded.permute(0, 4, 1, 2, 3), conv.weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups
-        )
-        feat_cache = update_cache(feat_cache, feat_idx, cache.permute(0, 4, 1, 2, 3))
-        return x, feat_cache
-
-
 class _FusedMidBlock(torch.nn.Module):
     """Fold attention projection bias/residual into the following norm/preparation."""
 
-    def __init__(self, block) -> None:
+    def __init__(self, block, *, custom_conv=False) -> None:
         super().__init__()
         self.resnets = block.resnets
         self.attentions = block.attentions
+        self.custom_conv = custom_conv
+        if custom_conv:
+            self.first = _FusedResidualBlock(block.resnets[0], custom_conv=True)
+            self.following = torch.nn.ModuleList(
+                _FusedResidualBlock(resnet, custom_conv=True) for resnet in block.resnets[1:]
+            )
         for resnet in self.resnets[1:]:
             if resnet.conv_shortcut is not None or resnet.norm1.norm.bias != 0:
                 raise ValueError("Attention fusion requires an identity skip and bias-free RMSNorm")
 
     def forward(self, x, feat_cache, feat_idx=0):
         """Keep attention and C1024 convolutions in Torch; fuse their boundary ops."""
-        x, feat_cache, feat_idx = self.resnets[0](x, feat_cache, feat_idx)
-        for attention, block in zip(self.attentions, self.resnets[1:]):
+        if self.custom_conv:
+            x, feat_cache, feat_idx, _ = self.first(x, feat_cache, feat_idx)
+        else:
+            x, feat_cache, feat_idx = self.resnets[0](x, feat_cache, feat_idx)
+        for index, (attention, block) in enumerate(zip(self.attentions, self.resnets[1:])):
             if attention is None:
                 x, feat_cache, feat_idx = block(x, feat_cache, feat_idx)
                 continue
@@ -426,7 +428,7 @@ class _FusedMidBlock(torch.nn.Module):
             attended = F.scaled_dot_product_attention(q, k, v)
             attended = attended.squeeze(1).permute(0, 2, 1).reshape(n * t, c, h, w)
             projection = attention.proj
-            raw = F.conv2d(
+            raw = spatial_convolution(
                 attended,
                 projection.weight,
                 None,
@@ -436,6 +438,10 @@ class _FusedMidBlock(torch.nn.Module):
                 projection.groups,
             )
             raw = raw.permute(0, 2, 3, 1).reshape(n, t, h, w, c).contiguous()
+            if self.custom_conv:
+                x = ((raw + projection.bias) + skip).permute(0, 4, 1, 2, 3)
+                x, feat_cache, feat_idx, _ = self.following[index](x, feat_cache, feat_idx)
+                continue
             padded, cache, residual = _norm_prepare(
                 raw,
                 block.norm1.norm.gamma.reshape(-1),
@@ -444,15 +450,22 @@ class _FusedMidBlock(torch.nn.Module):
                 skip,
             )
             conv = block.conv1.conv
-            x = F.conv3d(
-                padded.permute(0, 4, 1, 2, 3),
-                conv.weight,
-                conv.bias,
-                conv.stride,
-                conv.padding,
-                conv.dilation,
-                conv.groups,
-            )
+            if t == 1 and feat_cache[feat_idx] is None and use_first_frame_shortcut(conv):
+                x = spatial_convolution(
+                    padded[:, 2].permute(0, 3, 1, 2),
+                    conv.weight[:, :, 2].contiguous(memory_format=torch.channels_last),
+                    conv.bias,
+                ).unsqueeze(2)
+            else:
+                x = F.conv3d(
+                    padded.permute(0, 4, 1, 2, 3),
+                    conv.weight,
+                    conv.bias,
+                    conv.stride,
+                    conv.padding,
+                    conv.dilation,
+                    conv.groups,
+                )
             feat_cache = update_cache(feat_cache, feat_idx, cache.permute(0, 4, 1, 2, 3))
             feat_idx += 1
             x = block.dropout(block.activation2(block.norm2(x)))

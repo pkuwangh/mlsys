@@ -28,7 +28,6 @@ It supports BF16 or FP32 with explicit TF32 permission and requires CUTLASS DSL.
 
 import argparse
 import gc
-import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -39,6 +38,7 @@ from bench_utils import (
     add_arithmetic_arguments,
     compare_model_outputs,
     configure_arithmetic,
+    median_timings,
     print_case_header,
     print_startup_header,
     report_compilation,
@@ -183,30 +183,6 @@ def load_vae(args: argparse.Namespace) -> AutoencoderKLWan:
     torch.nn.utils.convert_conv2d_weight_memory_format(vae, torch.channels_last)
     # Checkpoint loading already applies dtype while respecting FP32 modules.
     return vae.to(device="cuda").eval()
-
-
-def median_timings(paths: dict[str, Callable], repeats: int) -> dict[str, float]:
-    """Alternate execution order and measure complete decodes without CUDA Graphs."""
-    samples = {name: [] for name in paths}
-    peaks = {name: 0 for name in paths}
-    for i in range(repeats):
-        order = list(paths) if i % 2 == 0 else list(reversed(paths))
-        for name in order:
-            live_bytes = torch.cuda.memory_allocated()
-            torch.cuda.reset_peak_memory_stats()
-            start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-            start.record()
-            output = paths[name]()
-            end.record()
-            end.synchronize()
-            samples[name].append(start.elapsed_time(end))
-            peaks[name] = max(peaks[name], torch.cuda.max_memory_allocated() - live_bytes)
-            del output
-    print(
-        "  Peak additional allocated GiB: " + " | ".join(f"{name}={size / 2**30:.3f}" for name, size in peaks.items()),
-        flush=True,
-    )
-    return {name: statistics.median(values) for name, values in samples.items()}
 
 
 def warmup_and_validate(

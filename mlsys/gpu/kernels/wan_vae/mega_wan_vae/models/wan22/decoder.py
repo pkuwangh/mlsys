@@ -4,7 +4,13 @@ import torch
 
 from ..._utils import update_cache
 from ...kernels.conv import WanConv3d
-from ...layers.fused import _FusedMidBlock, _FusedUpBlock, _history, _input_conv3d
+from ...layers.fused import (
+    _FusedMidBlock,
+    _FusedUpBlock,
+    _history,
+    _input_conv3d,
+    compile_preserving_norms,
+)
 from ...layers.torch import TorchWanVaeDecoder, raw_cached_causal_conv3d, raw_canonicalize_cache
 
 
@@ -19,7 +25,7 @@ class _FusedDecoder(torch.nn.Module):
         self.cache_size = decoder.cache_size
 
     def forward(self, x, feat_cache, first_chunk=False):
-        """Retain the decoder's cache ordering and unchanged upsampling/output head."""
+        """Retain cache ordering, upsampling, and the ordinary output head."""
         feat_cache = raw_canonicalize_cache(feat_cache)
         raw, cache = _input_conv3d(
             x, self.input_conv.weight, _history(feat_cache[0]), self.input_conv.ctas, self.input_conv.precision
@@ -50,14 +56,15 @@ class Wan22Decoder(torch.nn.Module):
         if not self.fused_blocks:
             raise ValueError("No supported decoder blocks found")
         self.raw_decoder.decoder = _FusedDecoder(self.raw_decoder.decoder)
-        # Wan 2.2 passes the output gates with Inductor norms and division;
-        # keep those fusions instead of applying Wan 2.1's numerics workaround.
-        self.chunk_decoder = torch.compile(
-            self.raw_decoder.decoder,
-            fullgraph=True,
-            dynamic=False,
-            options={"emulate_precision_casts": True},
-        )
+        if vae.dtype == torch.bfloat16:
+            self.chunk_decoder = compile_preserving_norms(self.raw_decoder.decoder)
+        else:
+            self.chunk_decoder = torch.compile(
+                self.raw_decoder.decoder,
+                fullgraph=True,
+                dynamic=False,
+                options={"emulate_precision_casts": True},
+            )
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         """Decode with fresh history using the reference chunk loop."""

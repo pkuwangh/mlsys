@@ -2913,17 +2913,29 @@ def _verify_wan22() -> None:
     )
 
 
+def _print_fusion_legend() -> None:
+    """Explain the fusion comparison once at the start of a benchmark sweep."""
+    print(
+        "Fusion analysis: Raw=convolution only; Fused total=complete operation; Separate=raw + custom post-ops."
+        "\nFused kernel=direct fused launch on preconverted activations; -=no fused kernel (native convolution + separate post-ops)."
+        "\nRaw/Fused total/Separate include activation conversion; fused paths include history copying."
+        "\nRatios use Fused total: Fused/raw and Separate/raw are cost ratios; Separate/fused is the fusion speedup."
+        "\nEach timing is measured separately with rotating CUDA-graph timing order.",
+        flush=True,
+    )
+
+
 def _print_fusion_costs(results: list[tuple[str, tuple[float, float | None, float, float]]]) -> None:
     """Compare kernel and complete-operation costs against raw/separate paths."""
     headers = (
         "Operation",
         "Raw ms",
-        "Kernel ms",
-        "Total ms",
+        "Fused kernel ms",
+        "Fused total ms",
         "Separate ms",
-        "Total/raw",
-        "Extra ms",
-        "Separate/total",
+        "Fused/raw",
+        "Separate/raw",
+        "Separate/fused",
     )
     rows = [
         (
@@ -2933,7 +2945,7 @@ def _print_fusion_costs(results: list[tuple[str, tuple[float, float | None, floa
             f"{total:.4f}",
             f"{separate:.4f}",
             f"{total / raw:.3f}x",
-            f"{total - raw:+.4f}",
+            f"{separate / raw:.3f}x",
             f"{separate / total:.3f}x",
         )
         for label, (raw, kernel_ms, total, separate) in results
@@ -3087,14 +3099,7 @@ def _benchmark_conv(cfg: ConvConfig, history: int, spatial: bool, *, residual_bi
     print("Against Torch eager/cuDNN:", flush=True)
     print_benchmark_table(torch_results)
     if fusion_results:
-        print(
-            "Fusion cost (same operands, rotating CUDA-graph timing order):"
-            "\nKernel=direct fused launch, excluding activation conversion; -=no fused kernel."
-            "\nRaw/Total/Separate include per-call activation conversion; fused paths include history copying."
-            "\nSeparate=raw convolution + custom postprocessing; IEEE Total also uses separate library/post-ops."
-            "\nTotal/raw is a cost ratio (lower is better); Extra=Total-Raw.",
-            flush=True,
-        )
+        print("Fusion analysis:", flush=True)
         _print_fusion_costs(fusion_results)
 
 
@@ -3111,6 +3116,7 @@ def benchmark_matched(model: str, shapes: list[tuple[int, ...]], histories: list
         f"\nGPU: {torch.cuda.get_device_name(0)} | CTAs={ctas} | cuDNN autotuning={torch.backends.cudnn.benchmark}",
         flush=True,
     )
+    _print_fusion_legend()
     for n, frames, h, w in shapes:
         for history in histories:
             for c in sorted(channels):
@@ -3330,6 +3336,7 @@ def benchmark_production(model: str = "all", precision: str = "bf16") -> None:
         f"\ncuDNN autotuning: {torch.backends.cudnn.benchmark}.",
         flush=True,
     )
+    _print_fusion_legend()
     if model in ("all", "wan21"):
         _benchmark_wan21(precision)
     if model in ("all", "wan22"):

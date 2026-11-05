@@ -33,6 +33,7 @@ from ...kernels.norm import rmsnorm as primitive_norm
 from ...kernels.norm import rmsnorm_silu_conv_prep as primitive_conv_prep
 from ...kernels.residual import bias_residual as primitive_bias_residual
 from ...kernels.residual import stage_add as primitive_stage_add
+from ...layers.torch import spatial_convolution
 
 
 class _ConvWeights(torch.nn.Module):
@@ -180,8 +181,17 @@ class _PreparedResidualBlock(torch.nn.Module):
                 raise ValueError("Prepared residual convolution requires causal 3x3x3 padding")
             if tuple(conv.stride) != (1, 1, 1) or tuple(conv.dilation) != (1, 1, 1) or conv.groups != 1:
                 raise ValueError("Primitive residual convolution requires unit stride/dilation and groups=1")
+        # C640 TF32 is faster through native cuDNN; keep unrounded weights.
+        self.native_conv = (
+            block.conv1.out_channels == 640
+            and block.conv1.weight.dtype == torch.float32
+            and torch.backends.cudnn.allow_tf32
+        )
         self.primitive_convs = torch.nn.ModuleDict(
-            {name: WanConv3d(getattr(self, name).conv.weight) for name in ("conv1", "conv2")}
+            {
+                name: WanConv3d(getattr(self, name).conv.weight, precision="ieee" if self.native_conv else None)
+                for name in ("conv1", "conv2")
+            }
         )
         if self.primitive_convs["conv1"].out_channels in (160, 320) and self.norm2.affine_bias() is not None:
             raise ValueError("Fused convolution requires bias-free RMSNorm")
@@ -231,7 +241,21 @@ class _PreparedResidualBlock(torch.nn.Module):
         name = "conv1" if wrapper is self.conv1 else "conv2"
         if tuple(conv.stride) != (1, 1, 1) or tuple(conv.dilation) != (1, 1, 1) or conv.groups != 1:
             raise ValueError("Primitive residual convolution requires unit stride/dilation and groups=1")
-        out = self.primitive_convs[name](prepared.padded)
+        first = prepared.padded.shape[1] == 3 and (feat_cache is None or feat_cache[feat_idx] is None)
+        if self.native_conv or (first and self.primitive_convs[name].precision != "bf16"):
+            if first:
+                out = (
+                    spatial_convolution(
+                        prepared.padded[:, 2].permute(0, 3, 1, 2),
+                        conv.weight[:, :, 2].contiguous(memory_format=torch.channels_last),
+                    )
+                    .permute(0, 2, 3, 1)
+                    .unsqueeze(1)
+                )
+            else:
+                out = F.conv3d(prepared.padded.permute(0, 4, 1, 2, 3), conv.weight).permute(0, 2, 3, 4, 1)
+        else:
+            out = self.primitive_convs[name](prepared.padded)
         if feat_cache is not None:
             feat_cache = update_cache(feat_cache, feat_idx, prepared.cache)
             feat_idx += 1
@@ -309,7 +333,13 @@ class _PreparedResidualBlock(torch.nn.Module):
                 )
                 residual_bias = conv.bias
         conv1 = self.primitive_convs["conv1"]
-        if conv1.out_channels in (160, 320):
+        first1 = prepared.padded.shape[1] == 3 and (feat_cache is None or feat_cache[feat_idx] is None)
+        native_first = first1 and conv1.precision == "ieee"
+        if (
+            not native_first
+            and conv1.out_channels in (160, 320)
+            and (conv1.precision != "tf32" or (conv1.out_channels == 160 and not first1))
+        ):
             previous = None if feat_cache is None else feat_cache[feat_idx + 1]
             if isinstance(previous, str):
                 raise TypeError("Residual convolution cache must be a tensor or None")
@@ -333,7 +363,7 @@ class _PreparedResidualBlock(torch.nn.Module):
                 True,
                 self.conv1.conv.bias,
             )
-        if next_norm is not None:
+        if next_norm is not None and conv1.precision != "tf32" and not native_first:
             if pad_output:
                 raise ValueError("A residual block cannot prepare two distinct consumers")
             if next_norm.affine_bias() is not None:
@@ -353,7 +383,8 @@ class _PreparedResidualBlock(torch.nn.Module):
                 feat_cache = update_cache(feat_cache, feat_idx, prepared.cache)
                 feat_idx += 1
             return PreparedResidualOutput(next_prepared, residual), feat_cache, feat_idx
-        if pad_output:
+        first2 = prepared.padded.shape[1] == 3 and (feat_cache is None or feat_cache[feat_idx] is None)
+        if pad_output and not self.native_conv and not (first2 and conv1.precision != "bf16"):
             padded = self.primitive_convs["conv2"].forward_spatial_residual(
                 prepared.padded, self.conv2.conv.bias, residual, residual_bias
             )
@@ -415,7 +446,7 @@ class _Downsample(torch.nn.Module):
             )
         n, frames, height, width, channels = padded.shape
         conv = self.conv
-        x = F.conv2d(
+        x = spatial_convolution(
             padded.view(n * frames, height, width, channels).permute(0, 3, 1, 2),
             self.weight,
             None,
@@ -589,7 +620,7 @@ class _AttentionBlock(torch.nn.Module):
         n, t, h, w, c = x.shape
         normalized = self.norm(x).view(n * t, h, w, c).permute(0, 3, 1, 2)
         conv = self.to_qkv
-        qkv = F.conv2d(
+        qkv = spatial_convolution(
             normalized,
             conv.weight,
             conv.bias,
@@ -603,7 +634,7 @@ class _AttentionBlock(torch.nn.Module):
         attended = F.scaled_dot_product_attention(q, k, v)
         attended = attended.squeeze(1).permute(0, 2, 1).reshape(n * t, c, h, w)
         conv = self.proj
-        projected = F.conv2d(
+        projected = spatial_convolution(
             attended,
             conv.weight,
             None,
@@ -669,6 +700,7 @@ class _Encoder3d(torch.nn.Module):
         ):
             raise ValueError("Primitive input convolution requires causal unit-stride 3x3x3")
         self.primitive_input_conv = WanInputConv3d(conv.weight)
+        self.strict_fp32 = conv.weight.dtype == torch.float32 and not torch.backends.cudnn.allow_tf32
 
     def forward(self, x: torch.Tensor, feat_cache: FeatCache) -> tuple[torch.Tensor, FeatCache]:
         feat_cache = canonicalize_cache(feat_cache, torch.contiguous_format)
@@ -679,7 +711,17 @@ class _Encoder3d(torch.nn.Module):
             pad_input_channels=self.primitive_input_conv.input_channels == 16,
         )
         conv = self.conv_in.conv
-        x = self.primitive_input_conv(packed.padded)
+        if self.strict_fp32 and packed.padded.shape[1] == 3 and feat_cache[0] is None:
+            x = (
+                spatial_convolution(
+                    packed.padded[:, 2].permute(0, 3, 1, 2),
+                    conv.weight[:, :, 2].contiguous(memory_format=torch.channels_last),
+                )
+                .permute(0, 2, 3, 1)
+                .unsqueeze(1)
+            )
+        else:
+            x = self.primitive_input_conv(packed.padded)
         feat_cache = update_cache(feat_cache, 0, packed.cache)
         idx = 1
         x = ConvOutput(x, conv.bias)
@@ -695,15 +737,22 @@ class _Encoder3d(torch.nn.Module):
             residual_bias=pending.residual_bias,
         )
         conv = self.conv_out.conv
-        x = F.conv3d(
-            prepared.padded.permute(0, 4, 1, 2, 3),
-            self.head_weight,
-            conv.bias,
-            conv.stride,
-            conv.padding,
-            conv.dilation,
-            conv.groups,
-        )
+        if self.strict_fp32 and prepared.padded.shape[1] == 3 and feat_cache[idx] is None:
+            x = spatial_convolution(
+                prepared.padded[:, 2].permute(0, 3, 1, 2),
+                self.head_weight[:, :, 2].contiguous(memory_format=torch.channels_last),
+                conv.bias,
+            ).unsqueeze(2)
+        else:
+            x = F.conv3d(
+                prepared.padded.permute(0, 4, 1, 2, 3),
+                self.head_weight,
+                conv.bias,
+                conv.stride,
+                conv.padding,
+                conv.dilation,
+                conv.groups,
+            )
         feat_cache = update_cache(feat_cache, idx, prepared.cache)
         return x, feat_cache
 

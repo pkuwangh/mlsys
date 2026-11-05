@@ -230,6 +230,28 @@ def check_compile_rejection():
     must_reject(lambda: conv.compile_spatial_residual(cfg))
 
 
+@torch.inference_mode()
+def check_native_causal_chunks(policy):
+    """Compare the first-frame Conv2D shortcut and later history with Diffusers."""
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+    from mega_wan_vae.layers.torch import raw_causal_conv3d
+
+    dtype = torch.bfloat16 if policy == "bf16" else torch.float32
+    with torch.backends.cudnn.flags(allow_tf32=policy == "tf32"):
+        for ci, co in ((3, 96), (96, 96), (256, 256)):
+            layer = WanCausalConv3d(ci, co, 3, padding=1).to("cuda", dtype).eval()
+            layer.to(memory_format=torch.channels_last_3d)
+            previous = None
+            for frames in (1, 1, 4):
+                x = torch.randn(2, ci, frames, 5, 7, device="cuda", dtype=dtype) * 0.1
+                expected = layer(x, previous)
+                actual = raw_causal_conv3d(layer, x, previous)
+                close(actual, expected, policy)
+                joined = x if previous is None else torch.cat((previous, x), dim=2)
+                previous = joined[:, :, -2:].clone()
+    print(f"{policy}: native first-frame and streaming convolution PASS", flush=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("modes", nargs="*", default=["ieee", "tf32", "bf16"])
@@ -245,3 +267,4 @@ if __name__ == "__main__":
         for mode in args.modes:
             check_mode(mode, raw_only=args.raw_only)
             check_input_convolution(mode)
+            check_native_causal_chunks(mode)
