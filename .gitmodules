@@ -40,3 +40,9 @@
 [submodule "mlsys/inference/deepinfer/DeepInfer"]
 	path = mlsys/inference/deepinfer/DeepInfer
 	url = https://github.com/deepseek-ai/DeepInfer.git
+[submodule "mlsys/inference/serving/dynamo"]
+	path = mlsys/inference/serving/dynamo
+	url = https://github.com/pkuwangh/dynamo.git
+[submodule "mlsys/inference/serving/frontend-crates"]
+	path = mlsys/inference/serving/frontend-crates
+	url = https://github.com/pkuwangh/frontend-crates.git
