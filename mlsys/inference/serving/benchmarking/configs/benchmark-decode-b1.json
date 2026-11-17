@@ -1,0 +1,13 @@
+{
+  "name": "decode-b1-isl1-osl1024",
+  "kind": "decode",
+  "concurrency": 1,
+  "prompt_token_ids": [42],
+  "output_tokens": 1024,
+  "warmup_requests": 2,
+  "repeats": 3,
+  "requests_per_repeat": 4,
+  "seed": 42,
+  "request_timeout_seconds": 120,
+  "timeout_seconds": 900
+}

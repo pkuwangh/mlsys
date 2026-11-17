@@ -1,0 +1,10 @@
+{
+  "name": "agentx-c1",
+  "harness_version": "1.0.13",
+  "concurrency": 1,
+  "duration_seconds": 3600,
+  "seed": 42,
+  "dataset": "semianalysis_cc_traces_weka_062126",
+  "extra_args": [],
+  "timeout_seconds": 9000
+}
