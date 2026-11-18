@@ -46,3 +46,6 @@
 [submodule "mlsys/inference/serving/frontend-crates"]
 	path = mlsys/inference/serving/frontend-crates
 	url = https://github.com/pkuwangh/frontend-crates.git
+[submodule "mlsys/inference/tools/xgrammar"]
+	path = mlsys/inference/tools/xgrammar
+	url = https://github.com/pkuwangh/xgrammar.git
