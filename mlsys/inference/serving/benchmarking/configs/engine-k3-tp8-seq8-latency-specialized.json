@@ -1,5 +1,5 @@
 {
-  "name": "k3-tp16-dcp16",
+  "name": "k3-tp8-seq8-latency-specialized",
   "model": {
     "path": null,
     "draft_path": null,
@@ -20,8 +20,8 @@
     "VLLM_LOG_STATS_INTERVAL": "1"
   },
   "vllm_args": {
-    "tensor-parallel-size": 16,
-    "decode-context-parallel-size": 16,
+    "tensor-parallel-size": 8,
+    "decode-context-parallel-size": 8,
     "dcp-comm-backend": "a2a",
     "max-model-len": 1048576,
     "additional-config": {
@@ -48,10 +48,9 @@
     "enable-auto-tool-choice": true,
     "tool-call-parser": "kimi_k3",
     "reasoning-parser": "kimi_k3",
-    "max-cudagraph-capture-size": 48,
     "compilation-config": {
       "cudagraph_mode": "FULL_AND_PIECEWISE",
-      "cudagraph_capture_sizes": [
+      "prefill_cudagraph_capture_token_sizes": [
         5,
         6,
         10,
@@ -60,6 +59,16 @@
         24,
         40,
         48
+      ],
+      "decode_cudagraph_capture_request_sizes": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
       ]
     }
   },

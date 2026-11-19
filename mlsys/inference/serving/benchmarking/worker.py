@@ -82,7 +82,7 @@ def main() -> None:
         devices = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"], text=True)
         if len(devices.splitlines()) != deployment["slurm"]["gpus_per_node"] or any("GB300" not in line for line in devices.splitlines()):
             raise RuntimeError(f"Expected four GB300 GPUs per tray, got: {devices}")
-        for key in ("path", "draft_path"):
+        for key in (("path", "draft_path") if config["speculation"] is not None else ("path",)):
             check_model(config["model"][key])
         overlay = patch_vllm(deployment["patches"])
         cmd = server_command(config, deployment, rank, head)

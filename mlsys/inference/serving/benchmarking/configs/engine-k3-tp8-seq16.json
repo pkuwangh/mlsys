@@ -1,0 +1,98 @@
+{
+  "name": "k3-tp8-seq16",
+  "model": {
+    "path": null,
+    "draft_path": null,
+    "served_name": "moonshotai/Kimi-K3"
+  },
+  "network": {
+    "port": 8000
+  },
+  "env": {
+    "NCCL_CUMEM_ENABLE": "1",
+    "NCCL_MNNVL_ENABLE": "1",
+    "NCCL_NVLS_ENABLE": "1",
+    "VLLM_ALLREDUCE_USE_FLASHINFER": "1",
+    "VLLM_USE_DIRECT_DCP_A2A": "1",
+    "VLLM_USE_DIRECT_DCP_Q_GATHER": "1",
+    "VLLM_USE_DIRECT_DCP_KV_GATHER": "1",
+    "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
+    "VLLM_LOG_STATS_INTERVAL": "1"
+  },
+  "vllm_args": {
+    "tensor-parallel-size": 8,
+    "decode-context-parallel-size": 8,
+    "dcp-comm-backend": "a2a",
+    "max-model-len": 1048576,
+    "additional-config": {
+      "decode_backend": "auto"
+    },
+    "attention-backend": "TOKENSPEED_MLA",
+    "attention-config": {
+      "mla_prefill_backend": "TRTLLM_RAGGED",
+      "use_prefill_query_quantization": true
+    },
+    "kv-cache-dtype": "fp8",
+    "mamba-ssm-cache-dtype": "float32",
+    "gpu-memory-utilization": 0.92,
+    "max-num-seqs": 16,
+    "max-num-batched-tokens": 16384,
+    "enable-prefix-caching": true,
+    "prefix-match-unit": 128,
+    "disable-flashinfer-autotune": true,
+    "moe-backend": "auto",
+    "load-format": "fastsafetensors",
+    "stream-interval": 10,
+    "language-model-only": true,
+    "trust-remote-code": true,
+    "enable-auto-tool-choice": true,
+    "tool-call-parser": "kimi_k3",
+    "reasoning-parser": "kimi_k3",
+    "compilation-config": {
+      "cudagraph_mode": "FULL_AND_PIECEWISE",
+      "prefill_cudagraph_capture_token_sizes": [
+        5,
+        6,
+        10,
+        12,
+        20,
+        24,
+        40,
+        48,
+        80,
+        96
+      ],
+      "decode_cudagraph_capture_request_sizes": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16
+      ]
+    }
+  },
+  "speculation": {
+    "method": "dspark",
+    "attention_backend": "TOKENSPEED_MLA",
+    "num_speculative_tokens": 5,
+    "draft_sample_method": "probabilistic",
+    "rejection_sample_method": "synthetic",
+    "synthetic_acceptance_length": 3.62
+  },
+  "provenance": {
+    "recipe": "https://recipes.vllm.ai/moonshotai/Kimi-K3?hardware=gb300&strategy=multi_node_tp&preset=gb300_low_latency",
+    "acceptance_source": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/30316471205",
+    "acceptance_note": "K3 DSpark K5, probabilistic drafting, block-verification calibration, thinking_on: AL 3.62. Synthetic replay only."
+  }
+}

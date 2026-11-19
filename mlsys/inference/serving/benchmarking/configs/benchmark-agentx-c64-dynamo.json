@@ -1,0 +1,19 @@
+{
+  "name": "agentx-c64",
+  "harness_version": "1.0.13",
+  "concurrency": 64,
+  "duration_seconds": 3600,
+  "seed": 42,
+  "dataset": "semianalysis_cc_traces_weka_062126",
+  "extra_args": [
+    "--export-level",
+    "raw",
+    "--no-export-outputs-json"
+  ],
+  "timeout_seconds": 9000,
+  "env": {
+    "AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING": "0",
+    "AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID": "true",
+    "AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS": "14400"
+  }
+}

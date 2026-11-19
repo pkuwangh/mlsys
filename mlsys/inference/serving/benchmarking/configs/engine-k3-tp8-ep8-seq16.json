@@ -1,5 +1,5 @@
 {
-  "name": "k3-tp16-dcp1-dl7-al6",
+  "name": "k3-tp8-ep8-seq16",
   "model": {
     "path": null,
     "draft_path": null,
@@ -20,11 +20,12 @@
     "VLLM_LOG_STATS_INTERVAL": "1"
   },
   "vllm_args": {
-    "tensor-parallel-size": 16,
-    "decode-context-parallel-size": 1,
-    "max-model-len": 2048,
+    "tensor-parallel-size": 8,
+    "decode-context-parallel-size": 8,
+    "dcp-comm-backend": "a2a",
+    "max-model-len": 1048576,
     "additional-config": {
-      "decode_backend": "latency_specialized"
+      "decode_backend": "auto"
     },
     "attention-backend": "TOKENSPEED_MLA",
     "attention-config": {
@@ -34,41 +35,65 @@
     "kv-cache-dtype": "fp8",
     "mamba-ssm-cache-dtype": "float32",
     "gpu-memory-utilization": 0.92,
-    "max-num-seqs": 8,
+    "max-num-seqs": 16,
     "max-num-batched-tokens": 16384,
+    "enable-prefix-caching": true,
+    "prefix-match-unit": 128,
     "disable-flashinfer-autotune": true,
     "moe-backend": "auto",
     "load-format": "fastsafetensors",
-    "stream-interval": 1,
+    "stream-interval": 10,
     "language-model-only": true,
     "trust-remote-code": true,
-    "max-cudagraph-capture-size": 64,
+    "enable-auto-tool-choice": true,
+    "tool-call-parser": "kimi_k3",
+    "reasoning-parser": "kimi_k3",
     "compilation-config": {
       "cudagraph_mode": "FULL_AND_PIECEWISE",
-      "cudagraph_capture_sizes": [
+      "prefill_cudagraph_capture_token_sizes": [
+        5,
+        6,
+        10,
+        12,
+        20,
+        24,
+        40,
+        48,
+        80,
+        96
+      ],
+      "decode_cudagraph_capture_request_sizes": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
         7,
         8,
+        9,
+        10,
+        11,
+        12,
+        13,
         14,
-        16,
-        28,
-        32,
-        56,
-        64
+        15,
+        16
       ]
     },
-    "no-enable-prefix-caching": true
+    "enable-expert-parallel": true
   },
   "speculation": {
     "method": "dspark",
     "attention_backend": "TOKENSPEED_MLA",
-    "num_speculative_tokens": 7,
+    "num_speculative_tokens": 5,
     "draft_sample_method": "probabilistic",
     "rejection_sample_method": "synthetic",
-    "synthetic_acceptance_length": 6
+    "synthetic_acceptance_length": 3.62
   },
   "provenance": {
-    "article": "https://vllm.ai/blog/2026-10-16-kimi-k3-megakernel",
-    "pr": "https://github.com/vllm-project/vllm/pull/61867",
-    "note": "Short-context B1 reproduction attempt: ISL1 OSL1024 DL7 synthetic AL6. DCP1 chosen for short context; historical DCP and image not specified in published table. Current nightly, not exact historical replay."
+    "recipe": "https://recipes.vllm.ai/moonshotai/Kimi-K3?hardware=gb300&strategy=multi_node_tp&preset=gb300_low_latency",
+    "acceptance_source": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/30316471205",
+    "acceptance_note": "K3 DSpark K5, probabilistic drafting, block-verification calibration, thinking_on: AL 3.62. Synthetic replay only."
   }
 }

@@ -1,0 +1,21 @@
+{
+  "lanes": [
+    [
+      {
+        "name": "c48-tp8-cpu-kv-offload",
+        "engine": "engine-k3-tp8-seq48-cpu-kv-offload.json",
+        "benchmark": "benchmark-agentx-c48.json",
+        "deployment": "deployment-gb300-2n.json"
+      }
+    ],
+    [
+      {
+        "name": "c64-1p2d-prefill-context-kv-only",
+        "prefill_engine": "engine-k3-1p2d-c64-prefill-context-kv-only.json",
+        "decode_engine": "engine-k3-1p2d-c48-decode.json",
+        "benchmark": "benchmark-agentx-c64-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n.json"
+      }
+    ]
+  ]
+}

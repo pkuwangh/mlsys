@@ -1,0 +1,13 @@
+{
+  "lanes": [
+    [
+      {
+        "name": "c64-1p2d",
+        "prefill_engine": "engine-k3-1p2d-c48-prefill.json",
+        "decode_engine": "engine-k3-1p2d-c48-decode.json",
+        "benchmark": "benchmark-agentx-c64-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n.json"
+      }
+    ]
+  ]
+}
