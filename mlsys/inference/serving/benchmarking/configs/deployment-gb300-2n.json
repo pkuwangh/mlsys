@@ -7,7 +7,8 @@
     "gpus_per_node": 4,
     "cpus_per_task": null,
     "extra_args": [
-      "--segment=2"
+      "--segment=2",
+      "--wckey=p0"
     ]
   },
   "containers": {
