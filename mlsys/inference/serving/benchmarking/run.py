@@ -58,8 +58,19 @@ def validate(config: dict, bench: dict, deployment: dict, local_files: bool = Fa
     if any(key in config for key in ("slurm", "container", "patches", "server_command_prefix", "startup_seconds")) or "container" in bench:
         raise ValueError("Keep allocation, containers, and launcher settings in the deployment config")
     slurm, spec = deployment["slurm"], config["speculation"]
-    if slurm["nodes"] * slurm["gpus_per_node"] != config["vllm_args"]["tensor-parallel-size"]:
-        raise ValueError("This runner requires one TP group spanning all allocated GPUs")
+    parallel = config["vllm_args"]
+    tp, dp = parallel["tensor-parallel-size"], parallel.get("data-parallel-size", 1)
+    if min(tp, dp) < 1 or slurm["nodes"] * slurm["gpus_per_node"] != tp * dp:
+        raise ValueError("Allocated GPU count must equal TP * DP")
+    if parallel.get("pipeline-parallel-size", 1) != 1 or parallel.get("prefill-context-parallel-size", 1) != 1:
+        raise ValueError("This runner supports TP/DP with PP=PCP=1")
+    dcp = parallel.get("decode-context-parallel-size", 1)
+    if dcp < 1 or tp % dcp:
+        raise ValueError("DCP must divide TP")
+    if any(parallel.get(key) is not None and parallel[key] is not False for key in (
+        "data-parallel-rank", "data-parallel-start-rank", "data-parallel-external-lb", "data-parallel-hybrid-lb",
+    )):
+        raise ValueError("This runner uses internal DP load balancing and infers DP ranks from node ranks")
     kind = bench.get("kind", "agentx")
     if kind not in ("agentx", "decode"):
         raise ValueError(f"Unknown benchmark kind: {kind}")

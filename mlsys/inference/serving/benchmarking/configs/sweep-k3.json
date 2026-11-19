@@ -1,0 +1,87 @@
+{
+  "lanes": [
+    [
+      {
+        "name": "c32-1p2d",
+        "prefill_engine": "engine-k3-1p2d-prefill.json",
+        "decode_engine": "engine-k3-1p2d-decode.json",
+        "benchmark": "benchmark-agentx-c32-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n.json"
+      },
+      {
+        "name": "c1-tp16",
+        "engine": "engine-k3-tp16-seq8-latency-specialized.json",
+        "benchmark": "benchmark-agentx-c1.json",
+        "deployment": "deployment-gb300-4n.json"
+      },
+      {
+        "name": "c2-tp16",
+        "engine": "engine-k3-tp16-seq8-latency-specialized.json",
+        "benchmark": "benchmark-agentx-c2.json",
+        "deployment": "deployment-gb300-4n.json"
+      },
+      {
+        "name": "decode-b1",
+        "engine": "engine-k3-tp16-dcp1-seq8-latency-specialized.json",
+        "benchmark": "benchmark-decode-b1.json",
+        "deployment": "deployment-b1-gb300-4n.json"
+      },
+      {
+        "name": "c16-tp8-latency-specialized",
+        "engine": "engine-k3-tp8-seq16-latency-specialized.json",
+        "benchmark": "benchmark-agentx-c16.json",
+        "deployment": "deployment-gb300-2n.json"
+      },
+      {
+        "name": "c32-tp8-ep8",
+        "engine": "engine-k3-tp8-ep8-seq32.json",
+        "benchmark": "benchmark-agentx-c32.json",
+        "deployment": "deployment-gb300-2n.json"
+      },
+      {
+        "name": "c32-tp4-dp2-ep8",
+        "engine": "engine-k3-tp4-dp2-ep8.json",
+        "benchmark": "benchmark-agentx-c32.json",
+        "deployment": "deployment-gb300-2n.json"
+      }
+    ],
+    [
+      {
+        "name": "c32-tp8",
+        "engine": "engine-k3-tp8-seq32.json",
+        "benchmark": "benchmark-agentx-c32.json",
+        "deployment": "deployment-gb300-2n.json"
+      },
+      {
+        "name": "c2-tp8",
+        "engine": "engine-k3-tp8-seq8-latency-specialized.json",
+        "benchmark": "benchmark-agentx-c2.json",
+        "deployment": "deployment-gb300-2n.json"
+      },
+      {
+        "name": "c4-tp8",
+        "engine": "engine-k3-tp8-seq8-latency-specialized.json",
+        "benchmark": "benchmark-agentx-c4.json",
+        "deployment": "deployment-gb300-2n.json"
+      },
+      {
+        "name": "c8-tp8",
+        "engine": "engine-k3-tp8-seq8-latency-specialized.json",
+        "benchmark": "benchmark-agentx-c8.json",
+        "deployment": "deployment-gb300-2n.json"
+      },
+      {
+        "name": "c16-tp8",
+        "engine": "engine-k3-tp8-seq16.json",
+        "benchmark": "benchmark-agentx-c16.json",
+        "deployment": "deployment-gb300-2n.json"
+      },
+      {
+        "name": "c16-tp8-ep8",
+        "engine": "engine-k3-tp8-ep8-seq16.json",
+        "benchmark": "benchmark-agentx-c16.json",
+        "deployment": "deployment-gb300-2n.json"
+      }
+    ]
+  ]
+}

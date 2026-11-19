@@ -1,0 +1,83 @@
+{
+  "name": "k3-tp16-dcp1-seq8-latency-specialized",
+  "model": {
+    "path": null,
+    "draft_path": null,
+    "served_name": "moonshotai/Kimi-K3"
+  },
+  "network": {
+    "port": 8000
+  },
+  "env": {
+    "NCCL_CUMEM_ENABLE": "1",
+    "NCCL_MNNVL_ENABLE": "1",
+    "NCCL_NVLS_ENABLE": "1",
+    "VLLM_ALLREDUCE_USE_FLASHINFER": "1",
+    "VLLM_USE_DIRECT_DCP_A2A": "1",
+    "VLLM_USE_DIRECT_DCP_Q_GATHER": "1",
+    "VLLM_USE_DIRECT_DCP_KV_GATHER": "1",
+    "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
+    "VLLM_LOG_STATS_INTERVAL": "1"
+  },
+  "vllm_args": {
+    "tensor-parallel-size": 16,
+    "decode-context-parallel-size": 1,
+    "max-model-len": 2048,
+    "additional-config": {
+      "decode_backend": "latency_specialized"
+    },
+    "attention-backend": "TOKENSPEED_MLA",
+    "attention-config": {
+      "mla_prefill_backend": "TRTLLM_RAGGED",
+      "use_prefill_query_quantization": true
+    },
+    "kv-cache-dtype": "fp8",
+    "mamba-ssm-cache-dtype": "float32",
+    "gpu-memory-utilization": 0.92,
+    "max-num-seqs": 8,
+    "max-num-batched-tokens": 16384,
+    "disable-flashinfer-autotune": true,
+    "moe-backend": "auto",
+    "load-format": "fastsafetensors",
+    "stream-interval": 1,
+    "language-model-only": true,
+    "trust-remote-code": true,
+    "compilation-config": {
+      "cudagraph_mode": "FULL_AND_PIECEWISE",
+      "prefill_cudagraph_capture_token_sizes": [
+        7,
+        8,
+        14,
+        16,
+        28,
+        32,
+        56,
+        64
+      ],
+      "decode_cudagraph_capture_request_sizes": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    },
+    "no-enable-prefix-caching": true
+  },
+  "speculation": {
+    "method": "dspark",
+    "attention_backend": "TOKENSPEED_MLA",
+    "num_speculative_tokens": 7,
+    "draft_sample_method": "probabilistic",
+    "rejection_sample_method": "synthetic",
+    "synthetic_acceptance_length": 6
+  },
+  "provenance": {
+    "article": "https://vllm.ai/blog/2026-10-16-kimi-k3-megakernel",
+    "pr": "https://github.com/vllm-project/vllm/pull/61867",
+    "note": "Short-context B1 reproduction attempt: ISL1 OSL1024 DL7 synthetic AL6. DCP1 chosen for short context; historical DCP and image not specified in published table. Current nightly, not exact historical replay."
+  }
+}

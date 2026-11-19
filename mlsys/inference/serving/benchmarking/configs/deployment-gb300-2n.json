@@ -1,0 +1,40 @@
+{
+  "slurm": {
+    "account": null,
+    "partition": null,
+    "time": "04:00:00",
+    "nodes": 2,
+    "gpus_per_node": 4,
+    "cpus_per_task": null,
+    "extra_args": [
+      "--segment=2"
+    ]
+  },
+  "containers": {
+    "engine": {
+      "mounts": [
+        {
+          "source": null,
+          "target": null,
+          "readonly": true
+        }
+      ],
+      "image": null
+    },
+    "benchmark": {
+      "image": null,
+      "mounts": [
+        {
+          "source": null,
+          "target": null,
+          "readonly": true
+        }
+      ]
+    }
+  },
+  "network_interface": "eth0",
+  "patches": [],
+  "server_command_prefix": [],
+  "startup_seconds": 3600,
+  "cache_dir": null
+}
