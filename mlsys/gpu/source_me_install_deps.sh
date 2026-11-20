@@ -57,7 +57,7 @@ uv pip install "accelerate==1.14.0"
 
 # cutlass-dsl
 uv pip install "apache-tvm-ffi==0.1.12"
-# uv pip install "nvidia-cutlass-dsl[cu13]==4.8.0"
+uv pip install --prerelease=allow "nvidia-cutlass-dsl[cu13]==4.9.0.dev1"
 
 python "${CURR_DIR}/check_cuda.py"
 
