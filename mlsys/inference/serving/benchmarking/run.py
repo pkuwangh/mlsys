@@ -31,7 +31,9 @@ def flags(values: dict) -> list[str]:
 
 
 def server_command(config: dict, deployment: dict, rank: int, head: str) -> list[str]:
-    spec = dict(config["speculation"], model=config["model"]["draft_path"] or "<DRAFT_PATH>")
+    spec = config["speculation"]
+    if spec is not None:
+        spec = dict(spec, model=config["model"]["draft_path"] or "<DRAFT_PATH>")
     cmd = ["python3", "-m", "vllm.entrypoints.cli.main", "serve", config["model"]["path"] or "<MODEL_PATH>"]
     cmd += flags(config["vllm_args"])
     cmd += flags({"served-model-name": config["model"]["served_name"], "speculative-config": spec,
@@ -81,7 +83,7 @@ def validate(config: dict, bench: dict, deployment: dict, local_files: bool = Fa
             raise ValueError("Short-context reproduction requires exactly one input token")
     elif bench["concurrency"] < 1 or bench["duration_seconds"] <= 0:
         raise ValueError("Benchmark concurrency and duration must be positive")
-    if spec["rejection_sample_method"] == "synthetic":
+    if spec is not None and spec["rejection_sample_method"] == "synthetic":
         if not 1 <= spec["synthetic_acceptance_length"] <= spec["num_speculative_tokens"] + 1:
             raise ValueError("Synthetic acceptance length must be between 1 and draft length + 1")
     reserved = {"nnodes", "node-rank", "master-addr", "headless", "host", "port", "speculative-config", "served-model-name"}
@@ -99,7 +101,8 @@ def validate(config: dict, bench: dict, deployment: dict, local_files: bool = Fa
     cache_dir = deployment.get("cache_dir")
     if cache_dir and (not Path(cache_dir).is_absolute() or any(char in cache_dir for char in (",", ":"))):
         raise ValueError("cache_dir must be an absolute path without ',' or ':'")
-    for key in ("path", "draft_path"):
+    model_keys = ("path", "draft_path") if spec is not None else ("path",)
+    for key in model_keys:
         value = config["model"][key]
         if not value or not Path(value).is_absolute() or not Path(value).is_dir():
             raise ValueError(f"Set model.{key} to an existing absolute directory")
@@ -118,7 +121,7 @@ def validate(config: dict, bench: dict, deployment: dict, local_files: bool = Fa
             raise ValueError("Mount source must be an existing absolute path")
         if not mount["target"] or not Path(mount["target"]).is_absolute():
             raise ValueError("Mount target must be absolute")
-    mount_paths = list(config["model"][key] for key in ("path", "draft_path"))
+    mount_paths = list(config["model"][key] for key in model_keys)
     mount_paths += [mount[key] for mount in mounts for key in ("source", "target")]
     if any("," in path or ":" in path for path in mount_paths):
         raise ValueError("Pyxis mount paths cannot contain ',' or ':'")
@@ -128,7 +131,7 @@ def container_args(config: dict, container: dict, output: Path, role: str, cache
     mounts = [f"{output}:/experiment"]
     if cache_dir:
         mounts.append(f"{cache_dir}:/cache:rw")
-    for key in (("path", "draft_path") if role == "server" else ("path",)):
+    for key in (("path", "draft_path") if role == "server" and config["speculation"] is not None else ("path",)):
         path = config["model"][key]
         mounts.append(f"{path}:{path}:ro")
     for mount in container["mounts"]:

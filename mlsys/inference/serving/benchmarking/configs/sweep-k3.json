@@ -3,8 +3,8 @@
     [
       {
         "name": "c32-1p2d",
-        "prefill_engine": "engine-k3-1p2d-prefill.json",
-        "decode_engine": "engine-k3-1p2d-decode.json",
+        "prefill_engine": "engine-k3-1p2d-c32-prefill.json",
+        "decode_engine": "engine-k3-1p2d-c32-decode.json",
         "benchmark": "benchmark-agentx-c32-dynamo.json",
         "deployment": "deployment-gb300-1p2d-6n.json"
       },

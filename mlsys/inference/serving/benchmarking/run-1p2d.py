@@ -222,8 +222,13 @@ def validate_1p2d(engines, bench, deployment, local_files=False):
         raise ValueError('The 1P2D launcher does not support patches or server_command_prefix')
     if bench.get('kind', 'agentx') != 'agentx':
         raise ValueError('The 1P2D launcher runs AgentX benchmarks')
-    if engines['prefill']['model'] != engines['decode']['model'] or engines['prefill']['speculation'] != engines['decode']['speculation']:
-        raise ValueError('Prefill and decode must use the same models and speculation settings')
+    prefill_spec = copy.deepcopy(engines['prefill']['speculation'])
+    decode_spec = engines['decode']['speculation']
+    # Prefill still builds the draft context KV consumed by speculative decode.
+    if prefill_spec is not None:
+        prefill_spec.pop('prefill_context_kv_only', None)
+    if engines['prefill']['model'] != engines['decode']['model'] or prefill_spec != decode_spec:
+        raise ValueError('Prefill and decode must use the same models and speculation settings, except prefill_context_kv_only on prefill')
     worker_deployment = copy.deepcopy(deployment)
     worker_deployment['slurm']['nodes'] = 2
     for engine in engines.values():
