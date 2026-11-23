@@ -1,0 +1,67 @@
+{
+  "slurm": {
+    "account": null,
+    "partition": null,
+    "time": "04:00:00",
+    "nodes": 6,
+    "gpus_per_node": 4,
+    "cpus_per_task": null,
+    "extra_args": [
+      "--segment=6",
+      "--wckey=p0"
+    ]
+  },
+  "containers": {
+    "engine": {
+      "mounts": [
+        {
+          "source": null,
+          "target": null,
+          "readonly": true
+        }
+      ],
+      "image": null
+    },
+    "benchmark": {
+      "image": null,
+      "mounts": [
+        {
+          "source": null,
+          "target": null,
+          "readonly": true
+        }
+      ]
+    }
+  },
+  "network_interface": "eth0",
+  "patches": [],
+  "server_command_prefix": [],
+  "startup_seconds": 3600,
+  "cache_dir": null,
+  "dynamo": {
+    "namespace": "k3-ep-study",
+    "env": {
+      "DYN_REQUEST_PLANE": "tcp",
+      "DYN_TCP_REQUEST_TIMEOUT": "120",
+      "ETCD_LEASE_TTL": "600",
+      "DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS": "3600",
+      "DYN_TOKENIZER_CACHE_BYTES": "8589934592",
+      "DYN_DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION": "1"
+    },
+    "frontend_args": {
+      "router-mode": "least-loaded",
+      "router-session-affinity-ttl-secs": 1,
+      "router-min-initial-workers": 2
+    },
+    "worker_args": {},
+    "mooncake": {
+      "metadata_server": "P2PHANDSHAKE",
+      "global_segment_size": "168GB",
+      "local_buffer_size": "4GB",
+      "protocol": "rdma",
+      "device_name": "mlx5_0,mlx5_1,mlx5_2,mlx5_3",
+      "mode": "embedded",
+      "enable_offload": false
+    }
+  }
+}

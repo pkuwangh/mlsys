@@ -1,0 +1,41 @@
+{
+  "lanes": [
+    [
+      {
+        "name": "c64-1p2d-mooncake-672g",
+        "prefill_engine": "engine-k3-1p2d-c48-prefill.json",
+        "decode_engine": "engine-k3-1p2d-c48-decode.json",
+        "benchmark": "benchmark-agentx-c64-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n-mooncake-672g.json"
+      },
+      {
+        "name": "c64-1p2d-mooncake-640g-ssd640g",
+        "prefill_engine": "engine-k3-1p2d-c48-prefill-ssd.json",
+        "decode_engine": "engine-k3-1p2d-c48-decode-ssd.json",
+        "benchmark": "benchmark-agentx-c64-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n-mooncake-640g-ssd640g.json"
+      },
+      {
+        "name": "c80-1p2d-mooncake-640g",
+        "prefill_engine": "engine-k3-1p2d-c48-prefill.json",
+        "decode_engine": "engine-k3-1p2d-c48-decode.json",
+        "benchmark": "benchmark-agentx-c80-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n.json"
+      },
+      {
+        "name": "c80-1p2d-mooncake-672g",
+        "prefill_engine": "engine-k3-1p2d-c48-prefill.json",
+        "decode_engine": "engine-k3-1p2d-c48-decode.json",
+        "benchmark": "benchmark-agentx-c80-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n-mooncake-672g.json"
+      },
+      {
+        "name": "c80-1p2d-mooncake-640g-ssd640g",
+        "prefill_engine": "engine-k3-1p2d-c48-prefill-ssd.json",
+        "decode_engine": "engine-k3-1p2d-c48-decode-ssd.json",
+        "benchmark": "benchmark-agentx-c80-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n-mooncake-640g-ssd640g.json"
+      }
+    ]
+  ]
+}

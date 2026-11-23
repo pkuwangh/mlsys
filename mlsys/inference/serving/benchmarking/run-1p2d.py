@@ -76,6 +76,70 @@ def wait_ready(urls, processes, seconds):
             time.sleep(5)
 
 
+def wait_port(host, port, processes, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if any(p.poll() is not None for p in processes):
+            raise RuntimeError(f'Mooncake process exited before {host}:{port} was ready')
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return
+        except OSError:
+            time.sleep(1)
+    raise TimeoutError(f'Mooncake readiness timed out: {host}:{port}')
+
+
+def mooncake_owner_command(deployment, address, master):
+    mc = deployment['dynamo']['mooncake']
+    owner = deployment['dynamo']['mooncake_store']
+    return ['mooncake_client', f'--host={address}:50053', '--port=50052',
+            f'--master_server_address={master}:50051',
+            f'--metadata_server={mc["metadata_server"]}',
+            f'--protocol={mc["protocol"]}', f'--device_names={mc["device_name"]}',
+            f'--global_segment_size={owner["global_segment_size"]}',
+            f'--local_buffer_size={owner["local_buffer_size"]}',
+            '--enable_offload=true', '--start_offload_rpc_server=true']
+
+
+def worker_with_mooncake_owner(root, deployment, addresses, rank, env, cmd):
+    owner = deployment['dynamo']['mooncake_store']
+    owner_env = dict(env, **owner['env'])
+    base = Path(owner_env['MOONCAKE_OFFLOAD_FILE_STORAGE_PATH'])
+    base.mkdir(parents=True, exist_ok=True)
+    capacity = int(owner_env['MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES'])
+    filesystem = subprocess.check_output(['findmnt', '-n', '-o', 'FSTYPE', '-T', str(base)], text=True).strip()
+    if filesystem in ('tmpfs', 'ramfs', 'nfs', 'nfs4', 'lustre', 'overlay'):
+        raise RuntimeError(f'Mooncake SSD path must be on local disk, got {filesystem}: {base}')
+    if shutil.disk_usage(base).free < capacity + 16 * 1024**3:
+        raise RuntimeError(f'Insufficient free SSD space for {capacity} bytes at {base}')
+    path = base / f'k3-{os.environ["SLURM_JOB_ID"]}-rank{rank}'
+    path.mkdir(exist_ok=False)
+    owner_env['MOONCAKE_OFFLOAD_FILE_STORAGE_PATH'] = str(path)
+    owner_cmd = mooncake_owner_command(deployment, addresses[rank], addresses[0])
+    write(root / f'mooncake-owner-{rank}.json', {
+        'command': owner_cmd, 'env': {k: owner_env[k] for k in owner['env']},
+        'filesystem': filesystem, 'free_bytes': shutil.disk_usage(base).free})
+    if owner['prefer_local_segment']:
+        env['MOONCAKE_PREFERRED_SEGMENT'] = f'{addresses[rank]}:50053'
+    processes = []
+    try:
+        wait_port(addresses[0], 50051, [], 120)
+        with (root / f'mooncake-owner-{rank}.log').open('w') as log:
+            processes.append(subprocess.Popen(owner_cmd, env=owner_env, stdout=log, stderr=subprocess.STDOUT))
+        wait_port(addresses[rank], 50052, processes, 600)
+        processes.append(subprocess.Popen(cmd, env=env))
+        while processes[-1].poll() is None:
+            if processes[0].poll() is not None:
+                raise RuntimeError('Mooncake pool owner exited while the engine was running')
+            time.sleep(2)
+        if processes[-1].returncode:
+            raise RuntimeError(f'Engine exited {processes[-1].returncode}')
+    finally:
+        for process in reversed(processes):
+            stop(process)
+        shutil.rmtree(path)
+
+
 def worker(root):
     deployment = read(root / 'deployment.json')
     addresses = read(root / 'allocation.json')['addresses']
@@ -108,6 +172,8 @@ def worker(root):
     versions = {n: importlib.metadata.version(n) for n in ('vllm', 'torch', 'flashinfer-python', 'nixl', 'ai-dynamo', 'ai-dynamo-runtime', 'mooncake-transfer-engine-cuda13')}
     write(root / f'runtime-{rank}.json', {'role': role, 'hostname': socket.gethostname(), 'gpus': devices, 'versions': versions, 'command': cmd})
     print(shlex.join(cmd), flush=True)
+    if deployment['dynamo'].get('mooncake_store'):
+        return worker_with_mooncake_owner(root, deployment, addresses, rank, env, cmd)
     os.execvpe(cmd[0], cmd, env)
 
 
@@ -138,6 +204,8 @@ def infra(root):
                      'python3', '-m', 'dynamo.frontend', '--http-host=0.0.0.0', '--http-port=8000',
                      '--namespace', deployment['dynamo']['namespace']] + flags(deployment['dynamo']['frontend_args']),
     }
+    if deployment['dynamo']['mooncake'].get('enable_offload'):
+        commands['mooncake-master'].append('--enable_offload=true')
     processes = []
     try:
         for name, cmd in commands.items():
@@ -216,6 +284,24 @@ def job(root):
 
 
 def validate_1p2d(engines, bench, deployment, local_files=False):
+    mc = deployment['dynamo']['mooncake']
+    owner = deployment['dynamo'].get('mooncake_store')
+    if mc.get('mode') == 'standalone-store' or owner:
+        if not owner or mc.get('mode') != 'standalone-store' or mc['global_segment_size'] != 0:
+            raise ValueError('Standalone Mooncake requires a per-node owner and zero pool allocation in engine ranks')
+        if not mc['enable_offload'] or not owner['enable_offload']:
+            raise ValueError('Enable SSD offloading in both the requester and owner configs')
+        owner_env = owner['env']
+        capacity = int(owner_env['MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES'])
+        if capacity <= 0 or int(owner_env['MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE']) != capacity:
+            raise ValueError('Set matching positive Mooncake SSD advertised and disk eviction capacities')
+        if local_files:
+            path = owner_env['MOONCAKE_OFFLOAD_FILE_STORAGE_PATH']
+            if not path or not Path(path).is_absolute():
+                raise ValueError('Set an absolute local SSD path for Mooncake')
+            if not any(not m.get('readonly', True) and Path(path).is_relative_to(m['target'])
+                       for m in deployment['containers']['engine']['mounts']):
+                raise ValueError('Mount the Mooncake SSD path read-write in the engine container')
     if deployment['slurm']['nodes'] != 6 or deployment['slurm']['gpus_per_node'] != 4:
         raise ValueError('1P2D requires six nodes with four GPUs each')
     if deployment['patches'] or deployment['server_command_prefix']:
