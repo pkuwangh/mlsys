@@ -1,0 +1,20 @@
+{
+  "lanes": [
+    [
+      {
+        "name": "c48-1p2d-prefill-no-ep",
+        "prefill_engine": "engine-k3-1p2d-c48-prefill-no-ep.json",
+        "decode_engine": "engine-k3-1p2d-c48-decode.json",
+        "benchmark": "benchmark-agentx-c48-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n.json"
+      },
+      {
+        "name": "c80-1p2d-mooncake-640g-ssd640g-lookup5s-prefill-no-ep",
+        "prefill_engine": "engine-k3-1p2d-c48-prefill-ssd-lookup5s-no-ep.json",
+        "decode_engine": "engine-k3-1p2d-c48-decode-ssd-lookup5s.json",
+        "benchmark": "benchmark-agentx-c80-dynamo.json",
+        "deployment": "deployment-gb300-1p2d-6n-mooncake-640g-ssd640g.json"
+      }
+    ]
+  ]
+}
