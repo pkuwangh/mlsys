@@ -1,0 +1,12 @@
+{
+  "lanes": [
+    [
+      {
+        "name": "c48-tp8-cpu-kv-offload",
+        "engine": "engine-k3-tp8-seq48-cpu-kv-offload.json",
+        "benchmark": "benchmark-agentx-c48.json",
+        "deployment": "deployment-gb300-2n.json"
+      }
+    ]
+  ]
+}
